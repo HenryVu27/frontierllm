@@ -1,0 +1,41 @@
+# Local-only / heavy
+papers/
+scratch/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.uv/
+.pdm-python
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors
+.vscode/
+.idea/
+
+# Model weights / checkpoints (when projects exist)
+*.pt
+*.bin
+*.safetensors
+*.gguf
+*.ckpt
+checkpoints/
+runs/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Common large files
+*.zip
+*.tar
+*.tar.gz
+*.parquet
+data/
