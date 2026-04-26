@@ -7,10 +7,10 @@ Thin index across all topics. Update the status line as you progress.
 ## Notes
 
 - `00-foundations/` — refresher on what's assumed (transformer math, optimization basics) — *0/6 done*
-- `01-pretraining/` — scaling laws, data, modern arch, optimization stability, mid-training, long context — *0/16 done*
+- `01-pretraining/` — scaling laws, data, modern arch, optimization stability, mid-training, long context — *0/17 done*
 - `02-post-training/` — SFT, distillation, instruction tuning, synthetic data — *0/11 done*
-- `03-rlhf-and-rl/` — RM training, PPO, DPO family, RLAIF, RLVR, online vs offline — *0/15 done*
-- `04-distributed-training/` — DP/TP/PP/SP/EP, ZeRO, FSDP, Megatron 3D, FP8 — *0/13 done*
+- `03-rlhf-and-rl/` — RM training, PPO, DPO family, RLAIF, RLVR, online vs offline — *0/16 done*
+- `04-distributed-training/` — DP/TP/PP/SP/EP, ZeRO, FSDP, Megatron 3D, FP8 — *0/14 done*
 - `05-eval-and-benchmarks/` — benchmark families, contamination, eval design — *0/13 done*
 - `06-alignment-and-interp/` — mech interp, SAEs, scalable oversight, red-teaming — *0/12 done*
 - `07-frontier-labs/` — frontier model reports, comparative analysis — *orientation pass: not started*
