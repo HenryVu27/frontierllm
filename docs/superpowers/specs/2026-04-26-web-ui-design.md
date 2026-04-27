@@ -360,139 +360,253 @@ Topics with `total === 0` are excluded.
 
 ## 7. Design system
 
+> **Design provenance.** This design language is derived from
+> `C:/Personal/blog/` — the user's existing personal blog at
+> `henryvu.blog` — to keep the family of work coherent. See that repo for
+> the canonical reference. The CSS tokens, typeface choices, and motion
+> patterns below are extracted directly from that codebase and adapted for
+> a React/Tailwind context.
+
 ### Visual stance
 
 This is a learning repo, not a SaaS marketing site. The aesthetic to target
-is **"thoughtful, technical, calm"** — closer to a research lab notebook
-than a product page. Reference moodboard: Anthropic's docs, Vercel docs in
-dark mode, Linear's documentation pages, classic LaTeX papers.
+is **"editorial, technical, warm"** — closer to a well-typeset research
+journal than a product page, and directly related to the blog's own
+parchment-and-serif voice. Reference: the blog itself.
 
 Core principles:
-- High information density without feeling cluttered.
-- Long-form readability is the primary pleasure metric.
-- Zero gradient, zero hero illustrations, no marketing copy.
-- Color is a tool for hierarchy, not decoration; one accent only.
+- Long-form readability is the primary pleasure metric. Serif body text at
+  a generous size; wide measure kept narrow (600–720px prose column).
+- Warmth over sterility. The palette is parchment-warm, not cool gray.
+- One accent only — vermillion for interactive hover states; manuscript
+  blue for drop-cap / rare decorative use. No gradients, no illustrations.
+- Color is hierarchy, not decoration. Status colors (success / destructive)
+  used only for status pills, never decoration.
 
 ### Color tokens (oklch)
 
-Defined as CSS variables on `:root` and `:root.dark`. Tailwind config maps
-these to utility classes (`bg-background`, `text-foreground`, etc.). No
-hex/rgb in components per global standards.
+The blog uses a **warm, light-only** palette (no dark mode in the CSS
+source). The frontierllm UI defaults to dark per §11, so we derive a
+faithful dark counterpart. Both modes stay on the same warm-brown hue axis
+rather than shifting to cool gray.
+
+Defined as CSS variables on `:root` (light) and `:root.dark`. Tailwind
+config maps these to utility classes. No hex/rgb in components.
 
 ```css
 :root {
-  /* Light mode (secondary; default is dark) */
-  --background: oklch(0.99 0 0);
-  --foreground: oklch(0.18 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.18 0 0);
-  --muted: oklch(0.96 0 0);
-  --muted-foreground: oklch(0.48 0 0);
-  --border: oklch(0.92 0 0);
-  --input: oklch(0.92 0 0);
-  --ring: oklch(0.55 0.13 240);
-  --primary: oklch(0.55 0.13 240);          /* slate-blue */
-  --primary-foreground: oklch(0.99 0 0);
-  --accent: oklch(0.94 0.02 240);
-  --accent-foreground: oklch(0.18 0 0);
+  /* Light mode — derived directly from blog palette (#f2efe8 bg family) */
+  --background: oklch(0.955 0.010 78);      /* parchment: #f2efe8 */
+  --foreground: oklch(0.215 0.012 60);      /* warm near-black: #2c2926 */
+  --card: oklch(0.975 0.008 78);            /* slightly lighter than bg */
+  --card-foreground: oklch(0.215 0.012 60);
+  --muted: oklch(0.92 0.012 78);            /* code-bg warmth: #e9e5db */
+  --muted-foreground: oklch(0.48 0.022 60); /* blog --muted: #6d6355 */
+  --border: oklch(0.88 0.014 75);           /* blog --border: #ddd8cd */
+  --input: oklch(0.88 0.014 75);
+  --ring: oklch(0.31 0.07 240);             /* manuscript blue: #1a3a5c */
+  --primary: oklch(0.42 0.16 30);           /* vermillion: #8b2500 */
+  --primary-foreground: oklch(0.975 0.008 78);
+  --accent: oklch(0.92 0.012 78);           /* warm muted surface */
+  --accent-foreground: oklch(0.215 0.012 60);
   --destructive: oklch(0.55 0.22 27);
-  --success: oklch(0.62 0.14 150);
+  --success: oklch(0.55 0.14 150);
+  --gold: oklch(0.75 0.11 80);              /* blog --gold: #c9a84c — accent only */
+  --manuscript-blue: oklch(0.31 0.07 240);  /* blog --manuscript-blue: #1a3a5c */
   --radius: 0.5rem;
 }
 
 :root.dark {
-  --background: oklch(0.16 0.005 240);      /* deep cool gray */
-  --foreground: oklch(0.93 0 0);
-  --card: oklch(0.20 0.005 240);
-  --card-foreground: oklch(0.93 0 0);
-  --muted: oklch(0.22 0.005 240);
-  --muted-foreground: oklch(0.65 0 0);
-  --border: oklch(0.27 0.008 240);
-  --input: oklch(0.27 0.008 240);
-  --ring: oklch(0.72 0.10 240);
-  --primary: oklch(0.72 0.10 240);          /* slightly desaturated blue */
-  --primary-foreground: oklch(0.16 0.005 240);
-  --accent: oklch(0.26 0.02 240);
-  --accent-foreground: oklch(0.93 0 0);
+  /* Dark mode — same warm hue axis, darker luminance.
+     The blog has no dark mode; this is a derived counterpart. */
+  --background: oklch(0.175 0.012 60);      /* very dark warm brown */
+  --foreground: oklch(0.92 0.008 75);       /* warm off-white */
+  --card: oklch(0.215 0.012 60);            /* lifted surface */
+  --card-foreground: oklch(0.92 0.008 75);
+  --muted: oklch(0.245 0.012 60);           /* subtly lifted muted surface */
+  --muted-foreground: oklch(0.60 0.016 65); /* warm mid-gray */
+  --border: oklch(0.31 0.014 62);           /* warm dark border */
+  --input: oklch(0.31 0.014 62);
+  --ring: oklch(0.62 0.08 235);             /* lighter manuscript blue */
+  --primary: oklch(0.62 0.14 32);           /* lighter vermillion for dark bg */
+  --primary-foreground: oklch(0.175 0.012 60);
+  --accent: oklch(0.27 0.012 62);           /* warm dark hover surface */
+  --accent-foreground: oklch(0.92 0.008 75);
   --destructive: oklch(0.65 0.20 27);
-  --success: oklch(0.72 0.14 150);
+  --success: oklch(0.68 0.14 150);
+  --gold: oklch(0.75 0.11 80);
+  --manuscript-blue: oklch(0.62 0.08 235);
   --radius: 0.5rem;
 }
 ```
 
-The single accent is a **muted slate-blue**: technical, calm, and
-unmistakably not "marketing teal" or "AI lab purple." Status colors
-(success / destructive / warning) are reserved for status pills and
-alerts only — never decorative.
+**Open decision on dark mode:** The blog has no dark mode; the dark
+counterpart above is a principled derivation, not a canonical reference.
+If the warm-dark palette feels muddy in practice, consider a neutral-dark
+background (`oklch(0.16 0 0)`) with warm foreground text — keeping the
+warm hue on text while letting the background go neutral.
+
+The primary interactive accent is **vermillion** (blog: hover state on
+links and nav). In the React UI this is the focus ring color, active link,
+and checked-checkbox color. The **manuscript blue** appears only in
+special, high-signal moments (progress meter fill, active TOC item).
 
 ### Typography pairing
 
-- **Body / UI:** `Inter` (variable) — mature, neutral, exceptional at all
-  sizes; the Anthropic-docs feel.
-- **Display / headings:** `Inter` at heavier weights (no separate display
-  face; keeps the page calm).
-- **Mono / code:** `JetBrains Mono` (variable) — clean ligatures-off, a
-  near-universal "I am a developer reading code" signal.
-- Loaded via `@fontsource-variable/inter` and
-  `@fontsource-variable/jetbrains-mono` (self-hosted; no Google Fonts call
-  for offline-first dev). Listed in CSS as `font-sans` and `font-mono`.
+The blog uses **Century Expanded** (a classic book-weight serif loaded as a
+local `.otf`) as the sole typeface for body, headings, and nav. The index
+page also loads **Cormorant Garamond** from Google Fonts. Drop caps use
+**Goudy Initialen**. The UI stack mirrors this three-tier identity.
 
-Heading scale (Tailwind `prose`-aware):
-- `h1`: `text-3xl font-semibold tracking-tight` (page title).
-- `h2`: `text-2xl font-semibold tracking-tight mt-10` (section).
-- `h3`: `text-xl font-medium tracking-tight mt-8`.
-- `h4`: `text-lg font-medium`.
-- Body: `text-[15px] leading-relaxed text-foreground/90`.
-- Muted body: `text-sm text-muted-foreground leading-relaxed`.
+- **Serif / body / headings:** `Cormorant Garamond` variable (400–700,
+  including italic) — available via Google Fonts and close kin to the blog's
+  editorial feel. Self-host via `@fontsource/cormorant-garamond` if offline-
+  first is required. Where Century Expanded is specifically desired for a
+  local-only tool, it can be loaded from the blog repo via `@font-face`, but
+  Cormorant Garamond is the practical default for npm packaging.
+- **Sans / UI chrome:** `system-ui, -apple-system, sans-serif` — the blog
+  uses system-ui for any non-prose text (nav labels, meta, code filenames).
+  In Tailwind this is the default `font-sans`. No Google Fonts sans import.
+- **Mono / code:** `"Monaco", "Menlo", "Consolas", "Liberation Mono",
+  monospace` — exactly the blog's stack. No variable web font; the system
+  mono stack is deliberate (fast, familiar to the user).
+
+Font loaded via:
+```ts
+// In main.tsx — self-host Cormorant Garamond
+import "@fontsource/cormorant-garamond/400.css";
+import "@fontsource/cormorant-garamond/400-italic.css";
+import "@fontsource/cormorant-garamond/600.css";
+```
+
+Tailwind config maps:
+```ts
+fontFamily: {
+  serif: ['"Cormorant Garamond"', '"Iowan Old Style"', 'Palatino', 'Georgia', 'serif'],
+  sans:  ['system-ui', '-apple-system', 'sans-serif'],
+  mono:  ['"Monaco"', '"Menlo"', '"Consolas"', '"Liberation Mono"', 'monospace'],
+}
+```
+
+Heading scale (Tailwind `prose`-aware). The blog runs 21px body with
+light-to-medium weights; this UI matches the generosity:
+
+- `h1`: `font-serif text-4xl font-light leading-tight tracking-tight`
+  (44px equivalent — the blog's `.title` style).
+- `h2`: `font-serif text-2xl font-medium leading-snug mt-8`
+  (corresponds to blog's 29px h2 at font-weight 500).
+- `h3`: `font-serif text-xl font-normal leading-snug mt-6`
+  (blog's 26px h3 at font-weight 400).
+- `h4`: `font-serif text-lg font-medium`.
+- Body: `font-serif text-[19px] leading-relaxed text-foreground`.
+  (Slightly below the blog's 21px to account for screen resolution;
+  revisit to taste.)
+- Muted / meta: `font-sans text-sm text-muted-foreground leading-relaxed`.
+- UI chrome (nav labels, badges, filters): `font-sans text-sm`.
 
 ### Spacing scale
 
-4px base unit. Used values: 4, 8, 12, 16, 24, 32, 48, 64. Internal card
-padding is `p-6` minimum (`p-4` on small cards). Section gaps are `gap-6`
-or `gap-8` and never mixed within a region.
+4px base unit. Used values: 4, 8, 12, 16, 24, 32, 48, 64. The blog's prose
+column is `max-width: 600px` with `padding: 0 32px` and `margin: 80px auto`.
+The frontierllm content column targets `max-w-[660px]` with generous
+vertical rhythm — sections separated by at least `mt-16` (64px).
+
+Internal card padding: `p-6` minimum (`p-4` on small cards). Section gaps
+are `gap-6` or `gap-8` — never mixed within a region.
+
+The blog uses a **section divider ornament** (❧ fleuron, U+2767) between
+major content sections, flanked by horizontal rules. Adopt this for the
+prose view: rendered sections inside `RenderedMarkdown` should get a CSS
+`::before` ornament divider between `<section>` elements (port the
+`post-styles.css` pattern directly).
 
 ### Shadows / elevation
 
-- Light mode cards: `shadow-sm`, hover `shadow-md`, transition 200ms.
-- Dark mode: no shadows. Use `border border-border` plus subtle
-  `ring-1 ring-white/[0.04]` for elevated surfaces (popovers, dialogs).
+The blog uses **no box-shadows** on structural elements. Elevation is
+expressed through warm border lines (`1px solid var(--border)`), not
+shadow. The only shadow is on the proof popover (`0 8px 24px rgba(0,0,0,0.18)`).
+
+- Light mode: no shadow on cards. Use `border border-border` for all
+  card-like surfaces. On hover, shift background to `accent` rather than
+  adding shadow.
+- Dark mode: same — `border border-border` plus `ring-1 ring-white/[0.04]`
+  for elevated surfaces (popovers, dialogs). No `box-shadow`.
+- Popovers / command palette: `shadow-[0_8px_24px_rgba(0,0,0,0.18)]` is
+  the one permitted exception (matches the blog's proof popover).
 
 ### Radius
 
-- Cards / containers: `rounded-xl` (12px).
-- Buttons / inputs: `rounded-md` (6px).
+Blog consistently uses 8px (`border-radius: 8px`) on all boxes
+(algorithm boxes, code blocks, callouts, TOC border, images, proof
+triggers). Buttons and inputs get the same.
+
+- Cards / containers: `rounded-lg` (8px — matches blog exactly).
+- Buttons / inputs: `rounded-lg` (8px).
 - Avatars / pills: `rounded-full`.
 - Code blocks: `rounded-lg` (8px).
+- Modals / popovers: `rounded-lg` (8px).
+
+No `rounded-xl` or `rounded-md` — the blog's single-radius discipline is
+a design signature worth preserving.
 
 ### Motion
 
-`framer-motion` for orchestrated entrances. Page transitions:
+The blog uses `transition: color 150ms ease` on links and nav, and
+`transition: max-height 350ms ease` on collapsible code blocks. That is
+the full motion vocabulary: short color transitions, medium height
+transitions. No entrance animations, no stagger.
 
-- `initial={{ opacity: 0, y: 8 }}` →
-  `animate={{ opacity: 1, y: 0 }}` →
-  `exit={{ opacity: 0, y: -4 }}`,
-- duration 220ms, easing `easeOut`.
-- Lists stagger children at 30–40ms between items, capped at 8 items
-  (then snap remaining).
+For the React UI, keep transitions minimal in homage to the blog:
 
-Interactive transitions per global standards:
+- Page transitions: `initial={{ opacity: 0 }}` → `animate={{ opacity: 1 }}`
+  only (no Y translate), duration 180ms, `easeOut`. The blog has zero
+  translate motion; a brief fade is the least intrusive compromise.
+- Lists: no stagger by default. If needed, cap at 40ms between items and
+  no more than 5 items (then snap remaining).
 - Links: `transition-colors duration-150`.
-- Buttons: hover bg shift + `active:scale-[0.98]`.
-- Cards: `transition-shadow duration-200 hover:shadow-md` (light) /
-  `hover:bg-accent/40` (dark).
+- Buttons / interactive elements: hover bg shift + `active:scale-[0.98]`
+  (subtle press feedback not present in the static blog but appropriate for
+  interactive controls).
+- Mode toggle (underline tab style): `transition: color 150ms ease,
+  border-color 150ms ease` — mirrors the blog's `.mode-toggle button`
+  exactly.
 - All interactive elements get visible focus rings:
   `focus-visible:ring-2 ring-ring ring-offset-2 ring-offset-background`.
 
+Respect `prefers-reduced-motion`: strip all transitions and replace any
+`AnimatePresence` with instant swap.
+
 ### Prose styling
 
-`@tailwindcss/typography` plugin with a custom theme that maps `prose`
-classes to design tokens (no hardcoded colors). Code blocks use the Shiki-
-generated HTML untouched (themed via `rehype-pretty-code`). Inline code
-gets `bg-muted px-1.5 py-0.5 rounded font-mono text-[0.92em]`.
+`@tailwindcss/typography` plugin with a custom theme that overrides all
+hardcoded colors with design tokens. The result should feel like the blog's
+`post-styles.css` inside a Tailwind prose wrapper.
 
-Tables get a subtle striped variant via `prose-table:...` modifiers; the
-orientation comparative table is the headline use case and must look
-respectable.
+Specific overrides:
+
+- **Font family:** `prose-p:font-serif prose-headings:font-serif` — all
+  prose content uses the serif stack.
+- **Line height:** body at `leading-relaxed` (1.6 — blog's `line-height: 1.6`).
+- **Blockquote:** `border-l-[3px] border-border pl-4 text-muted-foreground`
+  — matches the blog's `border-left: 3px solid var(--border)`.
+- **Tables:** `border-collapse: collapse`, `1px solid border` on every
+  cell, `padding: 8px 10px`. The orientation comparative table is the
+  headline use case and must look exactly like the blog's table treatment.
+- **Inline code:** `bg-muted px-1 py-0 rounded font-mono text-[0.82em]`
+  — blog uses `0.82em` and `background: var(--code-bg)` with 4px padding.
+- **Code blocks:** Shiki-generated HTML via `rehype-pretty-code`, themed
+  with a warm light theme in light mode and a dark warm theme in dark mode.
+  Wrap in a `<div class="code-block">` with a title bar (`code-header`)
+  using `font-mono text-[13px]` and border-bottom — port the blog's
+  `code-blocks.css` IDE-style header pattern.
+- **Section dividers:** port `post-styles.css`'s `section + section::before`
+  ornament pattern (❧ fleuron + flanking rules) into the `prose.css`
+  overrides.
+- **Callout blocks:** `border border-border rounded-lg p-3 bg-transparent`
+  — the blog's `.callout` class. Use for tips and caveats inside rendered
+  content.
+- **Theorem / algorithm boxes:** `border border-border rounded-lg p-4
+  bg-muted` — matches the blog's `.algorithm-box`.
 
 ## 8. Page-by-page layout
 
@@ -653,8 +767,9 @@ point — see §12).
 ## 11. Dark mode
 
 **Default: dark.** The user is a developer; the tokens are designed dark-
-first (deep cool gray ~oklch(0.16 0.005 240)) with a light-mode
-counterpart for daylight reading. Implementation:
+first (deep warm brown ~oklch(0.175 0.012 60) — see §7 for the full dark
+token set) with a light parchment counterpart for daylight reading.
+Implementation:
 
 - `class`-based dark mode in Tailwind config (`darkMode: "class"`).
 - `useTheme` hook syncs `<html>` class with localStorage and supports
@@ -662,8 +777,10 @@ counterpart for daylight reading. Implementation:
 - Theme toggle is a 3-state `Switch` group in the topbar (sun / monitor /
   moon icons).
 - Code blocks: dual-theme via `rehype-pretty-code` (`themes: { light:
-  "github-light", dark: "tokyo-night" }`); output emits CSS variables
-  flipped by the dark class.
+  "one-light", dark: "vesper" }`); output emits CSS variables flipped by
+  the dark class. `one-light` is the closest Shiki theme to the blog's muted
+  One Light-inspired Prism palette. `vesper` is a warm, low-contrast dark
+  theme that aligns with the warm-brown dark mode tokens.
 - Images / diagrams (none currently, but plan for it): if an image has a
   `light` and `dark` variant, render the appropriate one via Tailwind
   variants; otherwise wrap in a thin `bg-card` frame.
@@ -727,7 +844,9 @@ Design B so that adding C is **additive**, not a rewrite. Extension points:
 ## 14. Open decisions you (the user) might want to revisit
 
 These are defaults I picked. Listed in rough order of "most likely to push
-back."
+back." Items 3 and 4 from the original list (font choice and accent color)
+are resolved: the blog reference settled both. Remaining decisions are
+renumbered.
 
 1. **Pre-rendered HTML at build time vs runtime markdown rendering.** I
    picked build-time HTML chunks for performance and bundle size, at the
@@ -744,22 +863,15 @@ back."
    separate because the user's stated workflow is "what should I read
    next" which deserves its own URL.
 
-3. **Font choice: Inter / Inter / JetBrains Mono.** Safe, well-loved, but
-   "calm and impersonal" is exactly the criticism. Alternatives that
-   keep the technical feel: **Geist** (single family for sans+mono,
-   modern), **iA Writer Quattro** (warmer, more editorial), or
-   **Söhne** if you want something Anthropic-coded. Inter is the
-   default-default; Geist would be my second pick.
+3. **Dark mode palette: warm-dark vs neutral-dark.** The blog has no dark
+   mode; the dark token set in §7 is derived (same warm hue axis,
+   lower luminance). In practice, warm dark backgrounds (`oklch(0.175
+   0.012 60)`) can feel muddy on uncalibrated monitors. If the dark mode
+   looks off, flip `--background` and `--card` to a neutral near-black
+   (`oklch(0.16 0 0)`) while keeping text and muted tokens on the warm
+   axis. This is a one-line change in `globals.css`.
 
-4. **Single accent color (slate-blue).** I picked one accent
-   (`oklch(0.55 0.13 240)`) intentionally to keep things calm. If you
-   want each topic to carry an identity color (one accent per topic
-   number, hue-shifted), that is supportable but pushes toward
-   "marketing site" feel. I would not do it; you might want a single
-   subtle topic stripe color for navigation cues, which is a smaller
-   change.
-
-5. **Tab-based topic page vs single long scroll.** I picked tabs
+4. **Tab-based topic page vs single long scroll.** I picked tabs
    (`Overview / Reading list / Synthesis / Open questions / Code`)
    because topics with 17 reading items + synthesis get long and
    navigation between sections is a real cost. Alternative: single
@@ -767,36 +879,39 @@ back."
    prose alternative is more "documentation-honest" and lets users
    skim more naturally; I am 60/40 in favor of tabs but easy to flip.
 
-6. **No per-item annotation / notes UI.** Reading-list items are
+5. **No per-item annotation / notes UI.** Reading-list items are
    read/unread booleans. We could add a tiny text field per item
    ("my one-line takeaway") that persists to localStorage. Useful but
    risks duplicating what synthesis sections are for. I left it out;
    the user will probably want it within a month.
 
-7. **No PDF / paper viewer.** Reading-list links open in a new tab to
+6. **No PDF / paper viewer.** Reading-list links open in a new tab to
    the external source (arXiv, etc.). The `papers/` folder is
    gitignored and local. We could light up a route that lists local
    PDFs and opens them with a `<embed>` viewer; rejected for B as
    scope creep, but trivial to add (a directory scan in the build
    plugin).
 
-8. **Reset semantics on reading-list title rename.** Stable ids are
+7. **Reset semantics on reading-list title rename.** Stable ids are
    `sha1(slug + normalized title)`. Renaming a title in markdown
    resets that item's check. The alternative is content-based ids that
    match on link URL — more stable, but breaks when an item has no
    external link. I picked title-based. If this bites once, switch
    to URL-when-present-else-title.
 
-9. **Self-hosted fonts via `@fontsource-variable/*` rather than Google
-   Fonts CDN.** Trade-off: tiny bit larger build, much better offline
-   dev. Fits "local-first" better. Easy to revert.
+8. **Self-hosted fonts via `@fontsource/*` rather than Google Fonts CDN.**
+   Trade-off: tiny bit larger build, much better offline dev. Fits
+   "local-first" better. Easy to revert. Note: `@fontsource/cormorant-garamond`
+   ships static weight files, not a variable font; install each weight
+   individually (400, 400-italic, 600) or use the Google Fonts import
+   if CDN is acceptable.
 
-10. **Vite plugin location: `web/scripts/build-content.ts`.** Could
-    instead be a separate published-locally Node package or live in
-    the repo root. I kept it inside `web/` to avoid leaking
-    JS/Node tooling into a Python-leaning repo root. If you want
-    `notes/` and `projects/` to be authored by other tools too, the
-    plugin could live at the repo root.
+9. **Vite plugin location: `web/scripts/build-content.ts`.** Could
+   instead be a separate published-locally Node package or live in
+   the repo root. I kept it inside `web/` to avoid leaking
+   JS/Node tooling into a Python-leaning repo root. If you want
+   `notes/` and `projects/` to be authored by other tools too, the
+   plugin could live at the repo root.
 
 ## 15. File layout (`web/`)
 
@@ -861,8 +976,10 @@ is a discrete, verifiable chunk; do not interleave.
       root; this creates `web/`).
 - [ ] Install dependencies:
       `react-router-dom framer-motion lucide-react clsx tailwind-merge
-      class-variance-authority sonner @fontsource-variable/inter
-      @fontsource-variable/jetbrains-mono minisearch zod`.
+      class-variance-authority sonner @fontsource/cormorant-garamond
+      minisearch zod`.
+      (No variable-font package for the mono stack — uses system fonts
+      per §7.)
 - [ ] Install Tailwind v4 + plugin:
       `tailwindcss @tailwindcss/vite @tailwindcss/typography`.
 - [ ] Install dev deps:
@@ -880,7 +997,8 @@ is a discrete, verifiable chunk; do not interleave.
       and `dark` class strategy.
 - [ ] Configure Tailwind theme to map tokens.
 - [ ] Wire `@tailwindcss/typography`; create `prose.css` overrides.
-- [ ] Import Inter + JetBrains Mono variable fonts in `main.tsx`.
+- [ ] Import Cormorant Garamond static weights in `main.tsx`
+      (`@fontsource/cormorant-garamond/400.css`, `400-italic.css`, `600.css`).
 - [ ] Add `useTheme` hook + topbar toggle; verify light/dark switch.
 
 ### Phase 3 — Content pipeline
