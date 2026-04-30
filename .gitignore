@@ -39,3 +39,8 @@ Thumbs.db
 *.tar.gz
 *.parquet
 data/
+
+# Web app
+web/node_modules/
+web/dist/
+web/src/generated/
