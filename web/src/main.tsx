@@ -1,13 +1,20 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './styles/globals.css'
-import App from './App.tsx'
+// Cormorant Garamond — the editorial serif used throughout (spec §7)
+import "@fontsource/cormorant-garamond/400.css";
+import "@fontsource/cormorant-garamond/400-italic.css";
+import "@fontsource/cormorant-garamond/600.css";
 
-const rootEl = document.getElementById('root')
-if (!rootEl) throw new Error('Root element not found')
+// Global styles + design tokens
+import "./styles/globals.css";
+
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.tsx";
+
+const rootEl = document.getElementById("root");
+if (!rootEl) throw new Error("Root element not found");
 
 createRoot(rootEl).render(
   <StrictMode>
     <App />
-  </StrictMode>,
-)
+  </StrictMode>
+);
