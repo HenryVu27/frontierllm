@@ -1,14 +1,30 @@
 /**
- * TEMPORARY — Phase 2 smoke-test preview page.
+ * TEMPORARY — Phase 3 debug page.
+ * Lists every manifest entry with slug, title, and reading-list count.
  * This entire file is replaced in Phase 4 with AppShell + routing.
- * Its only purpose is to verify design tokens, fonts, and theme toggle work.
  */
 
 import { ThemeToggle } from "@/components/layout/ThemeToggle";
-import { useTheme } from "@/hooks/useTheme";
+import { initManifest, getAllEntries } from "@/lib/manifest";
+import type { ManifestEntry } from "@/lib/manifest";
+
+// Import the generated manifest — produced at build time by build-content.ts
+// Using a static import so Vite can tree-shake and type-check.
+// The generated/ folder is gitignored; it is created by the content plugin.
+import manifestData from "@/generated/manifest.json";
+
+// Initialise the manifest module with the JSON data at module load time.
+// This is safe because manifest.json is a static build artifact (not async).
+initManifest(manifestData as Record<string, unknown>);
+
+// Load entries at module level — the manifest is already initialised above.
+const entries = getAllEntries();
 
 function App() {
-  const { resolvedTheme } = useTheme();
+  const totalReadingItems = entries.reduce(
+    (sum, e) => sum + e.readingList.length,
+    0
+  );
 
   return (
     <div className="min-h-screen bg-background text-foreground font-serif">
@@ -20,163 +36,97 @@ function App() {
         <ThemeToggle />
       </header>
 
-      {/* Main content */}
-      <main className="max-w-[660px] mx-auto px-8 py-16">
-        {/* Title */}
+      {/* Debug content */}
+      <main className="max-w-[800px] mx-auto px-8 py-12">
         <h1 className="font-serif text-4xl font-light tracking-tight text-foreground mb-2">
-          frontierllm
+          Phase 3 — Content Pipeline Debug
         </h1>
-        <p className="font-sans text-sm text-muted-foreground mb-12">
-          Design system preview — {resolvedTheme} mode
+        <p className="font-sans text-sm text-muted-foreground mb-8">
+          {entries.length} manifest entries · {totalReadingItems} total reading-list items
         </p>
 
-        {/* Typography specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Typography
-          </h2>
-          <p className="font-serif text-[19px] leading-relaxed text-foreground mb-4">
-            A learning repository for frontier-scale language models. The aesthetic
-            to target is <em>editorial, technical, warm</em> — closer to a
-            well-typeset research journal than a product page.
+        <div className="space-y-2">
+          {entries.map((entry) => (
+            <ManifestRow key={entry.slug} entry={entry} />
+          ))}
+        </div>
+
+        {entries.length === 0 && (
+          <p className="font-sans text-sm text-muted-foreground italic">
+            No manifest entries found. Run{" "}
+            <code className="bg-muted px-1 rounded font-mono text-[0.82em]">
+              npm run build
+            </code>{" "}
+            or{" "}
+            <code className="bg-muted px-1 rounded font-mono text-[0.82em]">
+              npm run dev
+            </code>{" "}
+            to generate the manifest.
           </p>
-          <p className="font-serif text-[19px] leading-relaxed text-foreground">
-            Long-form readability is the primary pleasure metric. Serif body text
-            at a generous size; wide measure kept narrow (600–720px prose column).
-            Warmth over sterility — the palette is parchment-warm, not cool gray.
-          </p>
-        </section>
-
-        {/* Color tokens specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Color tokens
-          </h2>
-          <div className="grid grid-cols-2 gap-3">
-            <ColorSwatch label="background" className="bg-background border border-border" />
-            <ColorSwatch label="card" className="bg-card border border-border" />
-            <ColorSwatch label="muted" className="bg-muted" />
-            <ColorSwatch label="accent" className="bg-accent" />
-            <ColorSwatch label="primary (vermillion)" className="bg-primary" textClass="text-primary-foreground" />
-            <ColorSwatch label="ring (manuscript blue)" className="bg-ring" textClass="text-primary-foreground" />
-            <ColorSwatch label="destructive" className="bg-destructive" textClass="text-white" />
-            <ColorSwatch label="gold" className="bg-gold" textClass="text-foreground" />
-          </div>
-        </section>
-
-        {/* Interactive elements specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Interactive elements
-          </h2>
-          <div className="flex flex-wrap gap-3 mb-4">
-            <button
-              type="button"
-              className="bg-primary text-primary-foreground font-sans text-sm px-4 py-2 rounded-lg hover:opacity-90 active:scale-[0.98] transition-all duration-150"
-            >
-              Primary button
-            </button>
-            <button
-              type="button"
-              className="border border-border text-foreground font-sans text-sm px-4 py-2 rounded-lg hover:bg-accent active:scale-[0.98] transition-all duration-150"
-            >
-              Ghost button
-            </button>
-            <button
-              type="button"
-              className="bg-muted text-muted-foreground font-sans text-sm px-4 py-2 rounded-lg hover:bg-accent hover:text-foreground active:scale-[0.98] transition-all duration-150"
-            >
-              Muted button
-            </button>
-          </div>
-
-          {/* Input */}
-          <input
-            type="text"
-            placeholder="Search notes..."
-            className="w-full font-sans text-sm bg-background text-foreground border border-input rounded-lg px-3 py-2 placeholder:text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2 transition-colors duration-150"
-          />
-        </section>
-
-        {/* Code specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Code
-          </h2>
-          <p className="font-serif text-[19px] leading-relaxed text-foreground mb-3">
-            Inline code uses <code className="bg-muted px-1 py-0 rounded font-mono text-[0.82em]">font-mono</code> at
-            82% body size with warm muted background. No border, just warmth.
-          </p>
-          <div className="code-block">
-            <div className="code-header">
-              <span>storage.ts</span>
-            </div>
-            <pre className="bg-muted p-4 overflow-x-auto font-mono text-sm leading-relaxed">
-              <code>{`export function storageGet<T>(key: StorageKey, entry: StorageEntry<T>): T {
-  const raw = localStorage.getItem(key);
-  if (raw === null) return entry.defaultValue;
-  return entry.schema.parse(JSON.parse(raw));
-}`}</code>
-            </pre>
-          </div>
-        </section>
-
-        {/* Card specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Cards
-          </h2>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-card border border-border rounded-lg p-6 hover:bg-accent transition-colors duration-200">
-              <p className="font-sans text-xs text-muted-foreground uppercase tracking-wide mb-1">01 — Pretraining</p>
-              <h3 className="font-serif text-xl font-medium text-foreground mb-2">Pretraining</h3>
-              <p className="font-sans text-sm text-muted-foreground">
-                Data, tokenization, architectures, scaling laws.
-              </p>
-              <div className="mt-4 h-1 bg-border rounded-full overflow-hidden">
-                <div className="h-full bg-manuscript-blue rounded-full w-[35%]" />
-              </div>
-              <p className="font-sans text-xs text-muted-foreground mt-1">6 / 17 read</p>
-            </div>
-            <div className="bg-card border border-border rounded-lg p-6 hover:bg-accent transition-colors duration-200">
-              <p className="font-sans text-xs text-muted-foreground uppercase tracking-wide mb-1">02 — Post-training</p>
-              <h3 className="font-serif text-xl font-medium text-foreground mb-2">Post-training</h3>
-              <p className="font-sans text-sm text-muted-foreground">
-                SFT, RLHF, DPO, instruction following.
-              </p>
-              <div className="mt-4 h-1 bg-border rounded-full overflow-hidden">
-                <div className="h-full bg-primary rounded-full w-[12%]" />
-              </div>
-              <p className="font-sans text-xs text-muted-foreground mt-1">2 / 14 read</p>
-            </div>
-          </div>
-        </section>
-
-        {/* Blockquote specimen */}
-        <section className="mb-10">
-          <h2 className="font-serif text-2xl font-medium text-foreground mb-4">
-            Blockquote
-          </h2>
-          <blockquote className="border-l-[3px] border-border pl-4 text-muted-foreground italic font-serif text-[19px] leading-relaxed">
-            "Long-form readability is the primary pleasure metric. Serif body text
-            at a generous size; wide measure kept narrow — 600 to 720 pixels."
-          </blockquote>
-        </section>
+        )}
       </main>
     </div>
   );
 }
 
-interface ColorSwatchProps {
-  label: string;
-  className: string;
-  textClass?: string;
+interface ManifestRowProps {
+  entry: ManifestEntry;
 }
 
-function ColorSwatch({ label, className, textClass = "text-foreground" }: ColorSwatchProps) {
+function ManifestRow({ entry }: ManifestRowProps) {
+  const kindColors: Record<ManifestEntry["kind"], string> = {
+    topic: "bg-manuscript-blue/10 text-manuscript-blue",
+    project: "bg-primary/10 text-primary",
+    orientation: "bg-gold/20 text-foreground",
+    root: "bg-muted text-muted-foreground",
+  };
+
   return (
-    <div className={`rounded-lg p-3 ${className}`}>
-      <span className={`font-mono text-xs ${textClass}`}>{label}</span>
+    <div className="border border-border rounded-lg px-4 py-3 flex items-start gap-4 hover:bg-accent transition-colors duration-150">
+      {/* Kind badge */}
+      <span
+        className={`font-sans text-xs px-2 py-0.5 rounded-full shrink-0 mt-0.5 ${kindColors[entry.kind]}`}
+      >
+        {entry.kind}
+      </span>
+
+      {/* Slug + title */}
+      <div className="flex-1 min-w-0">
+        <p className="font-mono text-xs text-muted-foreground mb-0.5">
+          {entry.slug}
+        </p>
+        <p className="font-serif text-base text-foreground leading-snug">
+          {entry.title}
+        </p>
+      </div>
+
+      {/* Reading list count */}
+      <div className="shrink-0 text-right">
+        <p className="font-sans text-sm font-medium text-foreground">
+          {entry.readingList.length}
+        </p>
+        <p className="font-sans text-xs text-muted-foreground">items</p>
+      </div>
+
+      {/* Synthesis status */}
+      <div className="shrink-0">
+        <span
+          className={`font-sans text-xs px-1.5 py-0.5 rounded ${
+            entry.synthesisStatus === "started"
+              ? "bg-success/15 text-success"
+              : "bg-muted text-muted-foreground"
+          }`}
+        >
+          {entry.synthesisStatus}
+        </span>
+      </div>
+
+      {/* Word count */}
+      <div className="shrink-0 text-right hidden sm:block">
+        <p className="font-sans text-xs text-muted-foreground">
+          {entry.wordCount.toLocaleString()} words
+        </p>
+      </div>
     </div>
   );
 }
