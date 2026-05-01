@@ -51,6 +51,8 @@ interface NavItemProps {
   collapsed: boolean;
   /** Tiny progress dot. Undefined = no dot, null = no items (hidden), 0–100 = pct */
   dotPct?: number | null;
+  /** Pass end=true for root "/" so it only matches exactly (not all routes) */
+  end?: boolean;
 }
 
 function NavItem({
@@ -59,6 +61,7 @@ function NavItem({
   icon,
   collapsed,
   dotPct,
+  end,
 }: NavItemProps) {
   // Three-state dot: no items = hidden, 0% = faint ring, partial = mid, 100% = filled
   const showDot = dotPct !== undefined && dotPct !== null;
@@ -70,6 +73,7 @@ function NavItem({
         <TooltipTrigger asChild>
           <NavLink
             to={to}
+            {...(end !== undefined ? { end } : {})}
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg",
@@ -251,12 +255,13 @@ export function Sidebar() {
 
       {/* Scrollable nav area */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden py-4 px-2 flex flex-col gap-1">
-        {/* Dashboard */}
+        {/* Dashboard — end=true so it only shows active on exactly "/" */}
         <NavItem
           to="/"
           label="Dashboard"
           icon={<LayoutDashboard className="w-4 h-4" />}
           collapsed={collapsed}
+          end={true}
         />
 
         {/* Notes group */}
