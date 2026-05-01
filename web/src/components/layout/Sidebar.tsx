@@ -7,10 +7,11 @@
  * Collapsed: icon-only nav with tooltips.
  * Active route: aria-current="page" on the current nav item.
  *
- * TODO Phase 5: replace empty progress dots with real per-topic progress
+ * Phase 5: progress dots use real topicCompletenessPct data.
+ * Three-state dot: opacity-20 (0%), opacity-50 (partial), opacity-100 (100%).
  */
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
@@ -25,8 +26,10 @@ import {
   Circle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getTopics, getProjects } from "@/lib/manifest";
+import { getTopics, getProjects, getAllEntries } from "@/lib/manifest";
 import { useUiPrefs } from "@/hooks/useUiPrefs";
+import { useReadingProgress } from "@/hooks/useReadingProgress";
+import { topicCompletenessPct } from "@/lib/progress";
 import {
   Tooltip,
   TooltipContent,
@@ -46,9 +49,8 @@ interface NavItemProps {
   label: string;
   icon?: React.ReactNode;
   collapsed: boolean;
-  /** Tiny progress dot — Phase 5 wires real data */
-  showDot?: boolean;
-  dotFilled?: boolean;
+  /** Tiny progress dot. Undefined = no dot, null = no items (hidden), 0–100 = pct */
+  dotPct?: number | null;
 }
 
 function NavItem({
@@ -56,9 +58,12 @@ function NavItem({
   label,
   icon,
   collapsed,
-  showDot = false,
-  dotFilled = false,
+  dotPct,
 }: NavItemProps) {
+  // Three-state dot: no items = hidden, 0% = faint ring, partial = mid, 100% = filled
+  const showDot = dotPct !== undefined && dotPct !== null;
+  const dotFilled = dotPct === 100;
+  const dotPartial = dotPct !== null && dotPct !== undefined && dotPct > 0 && dotPct < 100;
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
@@ -86,14 +91,16 @@ function NavItem({
             {!collapsed && (
               <span className="truncate flex-1">{label}</span>
             )}
-            {/* Progress dot — Phase 5 wires real data */}
+            {/* Three-state progress dot */}
             {!collapsed && showDot && (
               <Circle
                 className={cn(
-                  "w-2 h-2 shrink-0",
+                  "w-2 h-2 shrink-0 transition-all duration-150",
                   dotFilled
                     ? "fill-manuscript-blue text-manuscript-blue"
-                    : "text-border"
+                    : dotPartial
+                    ? "fill-manuscript-blue/40 text-manuscript-blue/40"
+                    : "fill-border/30 text-border"
                 )}
                 aria-hidden="true"
               />
@@ -193,10 +200,14 @@ export function Sidebar() {
   const { prefs, setPref } = useUiPrefs();
   const collapsed = prefs.sidebarCollapsed;
   const location = useLocation();
+  const { progress } = useReadingProgress();
 
   // Load manifest data (safe after initManifest() in App.tsx)
   const topics = getTopics();
   const projects = getProjects();
+
+  // Build a minimal manifest shape for progress derivation
+  const manifest = useMemo(() => ({ generatedAt: "", entries: getAllEntries() }), []);
 
   // Separate the 7 topic entries from the orientation entry
   const topicEntries = topics.filter((t) => t.kind === "topic");
@@ -262,7 +273,6 @@ export function Sidebar() {
               to="/notes"
               label="All Notes"
               collapsed={collapsed}
-              showDot={false}
             />
 
             {/* 7 topic entries */}
@@ -272,8 +282,7 @@ export function Sidebar() {
                 to={`/notes/${topic.slug}`}
                 label={topic.title}
                 collapsed={collapsed}
-                showDot={true}
-                dotFilled={false} // TODO Phase 5: wire real progress
+                dotPct={topicCompletenessPct(topic.slug, manifest, progress)}
               />
             ))}
 
@@ -283,8 +292,7 @@ export function Sidebar() {
                 to="/notes/07-frontier-labs/orientation"
                 label="↳ Orientation"
                 collapsed={collapsed}
-                showDot={true}
-                dotFilled={false} // TODO Phase 5: wire real progress
+                dotPct={topicCompletenessPct(orientationEntry.slug, manifest, progress)}
               />
             )}
           </NavGroup>
@@ -311,7 +319,6 @@ export function Sidebar() {
                 to={`/projects/${project.slug}`}
                 label={project.title}
                 collapsed={collapsed}
-                showDot={false}
               />
             ))}
           </NavGroup>
