@@ -11,7 +11,7 @@
 import { useCallback } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
-import { Clock } from "lucide-react";
+import { Clock, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useReadingProgress } from "@/hooks/useReadingProgress";
 import type { ReadingListItem as ReadingListItemType } from "@/lib/manifest";
@@ -90,15 +90,21 @@ export function ReadingListItem({ item }: Props) {
                 target="_blank"
                 rel="noopener noreferrer"
                 className={cn(
+                  "inline-flex items-center gap-1",
                   "font-serif text-[17px] leading-snug",
                   "text-foreground underline decoration-border underline-offset-2",
                   "transition-colors duration-150",
                   "hover:text-primary hover:decoration-primary",
+                  "focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-1 focus-visible:rounded",
                   isRead && "line-through decoration-muted-foreground"
                 )}
                 onClick={(e) => e.stopPropagation()}
               >
                 {item.title || item.text}
+                <ExternalLink
+                  className="w-3 h-3 shrink-0 text-muted-foreground opacity-60"
+                  aria-hidden="true"
+                />
               </a>
             ) : (
               <span

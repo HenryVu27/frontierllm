@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type UserConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
@@ -70,7 +70,30 @@ export default defineConfig(async () => {
         "@": resolve(__dirname, "./src"),
       },
     },
-  };
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id: string) {
+            // Split heavy vendor libraries into separate cacheable chunks
+            if (id.includes("node_modules/framer-motion")) return "vendor-motion";
+            if (id.includes("node_modules/minisearch")) return "vendor-search";
+            if (
+              id.includes("node_modules/react/") ||
+              id.includes("node_modules/react-dom/") ||
+              id.includes("node_modules/react-router")
+            ) return "vendor-react";
+            if (
+              id.includes("node_modules/radix-ui") ||
+              id.includes("node_modules/cmdk") ||
+              id.includes("node_modules/class-variance-authority") ||
+              id.includes("node_modules/clsx") ||
+              id.includes("node_modules/tailwind-merge")
+            ) return "vendor-ui";
+          },
+        },
+      },
+    },
+  } satisfies UserConfig;
 });
 
 // Suppress unused import warning for createRequire — used implicitly for CJS interop

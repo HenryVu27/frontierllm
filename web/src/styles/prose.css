@@ -199,18 +199,25 @@
   font-family: var(--font-serif);
 }
 
-/* Heading anchor links — visible on hover only */
+/* Heading anchor links — visible on hover only, vermillion per spec §7 */
 .prose :where(h1, h2, h3, h4) a.heading-anchor {
   opacity: 0;
-  color: var(--muted-foreground);
+  color: var(--primary);
   text-decoration: none;
   margin-left: 0.5rem;
   font-weight: 400;
-  transition: opacity 150ms ease;
+  transition: opacity 150ms ease, color 150ms ease;
 }
 
 .prose :where(h1, h2, h3, h4):hover a.heading-anchor {
   opacity: 1;
+}
+
+.prose :where(h1, h2, h3, h4) a.heading-anchor:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: var(--radius);
 }
 
 /* Callout blocks — blog .callout */

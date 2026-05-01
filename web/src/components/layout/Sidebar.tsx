@@ -70,7 +70,6 @@ function NavItem({
         <TooltipTrigger asChild>
           <NavLink
             to={to}
-            aria-current={undefined} // react-router NavLink adds aria-current="page" automatically
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg",

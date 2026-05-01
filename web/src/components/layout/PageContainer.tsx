@@ -3,10 +3,13 @@
  * Wraps routed page content. Provides the framer-motion entrance animation
  * per spec §7: fade only (no Y translate to honour the blog's minimal motion).
  *
+ * Respects prefers-reduced-motion: when reduced motion is preferred, animations
+ * are disabled and the content renders instantly (spec §7, §17).
+ *
  * Width target: max-w-[660px] (spec §7 — prose column for Cormorant at 19px).
  */
 
-import { motion, type Transition } from "framer-motion";
+import { motion, type Transition, useReducedMotion } from "framer-motion";
 
 interface PageContainerProps {
   children: React.ReactNode;
@@ -22,9 +25,19 @@ const pageVariants = {
   exit: { opacity: 0 },
 };
 
+const pageVariantsReduced = {
+  initial: { opacity: 1 },
+  animate: { opacity: 1 },
+  exit: { opacity: 1 },
+};
+
 const pageTransition: Transition = {
   duration: 0.18,
   ease: "easeOut",
+};
+
+const pageTransitionReduced: Transition = {
+  duration: 0,
 };
 
 export function PageContainer({
@@ -32,14 +45,16 @@ export function PageContainer({
   className = "",
   id = "main-content",
 }: PageContainerProps) {
+  const shouldReduceMotion = useReducedMotion();
+
   return (
     <motion.main
       id={id}
-      variants={pageVariants}
+      variants={shouldReduceMotion ? pageVariantsReduced : pageVariants}
       initial="initial"
       animate="animate"
       exit="exit"
-      transition={pageTransition}
+      transition={shouldReduceMotion ? pageTransitionReduced : pageTransition}
       className={[
         "flex-1 min-w-0",
         "px-6 py-10 md:px-10 md:py-12",

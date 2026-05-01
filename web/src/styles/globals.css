@@ -150,7 +150,7 @@
 
   /* Vermillion selection tint */
   ::selection {
-    background: oklch(0.42 0.16 30 / 0.15);
+    background: color-mix(in oklch, var(--primary) 15%, transparent);
   }
 
   /* Interactive defaults */
@@ -178,6 +178,69 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─── Print suppression ───────────────────────────────────────────────────── */
+@media print {
+  /* Hide navigation chrome */
+  nav,
+  header,
+  aside,
+  [aria-label="On this page"],
+  [aria-label="Main navigation"],
+  .print-hidden {
+    display: none !important;
+  }
+
+  /* Main content fills full width */
+  body {
+    background: #fff !important;
+    color: #000 !important;
+    font-size: 12pt;
+  }
+
+  main {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Ensure prose column uses full width */
+  .max-w-\[660px\] {
+    max-width: 100% !important;
+  }
+
+  /* Reading-list checkboxes: render as static circles */
+  [data-slot="checkbox"] {
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    width: 12pt !important;
+    height: 12pt !important;
+    border: 1pt solid #000 !important;
+    border-radius: 50% !important;
+    background: transparent !important;
+    display: inline-block !important;
+  }
+
+  /* Code blocks: no background colors in print */
+  pre, code {
+    background: transparent !important;
+    border: 1pt solid #ccc !important;
+  }
+
+  /* Links: show URLs after link text */
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 9pt;
+    color: #555;
+  }
+
+  /* No page-break inside key blocks */
+  section, article, .border {
+    page-break-inside: avoid;
   }
 }
 

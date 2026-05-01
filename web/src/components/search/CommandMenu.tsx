@@ -131,6 +131,13 @@ export function CommandMenu({ open, onOpenChange }: CommandMenuProps) {
           </CommandGroup>
         )}
 
+        {/* ── Help hint when no query and no recent pages ───────────────── */}
+        {!query.trim() && recentPages.length === 0 && (
+          <p className="px-3 py-2 font-sans text-xs text-muted-foreground text-center">
+            Start typing to search, or use ↑↓ to navigate suggestions.
+          </p>
+        )}
+
         {/* ── Recent pages (shown when no query + have recent) ──────────── */}
         {!query.trim() && recentPages.length > 0 && (
           <>

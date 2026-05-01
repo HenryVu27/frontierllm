@@ -33,7 +33,7 @@ export function RecentEdits({ count = 5 }: Props) {
   if (entries.length === 0) {
     return (
       <p className="font-sans text-sm text-muted-foreground">
-        No recent edits found.
+        Nothing edited yet.
       </p>
     );
   }
