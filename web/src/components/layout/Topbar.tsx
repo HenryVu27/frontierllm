@@ -6,8 +6,9 @@
  */
 
 import { useLocation, Link } from "react-router-dom";
-import { Menu, Search, GitFork } from "lucide-react";
+import { Menu, GitFork } from "lucide-react";
 import { ThemeToggle } from "@/components/layout/ThemeToggle";
+import { SearchInput } from "@/components/search/SearchInput";
 import { getEntry } from "@/lib/manifest";
 import {
   Breadcrumb,
@@ -19,11 +20,10 @@ import {
 } from "@/components/ui/breadcrumb";
 import { cn } from "@/lib/utils";
 
-// TODO Phase 7: replace this placeholder with <SearchInput /> + cmd-k trigger
-
 interface TopbarProps {
   onMenuClick: () => void;
   sidebarCollapsed?: boolean;
+  onOpenCmdK?: () => void;
 }
 
 interface BreadcrumbSegment {
@@ -122,7 +122,7 @@ function useEditorLink(): string | null {
   return null;
 }
 
-export function Topbar({ onMenuClick }: TopbarProps) {
+export function Topbar({ onMenuClick, onOpenCmdK }: TopbarProps) {
   const breadcrumbs = useBreadcrumbs();
   const editorLink = useEditorLink();
 
@@ -189,39 +189,8 @@ export function Topbar({ onMenuClick }: TopbarProps) {
         </Breadcrumb>
       </div>
 
-      {/* Search input placeholder — Phase 7 wires real behavior */}
-      <div className="hidden md:flex flex-1 max-w-xs">
-        <label htmlFor="topbar-search" className="sr-only">
-          Search
-        </label>
-        <div
-          className={cn(
-            "flex items-center gap-2 w-full",
-            "px-3 h-8 rounded-lg",
-            "border border-border bg-muted/50",
-            "text-muted-foreground",
-            "cursor-not-allowed"
-          )}
-          role="button"
-          aria-disabled="true"
-          title="Search — coming in Phase 7"
-          tabIndex={-1}
-        >
-          {/* TODO Phase 7: replace with <SearchInput /> or cmd-k trigger */}
-          <Search className="w-3.5 h-3.5 shrink-0" />
-          <span className="font-sans text-xs truncate">Search...</span>
-          <kbd
-            className={cn(
-              "hidden sm:inline-flex items-center",
-              "ml-auto px-1 py-0.5 rounded",
-              "font-mono text-[10px] text-muted-foreground",
-              "border border-border bg-background"
-            )}
-          >
-            ⌘K
-          </kbd>
-        </div>
-      </div>
+      {/* Search input — compact pill on desktop, icon button on mobile */}
+      <SearchInput compact {...(onOpenCmdK ? { onOpenCmdK } : {})} />
 
       {/* Right actions */}
       <div className="flex items-center gap-2 shrink-0">

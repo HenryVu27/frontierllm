@@ -118,7 +118,14 @@ export const UI_PREFS_ENTRY: StorageEntry<UiPrefs> = {
   defaultValue: { readingFilter: "all", notesView: "grid", sidebarCollapsed: false },
 };
 
-export const RecentPagesSchema = z.array(z.string()).max(8);
+export const RecentPageEntrySchema = z.object({
+  slug: z.string(),
+  title: z.string(),
+  href: z.string(),
+});
+export type RecentPageEntry = z.infer<typeof RecentPageEntrySchema>;
+
+export const RecentPagesSchema = z.array(RecentPageEntrySchema).max(8);
 export type RecentPages = z.infer<typeof RecentPagesSchema>;
 
 export const RECENT_PAGES_ENTRY: StorageEntry<RecentPages> = {

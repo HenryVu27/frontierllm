@@ -12,11 +12,12 @@
  * component and non-component exports in routes.tsx (react-refresh lint rule).
  */
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Outlet, ScrollRestoration } from "react-router-dom";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Topbar } from "@/components/layout/Topbar";
 import { RightSidebar } from "@/components/layout/RightSidebar";
+import { CommandMenu } from "@/components/search/CommandMenu";
 import {
   Sheet,
   SheetContent,
@@ -24,17 +25,38 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { useUiPrefs } from "@/hooks/useUiPrefs";
+import { useRecentPagesTracker } from "@/hooks/useRecentPages";
 import { AnimatePresence } from "framer-motion";
 import { useLocation } from "react-router-dom";
 
 export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [cmdkOpen, setCmdkOpen] = useState(false);
   const { prefs } = useUiPrefs();
   const collapsed = prefs.sidebarCollapsed;
   const location = useLocation();
 
+  // Track recent pages on route change
+  useRecentPagesTracker();
+
+  // Global cmd-k / ctrl-k listener
+  const openCmdk = useCallback(() => setCmdkOpen(true), []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setCmdkOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   return (
     <div className="flex min-h-screen bg-background text-foreground">
+      {/* Global cmd-k palette — mounted at root, open state managed here */}
+      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen} />
       {/* Skip to content — visually hidden until focused (a11y spec §17) */}
       <a
         href="#main-content"
@@ -81,6 +103,7 @@ export function AppShell() {
         <Topbar
           onMenuClick={() => setMobileOpen(true)}
           sidebarCollapsed={collapsed}
+          onOpenCmdK={openCmdk}
         />
 
         {/* Content + Right Sidebar */}
