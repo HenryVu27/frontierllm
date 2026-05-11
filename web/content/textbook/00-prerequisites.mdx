@@ -1,0 +1,59 @@
+---
+slug: 00-prerequisites
+title: Prerequisites — orientation
+description: How to read this module, dependency chain across chapters, notation conventions.
+order: 0
+chapter: 0
+reading_minutes: 1
+depends_on: []
+provides: []
+last_reviewed: 2026-05-10
+---
+
+# Pipeline smoke test
+
+This is a placeholder to confirm the MDX pipeline renders. Phase 4 of the
+implementation replaces this with the real orientation page.
+
+<Callout variant="info" title="Hello">
+Inline math: $d_1 = \frac{\ln(S/K)}{\sigma\sqrt{\tau}}$ — verify KaTeX is loading.
+</Callout>
+
+<Callout variant="warning">
+Variant without an explicit title — should display "Caution".
+</Callout>
+
+A sidenote in flowing prose<Sidenote>This expands when clicked. Verify the numbering increments.</Sidenote> and another<Sidenote>Second sidenote — number should be 2.</Sidenote> right after.
+
+<ComparisonTable
+  caption="Trivial comparison table to verify the component renders."
+  columns={["A", "B", "C"]}
+  rows={[
+    ["row-1-a", "row-1-b", "row-1-c"],
+    ["row-2-a", "row-2-b", "row-2-c"],
+  ]}
+/>
+
+Display math:
+
+$$
+\mathrm{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}
+$$
+
+A fenced code block:
+
+```python
+def attention(Q, K, V):
+    return softmax(Q @ K.T / math.sqrt(Q.shape[-1])) @ V
+```
+
+<Sources items={[
+  {
+    authors: "Vaswani, A. et al.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original transformer paper — cited everywhere in this module."
+  }
+]} />

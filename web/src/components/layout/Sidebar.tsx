@@ -16,6 +16,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
   BookOpen,
+  GraduationCap,
   FolderKanban,
   List,
   Info,
@@ -326,6 +327,16 @@ export function Sidebar() {
               />
             ))}
           </NavGroup>
+        </div>
+
+        {/* Textbook */}
+        <div className="mt-3">
+          <NavItem
+            to="/textbook"
+            label="Textbook"
+            icon={<GraduationCap className="w-4 h-4" />}
+            collapsed={collapsed}
+          />
         </div>
 
         {/* Reading List */}

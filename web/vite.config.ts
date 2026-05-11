@@ -5,7 +5,7 @@ import { resolve } from "path";
 import { createRequire } from "module";
 import mdx from "@mdx-js/rollup";
 import remarkFrontmatter from "remark-frontmatter";
-import { remarkMdxFrontmatter } from "remark-mdx-frontmatter";
+import remarkMdxFrontmatter from "remark-mdx-frontmatter";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";

@@ -54,24 +54,26 @@ function entriesFromModules(): ChapterEntry[] {
   const entries: ChapterEntry[] = [];
   for (const [filePath, mod] of Object.entries(modules)) {
     if (!mod.frontmatter) {
-      // eslint-disable-next-line no-console
       console.warn(`[textbook] ${filePath} is missing frontmatter — skipped`);
       continue;
     }
     const fm = mod.frontmatter;
-    entries.push({
+    const entry: ChapterEntry = {
       slug: fm.slug,
       title: fm.title,
       description: fm.description,
       order: fm.order,
-      chapter: fm.chapter,
       reading_minutes: fm.reading_minutes,
       depends_on: fm.depends_on ?? [],
       provides: fm.provides ?? [],
       last_reviewed: fm.last_reviewed,
       Component: mod.default,
       filePath,
-    });
+    };
+    if (fm.chapter !== undefined) {
+      entry.chapter = fm.chapter;
+    }
+    entries.push(entry);
   }
   return entries.sort((a, b) => a.order - b.order);
 }
@@ -93,7 +95,7 @@ export function getAdjacentChapters(
   const idx = ALL.findIndex((c) => c.slug === slug);
   if (idx === -1) return { prev: null, next: null };
   return {
-    prev: idx > 0 ? ALL[idx - 1] : null,
-    next: idx < ALL.length - 1 ? ALL[idx + 1] : null,
+    prev: idx > 0 ? (ALL[idx - 1] ?? null) : null,
+    next: idx < ALL.length - 1 ? (ALL[idx + 1] ?? null) : null,
   };
 }

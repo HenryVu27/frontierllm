@@ -15,7 +15,6 @@ export function Sidenote({ children }: SidenoteProps) {
   // Reset semantics are best-effort — pages remount on navigation in this SPA,
   // so this is acceptable for an MVP. If numbering becomes wrong, replace this
   // with a SidenoteProvider that resets per chapter.
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const [num] = useState(() => ++counter);
 
   return (
