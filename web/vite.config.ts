@@ -3,6 +3,15 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
 import { createRequire } from "module";
+import mdx from "@mdx-js/rollup";
+import remarkFrontmatter from "remark-frontmatter";
+import { remarkMdxFrontmatter } from "remark-mdx-frontmatter";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import rehypeSlug from "rehype-slug";
+import rehypeAutolinkHeadings from "rehype-autolink-headings";
+import rehypePrettyCode from "rehype-pretty-code";
 
 // https://vite.dev/config/
 export default defineConfig(async () => {
@@ -64,7 +73,32 @@ export default defineConfig(async () => {
   };
 
   return {
-    plugins: [react(), tailwindcss(), contentPlugin],
+    plugins: [
+      mdx({
+        remarkPlugins: [
+          remarkFrontmatter,
+          [remarkMdxFrontmatter, { name: "frontmatter" }],
+          remarkGfm,
+          remarkMath,
+        ],
+        rehypePlugins: [
+          rehypeSlug,
+          [rehypeAutolinkHeadings, { behavior: "wrap" }],
+          [rehypeKatex, { strict: false }],
+          [
+            rehypePrettyCode,
+            {
+              theme: { light: "github-light", dark: "github-dark-dimmed" },
+              keepBackground: false,
+            },
+          ],
+        ],
+        providerImportSource: "@mdx-js/react",
+      }),
+      react(),
+      tailwindcss(),
+      contentPlugin,
+    ],
     resolve: {
       alias: {
         "@": resolve(__dirname, "./src"),
