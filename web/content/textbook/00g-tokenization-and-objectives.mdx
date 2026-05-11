@@ -20,7 +20,7 @@ This chapter traces the full pipeline: how modern tokenisers are built (§ [BPE]
 Content calibrated to frontier-model practice as of May 2026. The underlying algorithms are stable; the vocabulary-size and objective-choice tables age fastest. Recheck every 6–12 months.
 </Callout>
 
-**Notation used in this chapter.** $V$ denotes vocabulary size. $d$ denotes the model (residual-stream) dimension, written $d_{\text{model}}$ where disambiguation is needed. $T$ is sequence length in tokens. $E \in \mathbb{R}^{V \times d}$ is the input embedding matrix; $W_U \in \mathbb{R}^{d \times V}$ is the output (unembedding) matrix. Log and entropy are in nats unless otherwise noted (matching PyTorch and JAX defaults).
+**Notation used in this chapter.** $V$ denotes vocabulary size. $d$ denotes the model (residual-stream) dimension, written $d_\text{model}$ where disambiguation is needed. $T$ is sequence length in tokens. $E \in \mathbb{R}^{V \times d}$ is the input embedding matrix; $W_U \in \mathbb{R}^{d \times V}$ is the output (unembedding) matrix. Log and entropy are in nats unless otherwise noted (matching PyTorch and JAX defaults).
 
 ---
 

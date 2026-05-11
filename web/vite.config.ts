@@ -19,6 +19,7 @@ export default defineConfig(async () => {
   // Dynamically import ESM-only modules
   const chokidar = await import("chokidar");
   const { buildContent } = await import("./scripts/build-content.js");
+  const { buildTextbook } = await import("./scripts/build-textbook.js");
 
   let rebuildTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -27,6 +28,7 @@ export default defineConfig(async () => {
 
     async buildStart() {
       await buildContent();
+      await buildTextbook();
     },
 
     configureServer(
@@ -38,6 +40,7 @@ export default defineConfig(async () => {
           resolve(__dirname, "../notes"),
           resolve(__dirname, "../projects"),
           resolve(__dirname, "../README.md"),
+          resolve(__dirname, "./content/textbook"),
         ],
         {
           ignoreInitial: true,
@@ -51,6 +54,7 @@ export default defineConfig(async () => {
         rebuildTimer = setTimeout(async () => {
           try {
             await buildContent();
+            await buildTextbook();
             // Touch the manifest to trigger HMR
             server.ws.send({ type: "full-reload" });
           } catch (err) {
@@ -64,6 +68,7 @@ export default defineConfig(async () => {
         rebuildTimer = setTimeout(async () => {
           try {
             await buildContent();
+            await buildTextbook();
             server.ws.send({ type: "full-reload" });
           } catch (err) {
             process.stderr.write(`[frontierllm-content] rebuild error: ${err}\n`);

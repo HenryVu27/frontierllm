@@ -10,7 +10,13 @@
       "Bash(git reset *)",
       "Bash(git push *)",
       "WebFetch",
-      "WebSearch"
+      "WebSearch",
+      "Bash(npm run *)",
+      "Bash(grep -E \"\\\\.mdx$\")",
+      "Bash(npm ls *)",
+      "Bash(grep -c \"\\\\\\\\\\\\\\\\{#\" content/textbook/00d-normalization-and-init.mdx)",
+      "Bash(grep *)",
+      "Bash(awk 'NR==17 || NR==33 || NR==73 || NR==127 || NR==197 || NR==251 || NR==319 || NR==371 { for\\(i=1;i<=length\\($0\\);i++\\) printf \"%s[%d] \", substr\\($0,i,1\\), i; print \"\"; print \"---\"; print $0; print \"===\"}' C:/Personal/frontierllm/web/content/textbook/00d-normalization-and-init.mdx)"
     ]
   }
 }

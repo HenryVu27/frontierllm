@@ -408,9 +408,9 @@ The SwiGLU/GeGLU split among gated models follows organizational lines: Meta, Al
 
 ### Connection to MoE architectures
 
-In mixture-of-experts models (covered in [MoE plumbing](/textbook/00h-moe-plumbing#expert-ffn)), each routed expert is typically a SwiGLU FFN. The 2/3 width adjustment applies per expert: if a model has $E$ experts each with hidden dimension $d_\text{ff}'$, the per-expert parameter cost is $3 d_\text{model} d_\text{ff}'$. DeepSeek-V3 exemplifies this: 256 routed experts per layer, each a $7168 \to 2048 \to 7168$ SwiGLU block.
+In mixture-of-experts models (covered in [MoE plumbing](/textbook/00h-moe-plumbing#frontier-moe-landscape)), each routed expert is typically a SwiGLU FFN. The 2/3 width adjustment applies per expert: if a model has $E$ experts each with hidden dimension $d_\text{ff}'$, the per-expert parameter cost is $3 d_\text{model} d_\text{ff}'$. DeepSeek-V3 exemplifies this: 256 routed experts per layer, each a $7168 \to 2048 \to 7168$ SwiGLU block.
 
-The pre-norm placement of [RMSNorm](/textbook/00d-normalization-and-init#rms-norm) before each FFN sub-block means the input $x$ to the FFN is already normalised. This interacts with activation-function choice: an RMSNorm-normalised input has roughly unit RMS, so pre-activations $xW$ are approximately normally distributed with standard deviation controlled by the initialisation of $W$. Both GELU and SiLU operate well in this regime.
+The pre-norm placement of [RMSNorm](/textbook/00d-normalization-and-init#rmsnorm) before each FFN sub-block means the input $x$ to the FFN is already normalised. This interacts with activation-function choice: an RMSNorm-normalised input has roughly unit RMS, so pre-activations $xW$ are approximately normally distributed with standard deviation controlled by the initialisation of $W$. Both GELU and SiLU operate well in this regime.
 
 ---
 

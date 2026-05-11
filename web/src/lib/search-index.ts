@@ -15,6 +15,19 @@
 import MiniSearch from "minisearch";
 import { getAllEntries } from "@/lib/manifest";
 import type { ManifestEntry } from "@/lib/manifest";
+import { getAllChapters } from "@/lib/textbook";
+import textbookSectionsRaw from "@/generated/textbook-search.json";
+
+interface TextbookSection {
+  id: string;
+  slug: string;
+  title: string;
+  heading: string;
+  anchor: string;
+  content: string;
+}
+
+const textbookSections = textbookSectionsRaw as TextbookSection[];
 
 // ─── Document types ───────────────────────────────────────────────────────────
 
@@ -28,6 +41,8 @@ export interface SearchDoc {
   href: string;
   /** Slug of the parent entry (topic/project) */
   slug: string;
+  /** Body text for content search (textbook sections only). Indexed but not stored. */
+  body?: string;
 }
 
 export interface GroupedResults {
@@ -146,10 +161,41 @@ export function buildIndex(): MiniSearch<SearchDoc> {
     }
   }
 
+  // ── Textbook chapters and sections ──────────────────────────────────────
+  for (const chapter of getAllChapters()) {
+    const chapterBreadcrumb =
+      chapter.chapter !== undefined && chapter.chapter > 0
+        ? `Textbook / Chapter ${chapter.chapter}`
+        : `Textbook`;
+
+    docs.push({
+      id: `textbook-page:${chapter.slug}`,
+      kind: "page",
+      title: chapter.title,
+      subtitle: chapter.description,
+      breadcrumb: chapterBreadcrumb,
+      href: `/textbook/${chapter.slug}`,
+      slug: chapter.slug,
+    });
+  }
+
+  for (const section of textbookSections) {
+    docs.push({
+      id: `textbook-section:${section.id}`,
+      kind: "heading",
+      title: section.heading,
+      subtitle: section.title,
+      breadcrumb: `Textbook / ${section.title}`,
+      href: `/textbook/${section.slug}#${section.anchor}`,
+      slug: section.slug,
+      body: section.content,
+    });
+  }
+
   _docs = docs;
 
   _index = new MiniSearch<SearchDoc>({
-    fields: ["title", "subtitle", "breadcrumb"],
+    fields: ["title", "subtitle", "breadcrumb", "body"],
     storeFields: ["id", "kind", "title", "subtitle", "breadcrumb", "href", "slug"],
     searchOptions: {
       boost: { title: 3, breadcrumb: 3 },
@@ -184,6 +230,7 @@ export function searchAll(
       title: 3,
       breadcrumb: 3,
       subtitle: 1.5,
+      body: 1,
     },
     fuzzy: 0.2,
     prefix: true,

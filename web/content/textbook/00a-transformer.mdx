@@ -16,9 +16,9 @@ Every frontier language model built today — Llama 3, DeepSeek-V3, Gemma 3, Qwe
 
 The chapter proceeds in five sections. The first introduces the *residual-stream framing*, a mental model that makes the whole architecture legible as a communication channel rather than a stack of opaque layers. The second derives scaled dot-product attention from first principles and works through a complete numerical example. The third covers the MLP sub-layer. The fourth addresses how blocks stack and why the placement of normalisation layers became the subject of active research through 2024–2026. The fifth derives the compute and memory cost of a single block so that you can reason quantitatively about training budgets and inference hardware.
 
-Later chapters cover the major modifications the field has made to this baseline: [attention variants including GQA and MLA](/textbook/00b-attention-variants#gqa-math), [positional encodings and RoPE](/textbook/00c-positional-encodings#rope-rotation), [RMSNorm versus LayerNorm](/textbook/00d-normalization-and-init#rmsnorm-vs-layernorm), [SwiGLU and the gating family](/textbook/00e-activations-and-gating#swiglu-formula), and [mixture-of-experts routing](/textbook/00h-moe-plumbing#moe-routing). This chapter introduces each of those topics at the signpost level and defers depth to the relevant chapter.
+Later chapters cover the major modifications the field has made to this baseline: [attention variants including GQA and MLA](/textbook/00b-attention-variants#gqa), [positional encodings and RoPE](/textbook/00c-positional-encodings#rope), [RMSNorm versus LayerNorm](/textbook/00d-normalization-and-init#rmsnorm), [SwiGLU and the gating family](/textbook/00e-activations-and-gating#swiglu), and [mixture-of-experts routing](/textbook/00h-moe-plumbing#top-k-routing). This chapter introduces each of those topics at the signpost level and defers depth to the relevant chapter.
 
-**Notation.** Throughout this chapter: $d$ or $d_{model}$ is the model dimension (the width of the residual stream); $L$ is the number of transformer blocks; $h$ is the number of attention heads; $d_k = d/h$ is the per-head key and query dimension; $d_v = d/h$ is the per-head value dimension (standard parameterisation); $d_{ff}$ is the FFN hidden dimension, defaulting to $4d$; $T$ is sequence length; $N$ denotes total non-embedding parameters. Weight matrices are indexed as $W_i^Q \in \mathbb{R}^{d \times d_k}$ for head $i$; the output projection as $W^O \in \mathbb{R}^{hd_v \times d}$.
+**Notation.** Throughout this chapter: $d$ or $d_\text{model}$ is the model dimension (the width of the residual stream); $L$ is the number of transformer blocks; $h$ is the number of attention heads; $d_k = d/h$ is the per-head key and query dimension; $d_v = d/h$ is the per-head value dimension (standard parameterisation); $d_{ff}$ is the FFN hidden dimension, defaulting to $4d$; $T$ is sequence length; $N$ denotes total non-embedding parameters. Weight matrices are indexed as $W_i^Q \in \mathbb{R}^{d \times d_k}$ for head $i$; the output projection as $W^O \in \mathbb{R}^{hd_v \times d}$.
 
 ---
 
@@ -94,7 +94,7 @@ Attention is invariant to the order of key-value pairs for any fixed query. If y
 
 The following example computes multi-head attention end-to-end for a minimal model. All arithmetic is exact; a calculator is sufficient to reproduce it.
 
-**Setup:** $d_{model} = 8$, $h = 2$ heads, $d_k = d_v = 4$, $T = 4$ tokens, causal mask. We work through head 1 in detail.
+**Setup:** $d_\text{model} = 8$, $h = 2$ heads, $d_k = d_v = 4$, $T = 4$ tokens, causal mask. We work through head 1 in detail.
 
 **Step 1 — Input matrix.** Suppose the residual stream at four token positions is the $4 \times 8$ identity-like matrix:
 
@@ -156,7 +156,7 @@ where $x \in \mathbb{R}^d$, $W_1 \in \mathbb{R}^{d_{ff} \times d}$, $W_2 \in \ma
 
 **Parameter count per layer.** The two weight matrices contribute $d \cdot d_{ff} + d_{ff} \cdot d = 2 d d_{ff}$ parameters. With $d_{ff} = 4d$: $8d^2$ MLP parameters per layer. The attention sub-layer contributes $4d^2$ (three projection matrices at $d \times d_k$ each plus $W^O$, totalling $4d^2$ for standard MHA with $d_k = d/h$, $h$ heads). The MLP therefore holds twice as many parameters as the attention sub-layer in a standard block.
 
-**Parameter ratio.** With GQA reducing the number of K/V heads (see [Chapter 00b](/textbook/00b-attention-variants#gqa-math)), the K and V projection matrices shrink proportionally. If the model uses $h_{kv}$ KV heads instead of $h$, the total attention parameters are $(h + 2 h_{kv}) d_k \cdot d + d^2$ rather than $4d^2$. For Llama 3.1 (2024) with $h = 32$, $h_{kv} = 8$, the attention parameters are approximately $(32 + 16)/32 \times d^2 = 1.5 d^2$ per head-parameter block — roughly half the standard MHA count, making the MLP even more dominant by parameter count.
+**Parameter ratio.** With GQA reducing the number of K/V heads (see [Chapter 00b](/textbook/00b-attention-variants#gqa)), the K and V projection matrices shrink proportionally. If the model uses $h_{kv}$ KV heads instead of $h$, the total attention parameters are $(h + 2 h_{kv}) d_k \cdot d + d^2$ rather than $4d^2$. For Llama 3.1 (2024) with $h = 32$, $h_{kv} = 8$, the attention parameters are approximately $(32 + 16)/32 \times d^2 = 1.5 d^2$ per head-parameter block — roughly half the standard MHA count, making the MLP even more dominant by parameter count.
 
 ### Activation history and frontier practice
 
@@ -168,7 +168,7 @@ $$\text{SwiGLU}(x) = (W_1 x) \odot \text{Swish}(W_3 x)$$
 
 $$\text{FFN}_{\text{gated}}(x) = W_2 \cdot \text{SwiGLU}(x)$$
 
-where $\odot$ is element-wise multiplication and $\text{Swish}(z) = z \cdot \sigma(z)$. This architecture uses three weight matrices per MLP block instead of two and adjusts $d_{ff}$ to $\frac{8}{3} d$ (approximately $2.67d$) to maintain the same parameter count as a $4d$ non-gated MLP. The full derivation of the $8/3$ factor and why gating helps empirically is in [Chapter 00e](/textbook/00e-activations-and-gating#swiglu-formula).
+where $\odot$ is element-wise multiplication and $\text{Swish}(z) = z \cdot \sigma(z)$. This architecture uses three weight matrices per MLP block instead of two and adjusts $d_{ff}$ to $\frac{8}{3} d$ (approximately $2.67d$) to maintain the same parameter count as a $4d$ non-gated MLP. The full derivation of the $8/3$ factor and why gating helps empirically is in [Chapter 00e](/textbook/00e-activations-and-gating#swiglu).
 
 For the purposes of this chapter, the important point is that the *role* of the MLP block is the same regardless of activation choice: it performs per-position computation on the updated residual stream, independently for each token. The attention sub-layer is responsible for mixing information across positions; the MLP is responsible for transforming the per-position representation.
 
@@ -251,7 +251,7 @@ The outer normalisation bounds the magnitude of the sub-layer's output before it
   ]}
 />
 
-Two patterns are unambiguous from this table. First, RMSNorm has replaced LayerNorm in every model trained after 2023; this convergence is discussed in detail in [Chapter 00d](/textbook/00d-normalization-and-init#rmsnorm-vs-layernorm). Second, pre-norm remains the plurality choice, but Peri-LN adoption is accelerating with Gemma 2, OLMo 2, Gemma 3, and OLMo 3. The norm-placement question is not settled as of 2026, in the sense that the field has not converged to a single dominant choice the way it converged to pre-norm in 2020–2023.
+Two patterns are unambiguous from this table. First, RMSNorm has replaced LayerNorm in every model trained after 2023; this convergence is discussed in detail in [Chapter 00d](/textbook/00d-normalization-and-init#rmsnorm). Second, pre-norm remains the plurality choice, but Peri-LN adoption is accelerating with Gemma 2, OLMo 2, Gemma 3, and OLMo 3. The norm-placement question is not settled as of 2026, in the sense that the field has not converged to a single dominant choice the way it converged to pre-norm in 2020–2023.
 
 For closed-weight models (the GPT-4 generation, Claude, Gemini 1.5 and later), the norm type and placement are not publicly reported. Based on the convergence visible in open-weight models, pre-norm RMSNorm is the most probable choice, but this is inference from industry trends rather than confirmed fact.
 
@@ -265,7 +265,7 @@ Understanding how much compute a transformer block requires is necessary for rea
 
 **Counting convention.** One multiply-add (a single multiply followed by a single add) counts as 2 FLOPs. A matrix-vector product of shape $(m, n) \times (n, 1)$ costs $2mn$ FLOPs.
 
-**Symbols:** $d = d_{model}$, $d_{ff} = 4d$, $L$ = layers, $T$ = sequence length, $N$ = total non-embedding parameters.
+**Symbols:** $d = d_\text{model}$, $d_{ff} = 4d$, $L$ = layers, $T$ = sequence length, $N$ = total non-embedding parameters.
 
 The per-token FLOPs for each component of one transformer block are:
 
@@ -343,7 +343,7 @@ At a context of 8,192 tokens: $128 \text{ KB} \times 8{,}192 \approx 1.05 \text{
 
 $$\text{KV cache per token} = 2 \times 96 \times 96 \times 128 \times 2 = 4{,}718{,}592 \text{ bytes} \approx 4.5 \text{ MB/token}$$
 
-At 2,048 tokens: $\approx 9.2 \text{ GB}$ of KV cache per sequence. This is why GQA, which reduces $h_{kv}$ from $h$ to $h/g$ for some group count $g$, was a critical efficiency gain for long-context serving: an 8× reduction in KV heads cuts the per-sequence KV cache by 8×. The arithmetic and tradeoffs of GQA, MQA, and MLA are treated in detail in [Chapter 00b](/textbook/00b-attention-variants#gqa-math).
+At 2,048 tokens: $\approx 9.2 \text{ GB}$ of KV cache per sequence. This is why GQA, which reduces $h_{kv}$ from $h$ to $h/g$ for some group count $g$, was a critical efficiency gain for long-context serving: an 8× reduction in KV heads cuts the per-sequence KV cache by 8×. The arithmetic and tradeoffs of GQA, MQA, and MLA are treated in detail in [Chapter 00b](/textbook/00b-attention-variants#gqa).
 
 ### Activation memory during training
 
@@ -376,7 +376,7 @@ For a 7B model ($L = 32$, $d = 4{,}096$) with a batch of $B = 1{,}024$ tokens, t
 This chapter has introduced the transformer block as Vaswani et al. defined it in 2017. Every frontier model today is built on the same skeleton — residual stream, attention sub-layer, MLP sub-layer — but diverges from the 2017 baseline in a predictable set of ways. The following table maps those divergences to the chapters that cover them.
 
 <ComparisonTable
-  caption="Modifications to the 2017 transformer baseline adopted by frontier labs, with approximate adoption timeline and pointer to the chapter treating each in depth."
+  caption="Modifications to the 2017 baseline as of May 2026. Sources for each item are in the relevant chapter linked in the rightmost column."
   columns={["Modification", "What changed from 2017", "When broadly adopted", "Chapter"]}
   rows={[
     ["RMSNorm", "Remove mean subtraction from LayerNorm; cheaper compute, similar quality", "2019–2022; universal in frontier models by 2023", "00d"],

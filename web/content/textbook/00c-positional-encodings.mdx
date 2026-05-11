@@ -33,15 +33,15 @@ The schemes divide into two families:
 
 ### Sinusoidal encoding (Vaswani et al., 2017)
 
-The original transformer (Vaswani et al., NeurIPS 2017, arXiv:1706.03762) assigns each position $\mathrm{pos}$ a deterministic vector in $\mathbb{R}^{d_\mathrm{model}}$, defined dimension-by-dimension:
+The original transformer (Vaswani et al., NeurIPS 2017, arXiv:1706.03762) assigns each position $\mathrm{pos}$ a deterministic vector in $\mathbb{R}^{d_\text{model}}$, defined dimension-by-dimension:
 
 $$
-\mathrm{PE}(\mathrm{pos},\, 2i)   = \sin\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\mathrm{model}}}\right),
+\mathrm{PE}(\mathrm{pos},\, 2i)   = \sin\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\text{model}}}\right),
 \qquad
-\mathrm{PE}(\mathrm{pos},\, 2i+1) = \cos\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\mathrm{model}}}\right).
+\mathrm{PE}(\mathrm{pos},\, 2i+1) = \cos\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\text{model}}}\right).
 $$
 
-The even-indexed dimensions use sine; the odd-indexed dimensions use cosine. The denominator $10000^{2i/d_\mathrm{model}}$ creates a geometric progression of wavelengths from $2\pi$ (at dimension 0) to $10000 \cdot 2\pi$ (at dimension $d_\mathrm{model} - 1$). This encoding is added, not concatenated, to the token embedding before the first layer.
+The even-indexed dimensions use sine; the odd-indexed dimensions use cosine. The denominator $10000^{2i/d_\text{model}}$ creates a geometric progression of wavelengths from $2\pi$ (at dimension 0) to $10000 \cdot 2\pi$ (at dimension $d_\text{model} - 1$). This encoding is added, not concatenated, to the token embedding before the first layer.
 
 The authors offered two motivations. First, for any fixed offset $k$, the encoding $\mathrm{PE}(\mathrm{pos} + k)$ can be expressed as a **linear function** of $\mathrm{PE}(\mathrm{pos})$, which they hoped would make it easy for the model to learn relative-position patterns by composition. Second, the encoding generalises to sequence lengths not seen during training — there is no learned lookup table to run out of entries.
 
@@ -53,7 +53,7 @@ Despite the theoretical argument that PE(pos + k) is a linear function of PE(pos
 
 ### Learned absolute encoding {#learned-absolute}
 
-BERT (Devlin et al., 2018, arXiv:1810.04805) and GPT-2 (Radford et al., 2019) replace the deterministic formula with a learnable embedding table $\mathbf{E} \in \mathbb{R}^{T_\mathrm{max} \times d_\mathrm{model}}$, where $T_\mathrm{max}$ is a hard upper bound on sequence length fixed at training time. BERT uses $T_\mathrm{max} = 512$; GPT-2 uses $T_\mathrm{max} = 1\,024$; GPT-3 uses $T_\mathrm{max} = 2\,048$.
+BERT (Devlin et al., 2018, arXiv:1810.04805) and GPT-2 (Radford et al., 2019) replace the deterministic formula with a learnable embedding table $\mathbf{E} \in \mathbb{R}^{T_\mathrm{max} \times d_\text{model}}$, where $T_\mathrm{max}$ is a hard upper bound on sequence length fixed at training time. BERT uses $T_\mathrm{max} = 512$; GPT-2 uses $T_\mathrm{max} = 1\,024$; GPT-3 uses $T_\mathrm{max} = 2\,048$.
 
 The row $\mathbf{E}[\mathrm{pos}]$ is added to the token embedding at position $\mathrm{pos}$. The table is updated by gradient descent alongside all other parameters.
 

@@ -1,59 +1,283 @@
 ---
 slug: 00-prerequisites
 title: Prerequisites — orientation
-description: How to read this module, dependency chain across chapters, notation conventions.
+description: How to read this module, dependency chain across chapters, and notation conventions.
 order: 0
 chapter: 0
-reading_minutes: 1
+reading_minutes: 18
 depends_on: []
 provides: []
-last_reviewed: 2026-05-10
+last_reviewed: 2026-05-11
 ---
 
-# Pipeline smoke test
+## About this module {#about}
 
-This is a placeholder to confirm the MDX pipeline renders. Phase 4 of the
-implementation replaces this with the real orientation page.
+This module is a self-contained textbook on the mathematical and engineering foundations of large language models. It covers the transformer block and every major component that frontier labs have modified from the 2017 baseline: attention variants, positional encodings, normalisation schemes, activations and gating, optimisers, tokenisation, and mixture-of-experts routing. After completing all eight chapters, a reader should be able to read a model technical report — DeepSeek-V3, Llama 3, Qwen 3, Gemma 3 — and understand every architectural choice it describes without consulting external references.
 
-<Callout variant="info" title="Hello">
-Inline math: $d_1 = \frac{\ln(S/K)}{\sigma\sqrt{\tau}}$ — verify KaTeX is loading.
+The module does not teach Python, PyTorch, undergraduate machine learning, or the practice of fine-tuning. Those are prerequisites for this module, not its content. It also does not cover pretraining data curation, post-training alignment, evaluation methodology, or the economics of scaling — each of those has its own module in this repo.
+
+The mathematics is presented at the level of Goodfellow, Bengio, and Courville's *Deep Learning* (2016) and Bishop's *Pattern Recognition and Machine Learning* (2006). Derivations are complete where the step-by-step arithmetic is the pedagogical payoff; they are abbreviated where the result is standard and a pointer to a primary source is more useful. Every major claim about frontier-lab practice carries a citation with a year, because the "what frontier labs ship" tables are the fastest-ageing part of the material.
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier-model practice as of May 2026. The mathematical definitions are durable. The comparison tables — which models use which attention variant, which optimiser, which positional encoding — age fastest. Recheck those tables every 6–12 months against published technical reports.
 </Callout>
 
-<Callout variant="warning">
-Variant without an explicit title — should display "Caution".
+---
+
+## What this module covers {#chapter-list}
+
+Eight chapters, each addressing one cluster of foundational concepts.
+
+**[Chapter 1 — The transformer block](/textbook/00a-transformer)**
+The residual-stream framing (Elhage et al., 2021), scaled dot-product attention with a complete worked numerical example, the MLP sub-block, pre-norm vs post-norm placement and the 2024–2026 Peri-LN variants, and a component-by-component derivation of FLOPs per token and KV cache size. The skeleton every other chapter builds on.
+
+**[Chapter 2 — Attention variants and FlashAttention](/textbook/00b-attention-variants)**
+The MHA → MQA → GQA → MLA progression: the math of each, the KV-cache arithmetic, and the quality/efficiency tradeoffs with worked numbers from the Llama 3.1 family and DeepSeek-V3. Sliding-window attention and its rolling-buffer implementation. The FlashAttention IO-aware tiling algorithm and why it reduces HBM traffic from $\Theta(N^2)$ to $\Theta(Nd)$ without changing the arithmetic. SSM-hybrid architectures (Jamba, Zamba, RecurrentGemma) and why softmax attention remains dominant at frontier scale as of 2026.
+
+**[Chapter 3 — Positional encodings](/textbook/00c-positional-encodings)**
+Why attention is permutation-equivariant without a positional signal. Sinusoidal and learned absolute encodings. Relative encodings: T5 bucket biases, ALiBi. Rotary position embedding (RoPE): the rotation math, why it encodes relative distance in the dot product, and a worked end-to-end example with concrete numbers. Context-extension methods: position interpolation, NTK-aware scaling, YaRN, LongRoPE. A comparison table of frontier-model choices as of 2026.
+
+**[Chapter 4 — Normalisation and initialisation](/textbook/00d-normalization-and-init)**
+LayerNorm vs RMSNorm: the full math of each, the worked examples with the same input vector, and the 2024 mechanistic evidence for why mean-centering is redundant in practice. Pre-norm vs post-norm gradient flow. QK-norm and the attention-logit blow-up problem it addresses. Weight initialisation: small-variance baseline, depth-scaled output-projection init ($2/L$ scaling), fan-in/out conventions, embedding init. Maximal Update Parametrization ($\mu$P) and what it actually transfers across model widths.
+
+**[Chapter 5 — Activations and gating](/textbook/00e-activations-and-gating)**
+The activation history: ReLU, GELU, SiLU/Swish — the numerical shape of each, the gradient at zero, the dead-neuron failure mode. Gated linear units: the GLU family (GLU, SwiGLU, GeGLU, ReGLU). The 2/3 width adjustment that keeps a gated FFN parameter-count-neutral relative to a 4$d$ non-gated MLP, with the arithmetic derived step by step. Why virtually every frontier model as of 2022–2026 uses SwiGLU.
+
+**[Chapter 6 — Optimisers and learning-rate schedules](/textbook/00f-optimizers)**
+SGD and momentum as the baseline. Adam: the two moment estimates, bias correction, the role of each hyperparameter ($\beta_1$, $\beta_2$, $\epsilon$). AdamW and why decoupled weight decay matters. Lion: sign-of-momentum update, memory savings, hyperparameter shifts vs AdamW. Muon: the Newton-Schulz orthogonalisation story and its 2024–2026 adoption trajectory. Shampoo/SOAP: the preconditioned-gradient approach and where the compute cost lives. Learning-rate schedules: warmup-cosine, WSD (warmup-stable-decay), and the continuous-pretraining schedule revival. Gradient clipping. A comparison table of frontier-lab optimiser choices.
+
+**[Chapter 7 — Tokenisation, embeddings, and training objectives](/textbook/00g-tokenization-and-objectives)**
+BPE (Sennrich 2016), byte-level BPE (GPT-2), SentencePiece unigram LM, tiktoken practicalities, and the vocabulary-size tradeoff. Glitch tokens, untrained tokens, and the SolidGoldMagikarp class of failure modes. Tied vs untied embeddings. Embedding-norm growth at scale and the normalisation fixes for it. Training objectives: causal language modelling, fill-in-the-middle for code, multi-token prediction (DeepSeek-V3's two-token head). Label smoothing and why frontier pretraining largely stopped using it.
+
+**[Chapter 8 — Mixture-of-experts plumbing](/textbook/00h-moe-plumbing)**
+Why MoE: the FLOPs-per-token vs parameter-count decoupling, with worked arithmetic showing 16× parameter count at half the FLOPs. Top-$k$ routing: the mechanism, the load-balancing problem, and a worked numerical example. Expert-choice routing. Auxiliary losses: load-balance loss and router z-loss. Capacity factor at training and at inference. Expert parallelism at a conceptual level. The 2026 frontier MoE landscape: DeepSeek-V3's fine-grained shared-expert design, Mixtral-style 8×7B, and what can be inferred from published reports about closed-model choices.
+
+---
+
+## Prerequisites for this module {#prereqs}
+
+This module assumes the following background. Gaps in any of these areas will make the material harder than it needs to be.
+
+**Calculus.** Partial derivatives, the chain rule, and gradient descent as a first-order optimisation method. You should be comfortable reading $\nabla_\theta L(\theta)$ and knowing what it means to update $\theta$ in the direction of the negative gradient.
+
+**Linear algebra.** Matrix multiplication, transpose, rank, the dot product as an inner product, and the geometric interpretation of orthogonality. Chapter 1 uses $Q K^\top$ heavily; Chapter 4 uses spectral properties of weight matrices; Chapter 6 covers second-moment matrix approximations in Shampoo.
+
+**Probability and statistics.** Basic probability, the normal distribution, expectation and variance. Softmax should be a familiar operation. Cross-entropy loss should be familiar as a training objective.
+
+**Neural network training experience.** You should have trained at least one small neural network — a two-layer MLP or a small CNN — and understand what a training loop looks like: forward pass, loss computation, backward pass, parameter update. You do not need to have trained a language model.
+
+**PyTorch fluency.** You have written a training loop in PyTorch. You can read tensor-shape annotations. You know what `.grad`, `loss.backward()`, and `optimizer.step()` do. Code in the module's exercises uses PyTorch idioms without explanation.
+
+<Callout variant="note" title="What you do not need">
+You do not need prior exposure to language models specifically, or to any particular framework beyond PyTorch. The module builds the transformer architecture from scratch in Chapter 1. If you have trained a ResNet or a simple seq2seq model, you have sufficient background.
 </Callout>
 
-A sidenote in flowing prose<Sidenote>This expands when clicked. Verify the numbering increments.</Sidenote> and another<Sidenote>Second sidenote — number should be 2.</Sidenote> right after.
+---
 
-<ComparisonTable
-  caption="Trivial comparison table to verify the component renders."
-  columns={["A", "B", "C"]}
-  rows={[
-    ["row-1-a", "row-1-b", "row-1-c"],
-    ["row-2-a", "row-2-b", "row-2-c"],
-  ]}
-/>
+## Reading order recommendations {#reading-order}
 
-Display math:
+### First time through
 
-$$
-\mathrm{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}
-$$
+Read the chapters in order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. The dependency graph (below) allows a few shortcuts, but the linear order is designed so that each chapter's worked examples reuse notation and concepts from the chapters before it. Chapter 1 in particular is a prerequisite for chapters 2, 3, 5, 7, and 8; skipping it will require frequent backtracking.
 
-A fenced code block:
+Time budget: at the stated reading-minutes estimates, the full module is approximately four hours of reading at normal pace, not counting exercises. Budget an additional hour if you work through the worked examples with a calculator.
 
-```python
-def attention(Q, K, V):
-    return softmax(Q @ K.T / math.sqrt(Q.shape[-1])) @ V
+### Deep refresher
+
+If you already understand the transformer at the level of Vaswani et al. (2017) and want to update your knowledge to 2024–2026 frontier practice, the highest-value chapters are:
+
+- **Chapter 2** (attention variants): MLA is new since 2024; SSM-hybrid architectures emerged in 2024.
+- **Chapter 3** (positional encodings): YaRN and LongRoPE context-extension methods emerged in 2023–2024.
+- **Chapter 4** (normalisation): QK-norm, Peri-LN, and $\mu$P qualifications are 2024–2025 developments.
+- **Chapter 8** (MoE): DeepSeek-V3's fine-grained shared-expert design and the broader MoE adoption wave are primarily 2024–2025.
+
+Skim Chapter 1 to refresh the notation conventions used throughout the module. Chapters 5, 6, and 7 can be read at a reduced pace unless your specific gap is activations, optimisers, or tokenisation.
+
+### Calibration check
+
+If you want to verify that you already know the material without reading prose, the comparison tables in each chapter are the fastest path. Each chapter has at least one `<ComparisonTable>` that summarises what frontier models actually ship — if the entries in those tables are all familiar, the chapter's prose will contain little new information for you. The exercises at the end of selected chapters are a second calibration tool: if you can solve them, the chapter is review.
+
+---
+
+## Dependency chain {#dependency-chain}
+
+The `depends_on` field in each chapter's frontmatter encodes which chapters must be read first for the material to be self-contained. The chain is:
+
+- **Chapter 1 — The transformer block** (`00a-transformer`): no dependencies. The entry point.
+- **Chapter 2 — Attention variants** (`00b-attention-variants`): depends on Chapter 1. Builds on scaled dot-product attention and the KV-cache derivation from Chapter 1.
+- **Chapter 3 — Positional encodings** (`00c-positional-encodings`): depends on Chapter 1. Requires the permutation-equivariance observation and the attention-score computation from Chapter 1.
+- **Chapter 4 — Normalisation and initialisation** (`00d-normalization-and-init`): depends on Chapters 1 and 2. The QK-norm section requires the attention-logit context from Chapter 1; the $\mu$P section is referenced in Chapter 6.
+- **Chapter 5 — Activations and gating** (`00e-activations-and-gating`): depends on Chapter 1. Requires the MLP sub-block structure from Chapter 1.
+- **Chapter 6 — Optimisers and schedules** (`00f-optimizers`): depends on Chapter 4. The $\mu$P treatment in Chapter 4 is a prerequisite for the hyperparameter-transfer discussion in Chapter 6.
+- **Chapter 7 — Tokenisation and objectives** (`00g-tokenization-and-objectives`): depends on Chapter 1. Requires the residual-stream and embedding-layer framing from Chapter 1.
+- **Chapter 8 — Mixture-of-experts** (`00h-moe-plumbing`): depends on Chapters 1 and 5. Requires the MLP block structure from Chapter 1 and the SwiGLU arithmetic from Chapter 5, since each expert in a MoE layer is a SwiGLU MLP.
+
+Visualised as a dependency list:
+
 ```
+00a-transformer
+├── 00b-attention-variants
+│   └── 00d-normalization-and-init (also 00a)
+│       └── 00f-optimizers
+├── 00c-positional-encodings
+├── 00e-activations-and-gating
+│   └── 00h-moe-plumbing (also 00a)
+└── 00g-tokenization-and-objectives
+```
+
+Chapters 2, 3, 5, 6, 7, and 8 can be read in parallel once Chapter 1 is complete, except that Chapter 6 requires Chapter 4 and Chapter 8 requires Chapter 5.
+
+---
+
+## Notation conventions {#notation}
+
+All eight chapters use the following notation consistently. Where the literature has competing conventions, the choice made here is stated explicitly.
+
+### Dimensions
+
+| Symbol | Meaning |
+|--------|---------|
+| $d$ or $d_\text{model}$ | Model (residual-stream) hidden dimension |
+| $L$ | Number of transformer layers (blocks) |
+| $H$ or $h$ | Number of attention heads (this module uses $H$ in Chapters 2–4, $h$ in Chapter 1; context disambiguates) |
+| $d_k$ | Per-head key and query dimension; equals $d/H$ in standard parameterisation |
+| $d_v$ | Per-head value dimension; equals $d_k$ in standard MHA |
+| $d_\text{ff}$ | FFN hidden dimension in a non-gated MLP; baseline is $4d$ |
+| $d_\text{ff}'$ | FFN hidden dimension in a gated (SwiGLU) MLP after the 2/3 adjustment |
+| $T$ or $N$ | Sequence length in tokens (this module uses $T$ in Chapters 1 and 3, $N$ in Chapters 2 and 6; context disambiguates) |
+| $V$ | Vocabulary size |
+| $E$ | Number of experts in a MoE layer |
+| $k$ | Top-$k$ routing in MoE; subscript for expert index |
+
+The $d$ vs $d_\text{model}$ ambiguity is common in the literature. This module uses $d$ as the short form throughout; $d_\text{model}$ is written out when the dimension needs to be distinguished from $d_k$, $d_v$, or $d_\text{ff}$.
+
+The $H$ vs $h$ discrepancy between Chapter 1 and later chapters reflects the source literature: Vaswani et al. (2017) use $h$; most post-2021 papers (GQA, MLA, RoPE) use $H$. Chapter 1 follows Vaswani; later chapters follow the more recent convention.
+
+### Matrices and vectors
+
+Matrices are upper-case roman: $W$, $Q$, $K$, $V$. Vectors are bold lower-case: $\mathbf{x}$, $\mathbf{q}$, $\mathbf{k}$, $\mathbf{v}$. The residual stream at position $t$ after block $\ell$ is $\mathbf{x}_t^{(\ell)}$, written as $\mathbf{x}^{(\ell)}$ when the position index is clear.
+
+Projection matrices are indexed by head and type: $W_i^Q \in \mathbb{R}^{d \times d_k}$ is the query projection for head $i$. The output projection is $W^O \in \mathbb{R}^{Hd_v \times d}$ (concatenated heads).
+
+### Operations
+
+$\odot$ denotes element-wise (Hadamard) multiplication. $\otimes$ denotes the outer product. $\sigma$ denotes the logistic sigmoid $\sigma(x) = (1+e^{-x})^{-1}$. $\text{softmax}$ operates row-wise unless stated otherwise.
+
+The scaled dot-product attention operation is written:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+
+with the $1/\sqrt{d_k}$ scaling always present and always explicit.
+
+### FLOPs
+
+One multiply-add (one multiply and one add) counts as **2 FLOPs** throughout. A matrix-vector product of shape $(m,n) \times (n,1)$ therefore costs $2mn$ FLOPs. This matches the EleutherAI Transformer Math convention and the Chinchilla paper's accounting.
+
+### Norms and log
+
+$\|\cdot\|$ without subscript denotes the Euclidean ($L_2$) norm. $\|\cdot\|_F$ denotes the Frobenius norm. Logarithms are natural (base $e$) unless stated otherwise; this matches PyTorch's `torch.nn.CrossEntropyLoss` default.
+
+### Sign conventions
+
+Causal masking adds $-\infty$ (in practice, a large negative constant such as $-10^4$) to pre-softmax logits at masked positions. ALiBi subtracts a positive penalty $m_h \cdot |i-j|$ from pre-softmax logits. Weight decay is a penalty added to the loss: $L_\text{total} = L + \frac{\lambda}{2}\|\theta\|^2$ in the Adam-with-L2 formulation; in AdamW the weight update is $\theta \leftarrow \theta - \eta\lambda\theta$ applied separately from the gradient step.
+
+---
+
+## What success looks like {#success}
+
+By the end of this module you should be able to do the following. These are concrete, not aspirational.
+
+**1. Read a frontier model technical report and account for every architectural choice.**
+Given the DeepSeek-V3, Llama 3, Qwen 3, or Gemma 3 technical report, you can identify the attention variant (MHA / GQA / MLA), the positional encoding (RoPE with base frequency and context extension), the normalisation scheme (RMSNorm, pre-norm or Peri-LN), the activation function (SwiGLU), the optimiser (AdamW with reported $\beta_1$, $\beta_2$, schedule), and the MoE configuration if applicable — and explain why each choice was likely made.
+
+**2. Derive the KV cache memory requirement for a given model at a given context length.**
+Given $d$, $H$, number of KV heads $G$, $d_k$, $L$, element size in bytes, and context length $T$, compute the KV cache size in bytes and determine whether it fits within a specified GPU memory budget alongside the model weights. (This is the exercise at the end of Chapter 2.)
+
+**3. Explain why RMSNorm replaced LayerNorm and what QK-norm addresses.**
+State the mathematical difference between LayerNorm and RMSNorm, explain the 2024 mechanistic evidence for why mean-centering is redundant (Gupta et al., 2024), and describe the attention-logit blow-up failure mode that QK-norm addresses — including under what training conditions it manifests and which models adopted the fix.
+
+**4. Derive the 2/3 width adjustment for SwiGLU FFN blocks.**
+Starting from the parameter counts of a non-gated two-matrix MLP ($W_1 \in \mathbb{R}^{d \times d_\text{ff}}, W_2 \in \mathbb{R}^{d_\text{ff} \times d}$) and a three-matrix gated MLP, derive the value of $d_\text{ff}'$ that makes the two parameter counts equal, showing that $d_\text{ff}' = \frac{2}{3} d_\text{ff}$ (and therefore $d_\text{ff}' \approx \frac{8}{3}d$ when $d_\text{ff} = 4d$).
+
+**5. Explain the difference between AdamW and Adam-with-L2, and state the frontier optimiser landscape as of 2026.**
+Derive why L2 regularisation in the Adam objective produces a weight decay that is scaled by the adaptive learning rate, whereas AdamW applies weight decay independently of the gradient scale. State which optimisers the major open-weight frontier models use based on published technical reports, including the adoption trajectory of Muon and the unresolved status of Shampoo/SOAP at frontier scale.
+
+**6. Describe the MoE routing problem and the auxiliary losses used to address it.**
+Explain what load imbalance means in the context of top-$k$ routing, why it leads to wasted capacity and collapsed routing, and state the load-balance loss and router z-loss formulations — including what each one penalises and at what scale each term is typically weighted in practice (citing DeepSeek-V3 as the primary example for fine-grained shared-expert MoE).
+
+---
+
+## How this module relates to the reading list {#reading-list}
+
+This module is the synthesis layer above the curated reading list at [/notes/00-foundations](/notes/00-foundations). The reading list organises the primary sources — the papers, technical reports, and blog posts — that the eight chapters draw on. If a chapter makes a claim that surprises you or you want to go deeper than the chapter's treatment, the reading list is the next step.
+
+The relationship is one-directional: the chapters cite and explain; the reading list points outward to the original sources. You do not need to read the sources to understand the chapters. You do need the chapters to make efficient use of the reading list.
+
+---
 
 <Sources items={[
   {
-    authors: "Vaswani, A. et al.",
+    authors: "Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I.",
     year: 2017,
     title: "Attention Is All You Need",
     venue: "NeurIPS 2017",
     url: "https://arxiv.org/abs/1706.03762",
-    note: "Original transformer paper — cited everywhere in this module."
+    note: "The 2017 baseline that all eight chapters modify or extend. Introduces scaled dot-product attention, MHA, post-norm placement, sinusoidal encodings, and the ReLU-MLP block."
+  },
+  {
+    authors: "Elhage, N., Nanda, N., Olsson, C., et al.",
+    year: 2021,
+    title: "A Mathematical Framework for Transformer Circuits",
+    venue: "Transformer Circuits Thread",
+    url: "https://transformer-circuits.pub/2021/framework/index.html",
+    note: "Introduces the residual-stream framing used throughout Chapter 1 as the organising mental model for the transformer architecture."
+  },
+  {
+    authors: "Hoffmann, J., Borgeaud, S., Mensch, A., et al.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models (Chinchilla)",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "The 6N FLOPs/token training rule and the compute-optimal N/D allocation — foundational for Chapter 1's FLOPs accounting."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "671B/37B MoE; MLA attention; fine-grained shared-expert routing; multi-token prediction; AdamW with WSD schedule. The primary example for Chapters 2, 6, 7, and 8."
+  },
+  {
+    authors: "Meta Llama Team",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama 3.1 family (8B / 70B / 405B): GQA with G=8, RoPE, pre-norm RMSNorm, SwiGLU, tiktoken-based tokeniser with 128K vocabulary. Primary example for Chapters 2, 3, 4, 5, and 7."
+  },
+  {
+    authors: "Qwen Team, Alibaba Group",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Dense and MoE variants; GQA; RoPE; pre-norm RMSNorm; SwiGLU. Comparative example for the frontier-practice tables in Chapters 2–8."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2025,
+    title: "Gemma 3 Technical Report",
+    venue: "arXiv:2503.19786",
+    url: "https://arxiv.org/abs/2503.19786",
+    note: "Peri-LN normalisation; QK-norm; interleaved local/global attention; GQA. Primary source for the normalisation and attention-variant tables in Chapters 2 and 4."
+  },
+  {
+    authors: "Raschka, S.",
+    year: 2025,
+    title: "The Big LLM Architecture Comparison",
+    venue: "Ahead of AI",
+    url: "https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison",
+    note: "Comparative architecture table covering 18 models from 2024–2025. Used as the aggregation source for frontier-practice tables across multiple chapters."
   }
 ]} />

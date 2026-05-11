@@ -14,7 +14,7 @@ last_reviewed: 2026-05-11
 Calibrated to frontier-model practice as of May 2026. The mathematical definitions are durable; the SOTA-choice table and the µP caveats section age fastest. Recheck every 6–12 months.
 </Callout>
 
-## Overview \{#overview\}
+## Overview {#overview}
 
 A transformer trained without normalization and careful initialisation will, at sufficient depth or width, either fail to train or exhibit runaway activation growth that causes numerical overflow in mixed precision. This chapter explains the specific mechanisms behind both failure modes and the design choices that frontier labs make to avoid them.
 
@@ -30,7 +30,7 @@ The material falls into five clusters:
 
 ---
 
-## LayerNorm \{#layernorm\}
+## LayerNorm {#layernorm}
 
 ### Mechanism
 
@@ -70,7 +70,7 @@ The output has mean zero and variance one (up to $\epsilon$). With non-trivial $
 
 ---
 
-## RMSNorm \{#rmsnorm\}
+## RMSNorm {#rmsnorm}
 
 ### Mechanism
 
@@ -124,7 +124,7 @@ Always verify that your RMSNorm implementation upcasts the accumulation to FP32 
 
 ---
 
-## Pre-norm vs post-norm \{#pre-norm-vs-post-norm\}
+## Pre-norm vs post-norm {#pre-norm-vs-post-norm}
 
 The placement of normalization within a transformer block has substantial training dynamics consequences. Refer to the [residual stream framing](/textbook/00a-transformer#residual-stream) in chapter 1 for the block-level context.
 
@@ -194,7 +194,7 @@ Pre-norm with RMSNorm remains the default for new architectures in 2026. Peri-LN
 
 ---
 
-## QK-norm \{#qk-norm\}
+## QK-norm {#qk-norm}
 
 ### The attention-logit blowup problem
 
@@ -204,7 +204,7 @@ $$
 a_{ij} = \frac{\mathbf{q}_i^\top \mathbf{k}_j}{\sqrt{d_h}} = \frac{\|\mathbf{q}_i\| \cdot \|\mathbf{k}_j\| \cdot \cos\theta_{ij}}{\sqrt{d_h}}
 $$
 
-The $1/\sqrt{d_h}$ scaling is designed to keep logit magnitudes in a useful range at *initialization*, when $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ are of order $\sqrt{d_h}$ (see [attention math](/textbook/00b-attention-variants#scaled-dot-product)). But during training, the norms $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ can grow unchecked.
+The $1/\sqrt{d_h}$ scaling is designed to keep logit magnitudes in a useful range at *initialization*, when $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ are of order $\sqrt{d_h}$ (see [attention math](/textbook/00b-attention-variants#mha)). But during training, the norms $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ can grow unchecked.
 
 Because softmax is translation-invariant — adding a constant to all logits in a row does not change the output — the model cannot adjust relative attention weights via additive shifts. It uses multiplicative norm growth instead. This creates a feedback loop: growing norms $\to$ more peaked (lower-entropy) softmax $\to$ near-one-hot attention $\to$ vanishing gradients through the attention operator $\to$ model learns to compensate by growing norms further. The softmax operator saturates and provides no useful gradient signal.
 
@@ -240,7 +240,7 @@ If RMSNorm is applied *after* RoPE, it removes the magnitude variation that the 
 
 **Output logit divergence** is a distinct instability in the unembedding matrix (the final linear layer), not in attention. QK-norm addresses attention-logit blowup but does not prevent the unembedding logits from diverging. Stollenwerk et al. (arXiv:2601.02031, January 2026) analyzed this separately and proposed output-embedding centering (OEC) and $\mu$-loss as alternatives to z-loss for that purpose. See [tokenisation and objectives](/textbook/00g-tokenization-and-objectives#embedding-norm-growth) for the full treatment.
 
-**MLA incompatibility.** DeepSeek-V3's Multi-Head Latent Attention uses low-rank factored Q and K matrices (with joint absorption of the up-projection and down-projection into the weight). Applying per-head RMSNorm before the low-rank projection breaks the structural invariant of MLA. This is why DeepSeek-V3 does not use QK-norm despite its stability benefits. See [MoE plumbing](/textbook/00h-moe-plumbing#router-normalization) for MLA's architectural constraints.
+**MLA incompatibility.** DeepSeek-V3's Multi-Head Latent Attention uses low-rank factored Q and K matrices (with joint absorption of the up-projection and down-projection into the weight). Applying per-head RMSNorm before the low-rank projection breaks the structural invariant of MLA. This is why DeepSeek-V3 does not use QK-norm despite its stability benefits. See [MLA](/textbook/00b-attention-variants#mla) for MLA's architectural constraints.
 
 <Callout variant="exercise">
 Compute the attention logit magnitude for $\mathbf{q} = [10, 0, 0, 0]$, $\mathbf{k} = [0, 10, 0, 0]$ with $d_h = 4$, both before and after QK-norm with $\boldsymbol{\gamma} = \mathbf{1}$. Then compute it for $\mathbf{q} = [100, 0, 0, 0]$, $\mathbf{k} = [0, 100, 0, 0]$ — the same direction, 10$\times$ larger. Observe how QK-norm makes the logit magnitude invariant to the original vector scale (though not to the angle between $\mathbf{q}$ and $\mathbf{k}$).
@@ -248,7 +248,7 @@ Compute the attention logit magnitude for $\mathbf{q} = [10, 0, 0, 0]$, $\mathbf
 
 ---
 
-## Initialisation \{#initialisation\}
+## Initialisation {#initialisation}
 
 ### Standard small-variance baseline
 
@@ -316,7 +316,7 @@ The depth-scaling recipe was derived for Pre-LN. Under Post-LN, the normalizatio
 
 ---
 
-## µP and hyperparameter transfer \{#mup\}
+## µP and hyperparameter transfer {#mup}
 
 ### The width-scaling problem
 
@@ -356,7 +356,7 @@ Standard µP's derivation assumes that attention uses multi-head attention with 
 
 Kosson et al. (arXiv:2510.19093, October 2025) re-examined µP's theoretical assumptions in practical LLM training. The µP invariant — that layer inputs are geometrically aligned with weights and gradients — holds approximately at the very start of training but breaks down within the first few hundred steps as the model learns. During most of training, it is weight decay rather than the µP initialization and learning-rate scaling that governs update dynamics across widths. Kosson et al. interpret µP scaling as functioning primarily as an implicit learning-rate warmup effect rather than as a persistent parametrization invariant.
 
-This finding limits µP's scope. Learning-rate transfer at proxy scale remains a practical benefit, particularly when budget constraints make large-scale HP sweeps infeasible. But practitioners should not expect near-perfect HP transfer without also explicitly tuning weight decay at target scale. The interaction with [optimiser configuration](/textbook/00f-optimizers#mup) (AdamW $\lambda$ tuning) is therefore important.
+This finding limits µP's scope. Learning-rate transfer at proxy scale remains a practical benefit, particularly when budget constraints make large-scale HP sweeps infeasible. But practitioners should not expect near-perfect HP transfer without also explicitly tuning weight decay at target scale. The interaction with [optimiser configuration](/textbook/00f-optimizers#lr-schedules) (AdamW $\lambda$ tuning) is therefore important.
 
 ### Frontier-lab practice
 
@@ -368,7 +368,7 @@ The most common µP implementation error is forgetting to change the attention l
 
 ---
 
-## Frontier norm and init choices \{#frontier-norm-init-table\}
+## Frontier norm and init choices {#frontier-norm-init-table}
 
 The following table summarizes normalization and initialization choices across publicly documented frontier models as of May 2026. Rows marked with "(inferred)" reflect the absence of a public architecture report; treat those entries as uncertain.
 
@@ -500,7 +500,7 @@ Several observations from the table:
 
 The five topics in this chapter interact:
 
-- **RMSNorm** is the right choice for any new transformer architecture: computationally equivalent to LayerNorm (with fused kernels), half the learnable parameters per norm, and mechanistically justified.
+- **RMSNorm** is, as of May 2026, the standard choice for new transformer architectures: computationally equivalent to LayerNorm (with fused kernels), half the learnable parameters per norm, and mechanistically justified.
 - **Pre-norm** is the safe default for training stability. For deep models (100+ layers) or mixed-precision training, the Peri-LN variant adds output-side normalization to control activation variance growth.
 - **QK-norm** is worth enabling at any scale where logit blowup is a risk — roughly above 1B parameters or at high learning rates. It must be applied before RoPE and is incompatible with MLA.
 - **Depth-scaled output projection init** ($\sigma = 0.02/\sqrt{2L}$) is a low-cost correction that prevents variance explosion in Pre-LN models and should be the default.
