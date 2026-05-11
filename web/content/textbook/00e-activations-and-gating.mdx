@@ -1,0 +1,589 @@
+---
+slug: 00e-activations-and-gating
+title: Activations and gating
+description: ReLU / GELU / SiLU, gated linear units (GLU / SwiGLU / GeGLU), the 2/3 width adjustment, and why frontier MLP blocks converged on SwiGLU.
+order: 5
+chapter: 5
+reading_minutes: 22
+depends_on: [00a-transformer]
+provides: [relu, gelu, silu, swiglu, two-thirds-width]
+last_reviewed: 2026-05-11
+---
+
+## Overview
+
+Every transformer layer contains two sub-blocks: an attention sub-block and a feed-forward network (FFN) sub-block. The [transformer chapter](/textbook/00a-transformer#mlp-block) introduces the two-matrix FFN:
+
+$$
+\text{FFN}(x) = W_2 \cdot \text{activation}(W_1 x)
+$$
+
+where $W_1 \in \mathbb{R}^{d_\text{model} \times d_\text{ff}}$ expands the hidden dimension and $W_2 \in \mathbb{R}^{d_\text{ff} \times d_\text{model}}$ contracts it back. The activation function $\phi$ is the only nonlinearity in this expression. Choosing the right $\phi$ turns out to matter considerably: a poorly chosen activation starves the network of gradient signal or wastes parameters.
+
+This chapter traces the activation-function history from **ReLU** (2010) through **GELU** (2016) to **SiLU/Swish** (2017), then covers the **gated linear unit** (GLU) family that replaced the two-matrix FFN with a three-matrix gated structure in virtually every frontier model deployed after 2022. The final section derives the **2/3 width adjustment** that keeps the gated FFN parameter-count-neutral relative to the baseline, and catalogs which activations open frontier models actually use as of May 2026.
+
+<Callout variant="note" title="Calibration">
+This chapter is calibrated to frontier-model practice as of May 2026. The mathematical content is durable. The "what models ship" tables age fastest — recheck in 6–12 months.
+</Callout>
+
+---
+
+## Notation
+
+Consistent with the rest of this module:
+
+- $d_\text{model}$: residual-stream width.
+- $d_\text{ff}$: FFN hidden (intermediate) dimension in a standard two-matrix FFN. Baseline expansion is $d_\text{ff} = 4 d_\text{model}$.
+- $d_\text{ff}'$: FFN hidden dimension in a gated (three-matrix) FFN, after the 2/3 correction.
+- $\sigma$: logistic sigmoid, $\sigma(x) = (1 + e^{-x})^{-1}$.
+- $\Phi$: standard Gaussian CDF.
+- $\odot$: element-wise (Hadamard) product.
+
+---
+
+## Activation functions: ReLU, GELU, SiLU {#relu-gelu-silu}
+
+### Mechanism
+
+An activation function $\phi : \mathbb{R} \to \mathbb{R}$ is applied pointwise to a vector of pre-activations. Its job is to introduce nonlinearity: without it, stacked linear layers collapse to a single linear map. The practical question is not "do we need a nonlinearity" but "which nonlinearity produces the best gradient flow and final quality at the scales we train."
+
+Three functions have dominated language-model practice:
+
+- **ReLU** (Rectified Linear Unit): hard threshold at zero. Zero gradient for all negative inputs.
+- **GELU** (Gaussian Error Linear Unit): smooth weighting by the Gaussian CDF. Allows small negative outputs and small positive gradients for negative inputs.
+- **SiLU** (Sigmoid Linear Unit), also called **Swish** at $\beta = 1$: smooth weighting by the sigmoid. Numerically close to GELU on typical pre-activation ranges.
+
+### Math
+
+**ReLU** (Nair & Hinton, ICML 2010; popularised at scale by Krizhevsky et al., 2012):
+
+$$
+\text{ReLU}(x) = \max(0,\, x)
+$$
+
+Gradient: $\mathbb{1}[x > 0]$. Zero for all $x < 0$; undefined (conventionally 0) at $x = 0$.
+
+**GELU** (Hendrycks & Gimpel, arXiv 1606.08415, 2016):
+
+$$
+\text{GELU}(x) = x \cdot \Phi(x)
+$$
+
+Intuitively, a neuron is "included" with probability $\Phi(x)$: large positive pre-activations pass through almost fully; large negative ones are suppressed. A practical tanh approximation used in GPT-2 and BERT:
+
+$$
+\text{GELU}(x) \approx \tfrac{1}{2} x \!\left(1 + \tanh\!\left(\sqrt{\tfrac{2}{\pi}}\,(x + 0.044715 x^3)\right)\right)
+$$
+
+This approximation is accurate to within 0.005 over the range $x \in [-5, 5]$.
+
+**SiLU / Swish** (Ramachandran, Zoph & Le, arXiv 1710.05941, 2017; Elfwing et al., 2018 for the "SiLU" name at $\beta = 1$):
+
+$$
+\text{SiLU}(x) = x \cdot \sigma(x)
+$$
+
+Properties: smooth everywhere; **non-monotone** (has a global minimum near $x \approx -1.28$ with value $\approx -0.28$); positive for all $x > 0$; the gradient is never exactly zero — there is always a small positive signal through $\sigma(x)$.
+
+### Worked example
+
+Apply all three functions to the vector $x = [-2.0,\; -0.5,\; 0.0,\; 1.0,\; 3.0]$:
+
+For SiLU, recall $\sigma(x) = 1/(1 + e^{-x})$:
+
+- $x = -2.0$: $\sigma(-2) \approx 0.119$, so $\text{SiLU}(-2) = -2 \times 0.119 = -0.238$.
+- $x = -0.5$: $\sigma(-0.5) \approx 0.378$, so $\text{SiLU}(-0.5) = -0.5 \times 0.378 = -0.189$.
+- $x = 1.0$: $\sigma(1.0) \approx 0.731$, so $\text{SiLU}(1.0) = 1.0 \times 0.731 = 0.731$.
+
+<ComparisonTable
+  caption="Activation function values for five representative pre-activations. ReLU zero-clamps all negative inputs; GELU and SiLU allow small negative outputs, reducing dead-neuron risk."
+  columns={["x", "ReLU(x)", "GELU(x)", "SiLU(x)"]}
+  rows={[
+    ["-2.0", "0.000", "−0.045", "−0.238"],
+    ["-0.5", "0.000", "−0.154", "−0.189"],
+    ["0.0", "0.000", "0.000", "0.000"],
+    ["1.0", "1.000", "0.841", "0.731"],
+    ["3.0", "3.000", "2.996", "2.858"],
+  ]}
+/>
+
+Key observations:
+
+1. ReLU produces zero for every negative input. A neuron receiving $x = -0.5$ or $x = -2.0$ contributes nothing to the layer output and passes zero gradient back to the weights that produced it.
+2. GELU and SiLU allow small but non-zero negative outputs ($-0.154$ and $-0.238$ respectively at $x = -2.0$). Gradient can still flow.
+3. All three converge at large positive $x$: at $x = 3.0$ the values differ by less than 0.15.
+
+### Why each transition happened
+
+**ReLU → GELU**: The "dying neuron" problem arises when a neuron's pre-activation is permanently negative — perhaps because a large weight update pushed its bias far negative. That neuron outputs zero, gradients through it are zero, and it never recovers. GELU provides a soft weighting: even mildly negative inputs receive a small output, keeping gradient flowing. GPT-1 (Radford et al., 2018) and BERT (Devlin et al., 2018) both adopted GELU and reported improved results versus ReLU. This established GELU as the default in the encoder-LM lineage.<Sidenote>The "BERT used it" effect compounded rapidly. Once BERT established GELU as the safe default, subsequent models copied it without independently reproducing Hendrycks & Gimpel's ablations. This is a recurring pattern in neural-architecture choices: empirical success at one high-visibility scale becomes convention.</Sidenote>
+
+**GELU → SiLU**: SiLU requires only a sigmoid call; GELU requires evaluating $\Phi(x)$ (or the tanh approximation). The two functions are numerically very close for $x \in [-3, 3]$, the range where most pre-activations lie. Shazeer (2020) chose SiLU as the gate nonlinearity in SwiGLU because of this simplicity. Ramachandran et al. (2017) had shown Swish/$\beta = 1$ improves over ReLU by 0.9 percentage points on Mobile NASNet-A ImageNet top-1 accuracy.
+
+<Callout variant="warning" title="The tanh approximation of GELU">
+The tanh approximation introduces a maximum error of ~0.005 relative to the exact GELU. This is negligible for training but can produce slight numerical discrepancies when comparing outputs across frameworks (e.g., JAX exact GELU vs PyTorch approximate). If exact reproducibility matters, specify which GELU variant you are using.
+</Callout>
+
+### Failure modes
+
+- **Dead ReLU neurons**: a neuron receiving a large negative pre-activation will permanently output zero and stop receiving gradient. At the scale of transformer pre-training (billions of steps, high learning rates early in training), this effect is non-negligible. Large-batch SGD with aggressive LR schedules can kill a substantial fraction of neurons in a purely ReLU network.
+- **SiLU non-monotonicity**: the global minimum at $x \approx -1.28$ means SiLU is non-monotone — unlike ReLU and GELU. Some interpretability tools that assume monotone activations produce misleading results when applied to SiLU-based networks.
+- **Partial relief only**: neither GELU nor SiLU fully eliminates dead neurons. A pre-activation of $-5.0$ gives GELU $\approx -0.001$ and SiLU $\approx -0.034$ — very close to zero. The risk decreases substantially but does not vanish.
+
+---
+
+## Gated linear units {#glu}
+
+### Mechanism
+
+A Gated Linear Unit (GLU) replaces the single-projection-plus-activation structure with a **product of two parallel projections**, one of which is modulated by a gate nonlinearity:
+
+$$
+\text{GLU}(x, W, V) = (xW) \odot \phi(xV)
+$$
+
+The first branch $xW$ produces a "content" vector; the second branch $\phi(xV)$ produces a "gate" vector — a soft mask in $[0, 1]$ (or $\mathbb{R}$ for gate functions that are not bounded above). The element-wise product passes or suppresses each dimension of the content based on the gate's value.
+
+This is a form of **input-dependent feature selection**: the network can zero out dimensions of the content vector when the gate is near zero and amplify them when the gate is large. A plain additive activation $\phi(xW_1)$ cannot do this — it applies the same transformation to every input.
+
+### Math
+
+**Original GLU** (Dauphin, Fan, Auli & Grangier, ICML 2017, arXiv 1612.08083):
+
+$$
+\text{GLU}(x) = (xW) \odot \sigma(xV)
+$$
+
+Introduced in the context of convolutional language models, not transformers. The sigmoid gate produces values in $(0, 1)$, providing a strict soft mask.
+
+**GLU variants for transformers** (Shazeer, arXiv 2002.05202, 2020):
+
+$$
+\begin{aligned}
+\text{ReGLU}(x)   &= (xW) \odot \max(0,\, xV) \\
+\text{GeGLU}(x)   &= (xW) \odot \text{GELU}(xV) \\
+\text{SwiGLU}(x)  &= (xW) \odot \text{SiLU}(xV) \\
+\text{Bilinear}(x) &= (xW) \odot (xV)
+\end{aligned}
+$$
+
+All four are defined and ablated in Shazeer (2020), which was written specifically to test these variants in the transformer FFN context. The paper's Table 1 reports that **GeGLU and SwiGLU produced the best perplexities** on the C4 language-modeling task among all variants tested, including plain ReLU, GELU, ReGLU, GLU, and Bilinear.<Sidenote>Shazeer (2020) explicitly notes that the improvement from gated variants is "somewhat empirically mysterious" — no theoretical explanation is given for why gating consistently outperforms plain activations at compute-matched comparison. No later paper appears to have resolved this gap definitively as of May 2026. The chapter reports the empirical result and does not attempt to explain it.</Sidenote>
+
+The full SwiGLU FFN sub-block includes a down-projection:
+
+$$
+\text{FFN}_\text{SwiGLU}(x) = \bigl(\text{SiLU}(xW) \odot xV\bigr) W_2
+$$
+
+where $W, V \in \mathbb{R}^{d_\text{model} \times d_\text{ff}'}$ and $W_2 \in \mathbb{R}^{d_\text{ff}' \times d_\text{model}}$. Note the three weight matrices compared to two in the standard FFN.
+
+### Capacity argument
+
+The multiplicative interaction in GLU variants provides a form of dynamic computation not available in additive MLPs. In a standard FFN, the mapping from $x$ to the hidden state is fixed: $h = \phi(xW_1)$. In a gated FFN, the effective mapping is input-dependent: the gate $\phi(xV)$ changes which dimensions of the content vector $xW$ survive the multiplication. This is mechanistically similar to the forget and input gates in an LSTM, but considerably lighter-weight because there is no recurrent state to maintain.
+
+Shazeer's compute-matched ablations on C4 provide empirical support. Both GeGLU and SwiGLU improve perplexity consistently over plain activations, with the margin being modest but reliable.
+
+<Callout variant="info" title="Compute-matched comparison">
+Shazeer (2020) evaluated all variants at matched FLOPs, not just matched parameter count. This is critical: a naive switch from two-matrix to three-matrix FFN would add ~50% parameters (and FLOPs) to the FFN block. The 2/3 width correction described in the next section is what makes the comparison fair.
+</Callout>
+
+### Worked example
+
+Let $d_\text{model} = 4$ and $d_\text{ff}' = 6$ (small for legibility).
+
+Input: $x = [0.5,\; -1.2,\; 0.8,\; 0.3]$.
+
+Suppose the gate branch pre-activation is $g = xW \in \mathbb{R}^6$:
+
+$$
+g = [1.1,\; -0.4,\; 0.7,\; -0.9,\; 0.2,\; 1.5]
+$$
+
+And the content branch pre-activation is $c = xV \in \mathbb{R}^6$:
+
+$$
+c = [0.3,\; 0.8,\; -0.2,\; 1.1,\; 0.5,\; -0.4]
+$$
+
+Compute the SiLU gate values $\text{SiLU}(g_i) = g_i \cdot \sigma(g_i)$ for selected dimensions:
+
+- $g_1 = 1.1$: $\sigma(1.1) \approx 0.750$, so $\text{SiLU}(1.1) = 1.1 \times 0.750 = 0.825$.
+- $g_4 = -0.9$: $\sigma(-0.9) \approx 0.289$, so $\text{SiLU}(-0.9) = -0.9 \times 0.289 = -0.261$.
+- $g_6 = 1.5$: $\sigma(1.5) \approx 0.818$, so $\text{SiLU}(1.5) = 1.5 \times 0.818 = 1.227$.
+
+Gated output $h = \text{SiLU}(g) \odot c$ for those dimensions:
+
+- $h_1 = 0.825 \times 0.3 = 0.248$: gate near 1, content passes through.
+- $h_4 = (-0.261) \times 1.1 = -0.287$: negative gate suppresses (and sign-flips) positive content.
+- $h_6 = 1.227 \times (-0.4) = -0.491$: large gate amplifies the negative content.
+
+The gate has selectively scaled each content dimension based on the input $x$. A different $x$ would produce different gate values and a different selection pattern. The down-projection $W_2$ then maps $h \in \mathbb{R}^6$ back to $\mathbb{R}^4$.
+
+### Notable architectural detail
+
+In practice implementations label the two branches differently. For example, the LLaMA codebase (Touvron et al., 2023) calls the gate branch `gate_proj` (weights $W$) and the content branch `up_proj` (weights $V$). The down-projection is `down_proj` ($W_2$). Recognising these names is helpful when reading config files or model weights.
+
+### Failure modes
+
+- **ReGLU dead gates**: if the gate branch uses ReLU, it inherits ReLU's dead-neuron problem. A gate dimension permanently at zero kills the corresponding content dimension for that position. GeGLU and SwiGLU avoid this.
+- **50% parameter inflation without width correction**: switching from a two-matrix FFN to a three-matrix GLU FFN at the same hidden dimension $d_\text{ff}$ increases FFN parameters by 50%. In a 7B model with 32 layers, an uncorrected switch adds roughly 1.4B parameters. The 2/3 width correction resolves this — see the next section.
+- **Inference memory bandwidth**: the gated FFN performs two independent matrix multiplies (gate and content) before the elementwise product, compared to one in the standard FFN. On memory-bandwidth-bound hardware this can be a bottleneck.
+
+---
+
+## The 2/3 width adjustment {#two-thirds-width}
+
+### Mechanism
+
+A SwiGLU (or any GLU-family) FFN uses three weight matrices instead of two. To keep the total parameter count equal to a baseline two-matrix FFN at the same expansion ratio, the hidden dimension must shrink by a factor of $2/3$. This is stated explicitly in Shazeer (2020) and replicated in every major adopter from PaLM onward.
+
+### Math
+
+**Standard two-matrix FFN** (ReLU or GELU):
+
+$$
+W_1 \in \mathbb{R}^{d_\text{model} \times d_\text{ff}}, \quad W_2 \in \mathbb{R}^{d_\text{ff} \times d_\text{model}}
+$$
+
+Parameter count (ignoring biases, which are absent in most modern transformer FFN layers):
+
+$$
+P_\text{std} = 2 \cdot d_\text{model} \cdot d_\text{ff}
+$$
+
+With the standard $4\times$ expansion $d_\text{ff} = 4 d_\text{model}$:
+
+$$
+P_\text{std} = 2 \cdot d_\text{model} \cdot 4 d_\text{model} = 8 \, d_\text{model}^2
+$$
+
+**SwiGLU three-matrix FFN**:
+
+$$
+W \in \mathbb{R}^{d_\text{model} \times d_\text{ff}'}, \quad V \in \mathbb{R}^{d_\text{model} \times d_\text{ff}'}, \quad W_2 \in \mathbb{R}^{d_\text{ff}' \times d_\text{model}}
+$$
+
+Parameter count:
+
+$$
+P_\text{GLU} = 3 \cdot d_\text{model} \cdot d_\text{ff}'
+$$
+
+Setting $P_\text{GLU} = P_\text{std}$ and solving:
+
+$$
+3 \cdot d_\text{model} \cdot d_\text{ff}' = 2 \cdot d_\text{model} \cdot d_\text{ff}
+\quad \Longrightarrow \quad
+d_\text{ff}' = \frac{2}{3} \, d_\text{ff}
+$$
+
+Substituting $d_\text{ff} = 4 d_\text{model}$:
+
+$$
+d_\text{ff}' = \frac{2}{3} \times 4 d_\text{model} = \frac{8}{3} \, d_\text{model} \approx 2.667 \, d_\text{model}
+$$
+
+This is the **2/3 width adjustment**: the hidden dimension of the gated FFN is $\frac{2}{3}$ of what it would be in the corresponding two-matrix block.
+
+### Worked example: LLaMA 7B
+
+The LLaMA 7B model (Touvron et al., 2023) has $d_\text{model} = 4096$.
+
+**Baseline (hypothetical standard FFN):**
+
+$$
+d_\text{ff} = 4 \times 4096 = 16{,}384
+$$
+$$
+P_\text{std} = 2 \times 4096 \times 16{,}384 = 134{,}217{,}728 \approx 134.2\text{M parameters per FFN layer}
+$$
+
+**SwiGLU FFN (exact):**
+
+$$
+d_\text{ff}' = \frac{2}{3} \times 16{,}384 = 10{,}922.\overline{6}
+$$
+
+Since non-integer hidden dimensions are not implementable, round to the nearest multiple of 64 (for tensor-core alignment):
+
+$$
+d_\text{ff}' = 10{,}922.\overline{6} \;\to\; 11{,}008 \quad (\text{next multiple of 64})
+$$
+
+The LLaMA 7B tech report (Touvron et al., 2023) confirms $d_\text{ff}' = 11{,}008$.
+
+**Parameter check:**
+
+$$
+P_\text{GLU} = 3 \times 4096 \times 11{,}008 = 135{,}331{,}840 \approx 135.3\text{M}
+$$
+$$
+\text{Ratio: } \frac{135{,}331{,}840}{134{,}217{,}728} \approx 1.0083
+$$
+
+The rounding to 11,008 introduces a marginal parameter surplus of ~0.8%, which is accepted in practice in exchange for tensor-core alignment. With 32 transformer layers, this rounding adds roughly $32 \times 1.1\text{M} \approx 35\text{M}$ parameters total to the model — a small overhead.
+
+### Second example: DeepSeek-V3 expert blocks
+
+DeepSeek-V3 (DeepSeek-AI, arXiv 2412.19437, 2024) is a mixture-of-experts model. Each expert is a SwiGLU FFN with $d_\text{model} = 7168$ and expert hidden dimension $d_\text{ff}' = 2048$. Each expert's parameter count:
+
+$$
+P_\text{expert} = 3 \times 7168 \times 2048 = 44{,}040{,}192 \approx 44\text{M per expert}
+$$
+
+The model has 256 routed experts plus 1 shared expert per layer, across 61 transformer layers.
+
+<Callout variant="note" title="FLOPs accounting">
+The parameter-count derivation above shows the 2/3 correction keeps parameter counts equal. FLOPs are approximately equal too: a matrix multiply $xW$ with $x \in \mathbb{R}^{d_\text{model}}$ and $W \in \mathbb{R}^{d_\text{model} \times d_\text{ff}'}$ costs $2 \, d_\text{model} \cdot d_\text{ff}'$ multiply-add operations per token. Three such multiplies cost $6 \, d_\text{model} \cdot d_\text{ff}'$. At $d_\text{ff}' = \frac{2}{3} d_\text{ff}$ this is $6 \cdot \frac{2}{3} \, d_\text{model} \cdot d_\text{ff} = 4 \, d_\text{model} \cdot d_\text{ff}$, matching the two-multiply standard FFN at $2 \times 2 \, d_\text{model} \cdot d_\text{ff} = 4 \, d_\text{model} \cdot d_\text{ff}$. The elementwise SiLU and Hadamard product add $O(d_\text{ff}')$ operations, negligible versus the matrix multiplies.
+</Callout>
+
+### Why it matters
+
+Omitting the 2/3 correction when switching from a two-matrix to a three-matrix FFN inflates model size without a corresponding quality benefit at fixed compute. In a 7B model with 32 layers, an uncorrected switch (keeping $d_\text{ff}' = d_\text{ff} = 16{,}384$) would add approximately:
+
+$$
+32 \times (3 - 2) \times 4096 \times 16{,}384 = 32 \times 67{,}108{,}864 \approx 2.1\text{B extra parameters}
+$$
+
+This is why Shazeer (2020) stated the reduction explicitly, and why all major adopters implement it.
+
+### Failure modes
+
+- **Rounding imbalance**: rounding $d_\text{ff}'$ to a hardware-friendly multiple introduces a small parameter surplus (~0.5–1%). This is universally accepted but means the "parameter-neutral" claim is approximate.
+- **Obscured derivation in code**: some implementations hard-code `int(8/3 * d_model)`, which produces the correct value but obscures the derivation. This is mathematically identical to `int(2/3 * 4 * d_model)`.
+- **Non-standard expansion ratios**: the 2/3 factor is exact only when you are comparing against a $4\times$ expansion standard FFN. If an architecture uses a different expansion ratio (say $8\times$ for Gemma 2's 9B model), the absolute hidden dimension changes but the $2/3$ ratio still applies relative to the corresponding two-matrix FFN's $d_\text{ff}$.
+
+<Callout variant="exercise">
+Consider a model with $d_\text{model} = 2048$ and a standard $4\times$ expansion. (a) What is the SwiGLU hidden dimension $d_\text{ff}'$ before rounding? (b) Round to the nearest multiple of 128 — what is $d_\text{ff}'$? (c) How many parameters does one SwiGLU FFN layer have at that rounded value? (d) By what percentage does rounding increase the parameter count relative to the exact $2/3$ target?
+</Callout>
+
+---
+
+## Frontier-model choices {#swiglu}
+
+By May 2026 the de-facto default for new dense and MoE frontier models is **SwiGLU**, with **GeGLU** as the primary alternative. This convergence is traceable to three well-documented steps:
+
+1. **PaLM 540B (2022)**: Chowdhery et al. published the first high-visibility adoption of SwiGLU at 540B scale, explicitly citing Shazeer (2020) and applying the 2/3 width correction.
+2. **LLaMA (2023)**: Touvron et al. made SwiGLU the default in the first publicly released LLaMA family. Every subsequent open model forking from LLaMA inherited it.
+3. **Independent corroboration (2023–2024)**: Mistral 7B, Qwen2, and DeepSeek-V3 — each from a different lab — independently chose SwiGLU, providing evidence that the preference is not a Meta-specific artifact.
+
+The most prominent counterexample is Google DeepMind's **Gemma** family, which uses GeGLU across all three generations (2024–2025). The gate nonlinearity differs (GELU vs SiLU) but the gating structure is identical. No Gemma tech report publishes an ablation comparing the two; the choice likely reflects an internal architectural preference aligned with the Gemini lineage. NVIDIA's **Nemotron-4 340B** (2024) uses squared ReLU (ReLU$^2$), a choice explicitly motivated by activation sparsity: Zhang et al. (arXiv 2402.03804, 2024) demonstrated that ReLU$^2$ achieves approximately 90% activation sparsity during inference, enabling hardware acceleration via structured sparsity (e.g., NVIDIA's 2:4 sparsity). Quality is reported competitive with SwiGLU at those scales.
+
+<Callout variant="warning" title="Closed models">
+GPT-4 (OpenAI) and the Claude 3–4 series (Anthropic) have not published technical reports disclosing their activation-function choices. Given that every published frontier model post-PaLM 2022 uses SwiGLU or GeGLU, it is plausible that these models do too — but this is inference from published practice, not a confirmed primary source. The table below marks these rows accordingly.
+</Callout>
+
+<ComparisonTable
+  caption="Activation and gating choices across frontier models, sourced from primary technical reports. Rows marked '(inferred)' lack a primary-source disclosure. Calibrated to May 2026."
+  columns={["Model", "Org", "Activation", "GLU?", "Source", "Year"]}
+  rows={[
+    ["BERT", "Google", "GELU", "No", "Devlin et al., arXiv 1810.04805", "2018"],
+    ["GPT-2", "OpenAI", "GELU (tanh approx.)", "No", "Radford et al., 2019", "2019"],
+    ["GPT-3", "OpenAI", "GELU", "No", "Brown et al., arXiv 2005.14165", "2020"],
+    ["PaLM 540B", "Google", "SwiGLU", "Yes", "Chowdhery et al., arXiv 2204.02311", "2022"],
+    ["LLaMA 7–65B", "Meta", "SwiGLU", "Yes", "Touvron et al., arXiv 2302.13971", "2023"],
+    ["Falcon 180B", "TII", "GELU", "No", "HuggingFace model card tiiuae/falcon-180B", "2023"],
+    ["LLaMA 2", "Meta", "SwiGLU", "Yes", "Touvron et al., arXiv 2307.09288", "2023"],
+    ["Mistral 7B", "Mistral AI", "SwiGLU", "Yes", "Jiang et al., arXiv 2310.06825", "2023"],
+    ["Gemma 1", "Google DeepMind", "GeGLU", "Yes", "Gemma Team, arXiv 2403.08295", "2024"],
+    ["Gemma 2 (2B/9B/27B)", "Google DeepMind", "GeGLU", "Yes", "Gemma Team, arXiv 2408.00118, Table 1", "2024"],
+    ["LLaMA 3 / 3.1 / 3.2", "Meta", "SwiGLU", "Yes", "Meta AI blog; HuggingFace model configs", "2024"],
+    ["Qwen2 (0.5B–72B)", "Alibaba", "SwiGLU", "Yes", "Qwen Team, arXiv 2407.10671, Table 1", "2024"],
+    ["Nemotron-4 340B", "NVIDIA", "ReLU²", "No", "NVIDIA, arXiv 2406.11704", "2024"],
+    ["Qwen2.5", "Alibaba", "SwiGLU", "Yes", "Qwen Team, arXiv 2412.15115", "2024"],
+    ["DeepSeek-V3", "DeepSeek", "SwiGLU", "Yes", "DeepSeek-AI, arXiv 2412.19437", "2024"],
+    ["LLaMA 4 Scout / Maverick", "Meta", "SwiGLU", "Yes", "Meta AI blog, Apr 2025; syhya.github.io analysis", "2025"],
+    ["Gemma 3 (1B–27B)", "Google DeepMind", "GeGLU", "Yes", "Gemma Team, arXiv 2503.19786", "2025"],
+    ["GPT-4", "OpenAI", "Not disclosed", "Unknown", "No published technical report", "(inferred)"],
+    ["Claude 3–4 series", "Anthropic", "Not disclosed", "Unknown", "No published technical report", "(inferred)"],
+  ]}
+/>
+
+### Reading the table
+
+The 19-row table spans 2018–2025 and shows a clear directional shift: the encoder-LM era (BERT, GPT-2/3) used GELU without gating; the frontier-LM era (PaLM onward) almost uniformly uses gated variants, predominantly SwiGLU. The exceptions — GELU without GLU in Falcon 180B, ReLU$^2$ in Nemotron-4, GeGLU in Gemma — are all motivated by specific engineering choices (legacy architecture, inference sparsity, internal lab preference) rather than quality arguments against SwiGLU.
+
+The SwiGLU/GeGLU split among gated models follows organizational lines: Meta, Alibaba, Mistral, and DeepSeek use SwiGLU; Google DeepMind's open-weight models use GeGLU. Both are smooth gated activations from Shazeer (2020) with very similar empirical performance; the difference is unlikely to be the dominant factor in quality comparisons between models.
+
+<Sidenote>The Qwen2 technical report (Table 1, arXiv 2407.10671) confirms SwiGLU with specific intermediate dimensions: 4,864 (0.5B), 8,960 (7B), 18,944 (57B MoE), and 29,568 (72B). Cross-checking these against the $\frac{8}{3} d_\text{model}$ formula: for 72B with $d_\text{model} = 8192$, the formula gives $\frac{8}{3} \times 8192 = 21{,}845$, which rounds to 21,888. The discrepancy — 29,568 vs 21,888 — indicates Qwen2 72B uses an expansion ratio larger than $4\times$ for the baseline. The 2/3 correction still applies relative to whatever two-matrix FFN Qwen2 would use; the expansion multiple is a separate hyperparameter choice.</Sidenote>
+
+### Connection to MoE architectures
+
+In mixture-of-experts models (covered in [MoE plumbing](/textbook/00h-moe-plumbing#expert-ffn)), each routed expert is typically a SwiGLU FFN. The 2/3 width adjustment applies per expert: if a model has $E$ experts each with hidden dimension $d_\text{ff}'$, the per-expert parameter cost is $3 d_\text{model} d_\text{ff}'$. DeepSeek-V3 exemplifies this: 256 routed experts per layer, each a $7168 \to 2048 \to 7168$ SwiGLU block.
+
+The pre-norm placement of [RMSNorm](/textbook/00d-normalization-and-init#rms-norm) before each FFN sub-block means the input $x$ to the FFN is already normalised. This interacts with activation-function choice: an RMSNorm-normalised input has roughly unit RMS, so pre-activations $xW$ are approximately normally distributed with standard deviation controlled by the initialisation of $W$. Both GELU and SiLU operate well in this regime.
+
+---
+
+## Summary
+
+The principal results of this chapter:
+
+1. **ReLU** has zero gradient for all negative inputs, causing dead neurons at scale. **GELU** and **SiLU/Swish** smooth the zero-crossing, providing small but non-zero gradients for negative pre-activations. The two smooth functions are numerically near-identical for $|x| \lesssim 3$.
+
+2. **GLU variants** replace the two-matrix FFN with a three-matrix gated structure $\bigl(\phi(xW) \odot xV\bigr) W_2$. The gate provides input-dependent feature selection. GeGLU and SwiGLU produced the best results in Shazeer's (2020) compute-matched ablations; the theoretical reason remains unexplained.
+
+3. **The 2/3 width adjustment** is necessary when switching from a two-matrix to a three-matrix FFN to maintain parameter (and FLOP) parity. With $d_\text{ff} = 4 d_\text{model}$, the corrected hidden dimension is $d_\text{ff}' = \frac{8}{3} d_\text{model} \approx 2.667 d_\text{model}$. In practice this is rounded to the nearest hardware-friendly multiple (64, 128, or 256), introducing a marginal ~0.5–1% parameter surplus.
+
+4. **Frontier consensus (May 2026)** is SwiGLU for dense and MoE models, with GeGLU as a functionally equivalent alternative used by Google DeepMind. Architectures predating the PaLM-era (Falcon, legacy GPT-NeoX) use plain GELU. Nemotron-4 340B uses ReLU$^2$ for inference-sparsity reasons.
+
+<Sources items={[
+  {
+    authors: "Nair, V. & Hinton, G. E.",
+    year: 2010,
+    title: "Rectified Linear Units Improve Restricted Boltzmann Machines",
+    venue: "ICML 2010",
+    url: "https://www.cs.toronto.edu/~fritz/absps/reluICML.pdf",
+    note: "Introduced ReLU. The AlexNet paper (Krizhevsky et al., NeurIPS 2012) popularised it for deep convolutional networks."
+  },
+  {
+    authors: "Hendrycks, D. & Gimpel, K.",
+    year: 2016,
+    title: "Gaussian Error Linear Units (GELUs)",
+    venue: "arXiv 1606.08415",
+    url: "https://arxiv.org/abs/1606.08415",
+    note: "Defines GELU and the tanh approximation. BERT and GPT-1/2/3 all adopted GELU from this paper."
+  },
+  {
+    authors: "Ramachandran, P., Zoph, B. & Le, Q. V.",
+    year: 2017,
+    title: "Searching for Activation Functions",
+    venue: "arXiv 1710.05941",
+    url: "https://arxiv.org/abs/1710.05941",
+    note: "Introduces Swish (SiLU at β=1) via automated search. Reports +0.9% ImageNet top-1 over ReLU at β=1."
+  },
+  {
+    authors: "Elfwing, S., Uchibe, E. & Doya, K.",
+    year: 2018,
+    title: "Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning",
+    venue: "Neural Networks, 2018",
+    note: "Formalises SiLU at β=1. Concurrent with Ramachandran et al.; the SiLU name originates here."
+  },
+  {
+    authors: "Dauphin, Y. N., Fan, A., Auli, M. & Grangier, D.",
+    year: 2017,
+    title: "Language Modeling with Gated Convolutional Networks",
+    venue: "ICML 2017",
+    url: "https://arxiv.org/abs/1612.08083",
+    note: "Introduces the original GLU with sigmoid gating, in a convolutional language-model context."
+  },
+  {
+    authors: "Shazeer, N.",
+    year: 2020,
+    title: "GLU Variants Improve Transformer",
+    venue: "arXiv 2002.05202",
+    url: "https://arxiv.org/abs/2002.05202",
+    note: "Defines and ablates ReGLU, GeGLU, SwiGLU, and Bilinear on C4. States the 2/3 width correction. GeGLU and SwiGLU win; improvement described as 'empirically mysterious'."
+  },
+  {
+    authors: "Devlin, J., Chang, M.-W., Lee, K. & Toutanova, K.",
+    year: 2018,
+    title: "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+    venue: "arXiv 1810.04805",
+    url: "https://arxiv.org/abs/1810.04805",
+    note: "BERT adopts GELU, establishing it as the encoder-LM default."
+  },
+  {
+    authors: "Brown, T. et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "GPT-3 uses GELU (no GLU gating). Last major OpenAI model to publish a full architecture description."
+  },
+  {
+    authors: "Chowdhery, A. et al.",
+    year: 2022,
+    title: "PaLM: Scaling Language Modeling with Pathways",
+    venue: "arXiv 2204.02311",
+    url: "https://arxiv.org/abs/2204.02311",
+    note: "First high-visibility SwiGLU adoption at 540B scale. Explicitly cites Shazeer 2020 and applies the 2/3 width correction."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "LLaMA: Open and Efficient Foundation Language Models",
+    venue: "arXiv 2302.13971",
+    url: "https://arxiv.org/abs/2302.13971",
+    note: "LLaMA 7–65B. SwiGLU with d_ff = 11,008 for the 7B model (2/3 × 4 × 4096 rounded to nearest 64)."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv 2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "LLaMA 2 continues SwiGLU with the same hidden-dimension formula."
+  },
+  {
+    authors: "Jiang, A. Q. et al.",
+    year: 2023,
+    title: "Mistral 7B",
+    venue: "arXiv 2310.06825",
+    url: "https://arxiv.org/abs/2310.06825",
+    note: "Mistral 7B uses SwiGLU; first non-Meta frontier-scale model to independently confirm SwiGLU."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2024,
+    title: "Gemma: Open Models Based on Gemini Research and Technology",
+    venue: "arXiv 2403.08295",
+    url: "https://arxiv.org/abs/2403.08295",
+    note: "Gemma 1 uses GeGLU ('approximated GeGLU non-linearity'). First generation of the Gemma family."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv 2408.00118",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "Table 1 confirms GeGLU for 2B, 9B, and 27B variants. Feedforward dims: 18,432 / 28,672 / 73,728."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2024,
+    title: "Qwen2 Technical Report",
+    venue: "arXiv 2407.10671",
+    url: "https://arxiv.org/abs/2407.10671",
+    note: "Table 1 confirms SwiGLU across all sizes. Intermediate dimensions: 4,864 (0.5B) to 29,568 (72B)."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Nemotron-4 340B Technical Report",
+    venue: "arXiv 2406.11704",
+    url: "https://arxiv.org/abs/2406.11704",
+    note: "Uses squared ReLU (ReLU²). Motivated by inference activation sparsity; d_model = 18,432."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv 2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "SwiGLU in each expert FFN. Expert hidden dim = 2048; d_model = 7168; 61 transformer layers; 256 routed + 1 shared expert per layer."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv 2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "Confirms SwiGLU continuation from Qwen2."
+  },
+  {
+    authors: "Zhang, Z. et al.",
+    year: 2024,
+    title: "ReLU² Wins: Discovering Efficient Activation Functions for Sparse LLMs",
+    venue: "arXiv 2402.03804",
+    url: "https://arxiv.org/abs/2402.03804",
+    note: "Shows ReLU² achieves ~90% activation sparsity with near-SwiGLU quality. Motivates Nemotron-4's choice."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2025,
+    title: "Gemma 3 Technical Report",
+    venue: "arXiv 2503.19786",
+    url: "https://arxiv.org/abs/2503.19786",
+    note: "GeGLU confirmed for Gemma 3 (1B–27B). Architectural changes from Gemma 2 focus on attention and context length, not FFN activation."
+  },
+]} />

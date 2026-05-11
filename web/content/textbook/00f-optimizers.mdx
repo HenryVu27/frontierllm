@@ -1,0 +1,652 @@
+---
+slug: 00f-optimizers
+title: Optimisers and learning-rate schedules
+description: SGD through AdamW, Lion, Muon, Shampoo / SOAP, plus the WSD-style learning-rate schedule landscape and gradient clipping — the optimiser choices behind 2026 frontier models.
+order: 6
+chapter: 6
+reading_minutes: 38
+depends_on: [00d-normalization-and-init]
+provides: [adam, adamw, lion, muon, shampoo, wsd-schedule, grad-clip]
+last_reviewed: 2026-05-11
+---
+
+## The problem an optimiser solves
+
+Training a neural network reduces to iteratively descending a high-dimensional loss surface. Given a minibatch loss $L(\theta; \mathcal{B}_t)$, the optimiser decides how large a step to take, in what direction, and whether to scale that step differently for different parameters. The choice of optimiser shapes convergence speed, final quality, memory footprint, and numerical stability. For frontier language model pretraining — runs lasting weeks on thousands of accelerators, consuming trillions of tokens — the optimiser is an engineering decision with real cost consequences.
+
+This chapter traces the design space from the simplest baseline (vanilla SGD) through the adaptive methods that dominate LLM pretraining (AdamW), two newer challengers that have reached production scale (Lion and Muon), and a class of preconditioned methods that may become more common as compute budgets grow (Shampoo and SOAP). The second half covers learning-rate schedules and gradient clipping, which interact closely with the optimiser choice.
+
+<Callout variant="note" title="Prerequisites and notation">
+This chapter assumes familiarity with the [normalisation and initialisation chapter](/textbook/00d-normalization-and-init), in particular the $\mu$P (maximal update parameterisation) section, which is referenced in §3.5 and §5. Throughout this chapter: $g_t = \nabla_\theta L(\theta_t; \mathcal{B}_t)$ is the minibatch gradient at step $t$; $\eta$ denotes the learning rate (sometimes written $\alpha$ in the literature — we use $\eta$ consistently); $\beta_1, \beta_2$ are exponential-moving-average decay factors; $\lambda$ is the weight-decay coefficient.
+</Callout>
+
+---
+
+## SGD, momentum, and Nesterov {#sgd}
+
+### Vanilla SGD
+
+The simplest possible update rule:
+
+$$\theta_{t+1} = \theta_t - \eta_t \, g_t$$
+
+Nothing is stored between steps; the step size is exactly $\eta_t$ in the gradient direction. This is the floor against which every more expensive method is judged.
+
+### Heavy-ball momentum (Polyak, 1964)
+
+Accumulate a velocity vector $v_t$ that is an exponential moving average of past gradients:
+
+$$v_t = \beta \, v_{t-1} + g_t, \qquad \theta_{t+1} = \theta_t - \eta \, v_t$$
+
+The effective number of recent steps contributing to $v_t$ is approximately $1/(1-\beta)$. With $\beta = 0.9$, the velocity integrates roughly the last ten gradients; with $\beta = 0.95$, roughly twenty.
+
+### Nesterov momentum
+
+Nesterov's variant evaluates the gradient at the *projected* position, not the current one:
+
+$$v_t = \beta \, v_{t-1} + \nabla L\!\left(\theta_t - \eta \beta \, v_{t-1}\right), \qquad \theta_{t+1} = \theta_t - \eta \, v_t$$
+
+The practical difference over heavy-ball is a faster correction when the gradient sign reverses — the lookahead gradient detects an impending overshoot before it happens rather than after.
+
+### Worked example
+
+Consider the scalar quadratic $L(\theta) = \tfrac{1}{2}\theta^2$, with $\eta = 0.1$, $\beta = 0.9$, starting at $\theta_0 = 1.0$.
+
+- **Step 0:** $g_0 = 1.0$, $v_0 = 1.0$, $\theta_1 = 1.0 - 0.1 \times 1.0 = 0.9$
+- **Step 1:** $g_1 = 0.9$, $v_1 = 0.9 \times 1.0 + 0.9 = 1.71$, $\theta_2 = 0.9 - 0.1 \times 1.71 = 0.729$
+
+Compare plain SGD at step 2: $\theta_2 = 1.0 - 0.1 - 0.09 = 0.81$. Momentum reaches $0.729$ vs. $0.81$ — a 10% closer approach to the optimum in the same number of steps, on this bowl-shaped loss.
+
+### Why SGD does not dominate LLM pretraining
+
+SGD with momentum trains vision models (ResNets, ViTs on small-to-medium datasets) competitively with Adam. It does not generalise to language models at scale for one primary reason: **sparse gradient problem.** In a large embedding table with vocabulary size 100k, most token embeddings receive zero gradient on any given minibatch. SGD applies the same update magnitude to every parameter regardless of how often it is visited; rarely visited embeddings fall systematically behind. Adaptive methods (§2) address this by maintaining per-parameter scale estimates. Momentum itself (the $v_t$ vector) appears inside Muon (§5) but after an orthogonalisation step.
+
+<Callout variant="warning" title="Momentum window and LR schedule interactions">
+With $\beta = 0.9$, the effective gradient window is ~10 steps. If the learning rate changes faster than this window, the velocity accumulates gradients computed at the *old* scale, injecting stale information. This is one reason learning-rate warmup — discussed in §6 — is applied before the Adam moment estimates or momentum vectors have had time to stabilise.
+</Callout>
+
+---
+
+## Adam {#adam}
+
+Adam (Kingma & Ba, 2015) extends the momentum idea to *two* running statistics: a first moment (signed, like SGD momentum) and a second moment (unsigned, tracking gradient magnitude). The ratio of the two gives a per-parameter, scale-normalised step.
+
+### Update rule
+
+$$m_t = \beta_1 \, m_{t-1} + (1 - \beta_1) \, g_t$$
+
+$$v_t = \beta_2 \, v_{t-1} + (1 - \beta_2) \, g_t^2$$
+
+$$\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}$$
+
+$$\theta_{t+1} = \theta_t - \eta \, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}$$
+
+### Role of each hyperparameter
+
+**$\beta_1 \approx 0.9$:** The exponential window over the signed gradient, analogous to SGD momentum. Controls how much the update direction tracks the recent gradient trend.
+
+**$\beta_2 \approx 0.95$–$0.999$:** The window for the second moment (gradient-squared). Larger $\beta_2$ gives a more stable scale estimate by averaging over more past values, but reacts more slowly to distribution shifts. Frontier LLM pretraining typically uses $\beta_2 = 0.95$ (not the Adam paper's default of $0.999$) because the token stream is long and the loss landscape drifts — a shorter window adapts faster. At $\beta_2 = 0.95$, the effective second-moment window is $1/(1-0.95) = 20$ steps.
+
+**$\epsilon \approx 10^{-8}$–$10^{-5}$:** Numerical floor. Without it, parameters with near-zero second moments produce arbitrarily large steps. Increasing $\epsilon$ reduces the adaptivity — at $\epsilon \gg \sqrt{\hat{v}_t}$, Adam degrades toward SGD.
+
+**Bias correction:** At step 1, $m_0 = 0$ and $v_0 = 0$ by initialisation. Without correction, $m_1 = (1 - \beta_1) g_1 \approx 0.1 g_1$ and the first update would be 10× smaller than intended. The bias correction terms $1 - \beta_1^t$ and $1 - \beta_2^t$ compensate — they are close to 1 once $t \gg 1/(1-\beta_2)$.
+
+### Worked example
+
+Let $g_0 = 1.0$, $g_1 = -0.5$, with $\eta = 0.001$, $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\epsilon = 10^{-8}$.
+
+**Step 0:**
+- $m_0 = (1 - 0.9) \times 1.0 = 0.1$; $v_0 = (1 - 0.999) \times 1.0^2 = 0.001$
+- $\hat{m}_0 = 0.1 / (1 - 0.9) = 1.0$; $\hat{v}_0 = 0.001 / (1 - 0.999) = 1.0$
+- Update $= -0.001 \times 1.0 / (\sqrt{1.0} + 10^{-8}) \approx -0.001$
+
+**Step 1:**
+- $m_1 = 0.9 \times 0.1 + 0.1 \times (-0.5) = 0.09 - 0.05 = 0.04$
+- $v_1 = 0.999 \times 0.001 + 0.001 \times 0.25 = 0.000999 + 0.00025 \approx 0.001249$
+- $\hat{m}_1 = 0.04 / (1 - 0.81) = 0.04 / 0.19 \approx 0.211$
+- $\hat{v}_1 = 0.001249 / (1 - 0.998001) \approx 0.001249 / 0.001999 \approx 0.625$
+- Update $\approx -0.001 \times 0.211 / \sqrt{0.625} \approx -0.001 \times 0.267 \approx -0.000267$
+
+The optimiser correctly reduces the step after a gradient sign reversal: the second-moment signal ($\hat{v}_1 > \hat{v}_0$ would be false here — magnitude was $0.25$ vs. $1.0$, so the scale dropped). The first moment blended the two conflicting gradients, and the net step is cautiously small. This is the core adaptive behaviour.
+
+### Why Adam dominates language model training
+
+Adam's key property is **per-coordinate adaptivity**: infrequently updated parameters (rare-token embeddings, certain attention heads) accumulate small $v_t$, which boosts their effective step size. Frequently updated parameters accumulate large $v_t$, which keeps their steps bounded. This automatic equalisation is the reason Adam generalises across the highly heterogeneous gradient distributions inside a large language model.
+
+The cost is memory: two extra tensors ($m_t$ and $v_t$) of the same shape as $\theta$. For a 70B-parameter model in FP32, that is $3 \times 70 \times 10^9 \times 4$ bytes $\approx 840$ GB of state, without counting activations. In practice, mixed-precision training (BF16 weights, FP32 or BF16 moments) reduces this — DeepSeek-V3 stores moments in BF16 and reports no quality degradation.
+
+---
+
+## AdamW {#adamw}
+
+AdamW (Loshchilov & Hutter, 2019) addresses a subtle coupling in standard Adam between weight decay and the adaptive learning-rate mechanism.
+
+### The L2-regularisation problem
+
+The natural way to add weight decay in a gradient-based framework is to add $\tfrac{\lambda}{2}\|\theta\|^2$ to the loss, which contributes $\lambda \theta_t$ to the gradient:
+
+$$g_t^{\text{L2}} = g_t + \lambda \theta_t$$
+
+When this modified gradient is fed into Adam's second-moment accumulator, the regularisation signal is absorbed into $v_t$:
+
+$$v_t = \beta_2 \, v_{t-1} + (1 - \beta_2) \, (g_t + \lambda \theta_t)^2$$
+
+The effective per-parameter regularisation strength then scales as $\lambda / \sqrt{\hat{v}_t}$ — strongest for parameters with small second moments, weakest for those with large second moments. This is backward: high-gradient parameters (which have already drifted far) receive weaker regularisation than low-gradient ones.
+
+### Decoupled weight decay
+
+AdamW applies the decay *after* the Adam step, entirely bypassing $v_t$:
+
+$$\theta_{t+1} = \theta_t - \eta \left[\frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}\right] - \eta \lambda \, \theta_t$$
+
+The second subtraction is proportional to $\theta_t$ regardless of gradient magnitude. This cleanly separates the "fit the data" and "stay near zero" objectives.
+
+<Callout variant="info" title="Which parameters get weight decay?">
+The standard exclusion pattern, established in BERT (2018) and maintained through GPT-3, Llama, and DeepSeek, is: apply weight decay to weight matrices and convolutions, exclude bias vectors, normalisation layer parameters (RMSNorm scale $\gamma$ and shift $\beta$), and sometimes token embeddings. The reasoning: norms and biases are already low-dimensional and easy to regularise; embeddings have their own implicit regularisation through limited gradient signal.
+</Callout>
+
+### Frontier-lab practice
+
+AdamW is the de-facto standard for LLM pretraining that does not use Muon. The hyperparameter choices have converged substantially across labs:
+
+- **$\beta_1 = 0.9$, $\beta_2 = 0.95$:** Used by GPT-3 (2020), LLaMA-2 (2023), Llama-3 (2024), DeepSeek-V3 (2024), and Qwen 2.5 (2024). The shorter $\beta_2$ window (vs. the Adam default $0.999$) is specific to large-scale LLM pretraining; it adapts faster to the shifting gradient distribution over a multi-trillion-token run.
+- **$\lambda = 0.1$:** The most common weight decay choice (LLaMA-2, DeepSeek-V3, Qwen 2.5). The Llama-3 405B report notes that their weight decay is scaled proportionally to the learning rate as it anneals.
+- **Gradient clip $\tau = 1.0$:** Near-universal default (discussed in §7).
+
+Wang & Aitchison (2024) derive scaling rules for $\lambda$: as dataset size increases, optimal $\lambda$ should *decrease* (more data provides its own implicit regularisation); as model width increases under $\mu$P parameterisation, optimal $\lambda$ should *increase*. These are not yet universally adopted but provide theoretical grounding for what practitioners have observed empirically.
+
+<Sidenote>DeepSeek-V3 (Dec 2024) stores both $m_t$ and $v_t$ in BF16 rather than FP32. The memory saving is 2× for the optimizer state — significant at 671B parameters. They report no observable quality degradation. This is a single large-scale data point; the community has not yet independently reproduced the parity claim at comparable scale.</Sidenote>
+
+---
+
+## Lion {#lion}
+
+Lion (Chen et al., NeurIPS 2023) was discovered through automated program search ("symbolic discovery") at Google Brain rather than designed from first principles. It discards the second moment entirely and operates only on the *sign* of a gradient-momentum interpolation.
+
+### Update rule
+
+```
+c_t = sign(β₁ · m_{t-1} + (1 - β₁) · g_t)   # interpolate, then sign
+m_t = β₂ · m_{t-1} + (1 - β₂) · g_t          # momentum update (separate β₂)
+θ_{t+1} = θ_t - η · c_t - η λ · θ_t          # decoupled weight decay included
+```
+
+The sign operation means every parameter receives an update of exactly $\pm \eta$ — magnitude information is fully discarded. Lion is *not* an adaptive-magnitude method; it is a signed momentum method.
+
+### Hyperparameter shifts vs. AdamW
+
+Because every step has magnitude $\eta$ (not $\eta \cdot \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)$, which is often much smaller), Lion requires:
+
+- **LR 3–10× lower** than AdamW to avoid overshooting: a typical Lion LR is $10^{-4}$, vs. $3 \times 10^{-4}$ for AdamW on the same model.
+- **Weight decay 3–10× higher** to compensate: since $\lambda_{\text{Lion}}$ multiplies a smaller $\eta$, it needs to be larger to produce the same total shrinkage.
+
+Default published values: $\beta_1 = 0.9$, $\beta_2 = 0.99$, $\eta = 10^{-4}$, $\lambda = 10^{-2}$.
+
+### Memory advantage
+
+Lion stores only one momentum vector $m_t$, compared to Adam's two ($m_t$ and $v_t$). At BF16 precision, for a 70B-parameter model: Adam optimizer state $\approx 280$ GB; Lion $\approx 140$ GB.
+
+### Empirical results
+
+Chen et al. report improvements over Adam on ViT/ImageNet (up to 2% accuracy), JFT-300M pre-training (compute reduced approximately 5×), and diffusion model FID. The optimizer was deployed in Google's search-ads click-through-rate production model.
+
+<Callout variant="note" title="Lion in frontier LLM pretraining">
+As of May 2026, there is no public confirmation of Lion being used for frontier-scale LLM pretraining at OpenAI, Meta, Anthropic, Google (LLM side), or DeepSeek. Chen et al.'s strongest LLM results are on moderate-scale language modelling tasks; the step-magnitude instability under bfloat16 and non-constant schedules appears to be a practical barrier at very large scale. The memory advantage is real but is also achievable via BF16 moment storage in AdamW.
+</Callout>
+
+---
+
+## Muon {#muon}
+
+Muon (Jordan et al., October 2024) takes a different approach from Lion: rather than simplifying the Adam update, it *orthogonalises* the momentum matrix before applying it. The result is an update whose singular value decomposition has all singular values equal — every direction in weight space receives equal learning progress.
+
+### The orthogonalisation idea
+
+Given a weight matrix $W \in \mathbb{R}^{m \times n}$, the gradient $G$ has an SVD $G = U \Sigma V^\top$ where $\Sigma$ contains the singular values. An AdamW update (coordinate-normalised) scales each singular direction by roughly $1 / \sqrt{\hat{v}}$ — the dominant singular directions receive disproportionately large updates. The orthogonal update replaces $G$ with $U V^\top$, which has all singular values equal to 1, distributing learning progress uniformly across directions.
+
+This is related to the concept of steepest descent under the spectral norm: the nearest matrix to $G$ with spectral norm $\leq 1$ is the rescaled matrix $UV^\top$.
+
+### Newton-Schulz orthogonalisation
+
+Computing the full SVD costs $O(\min(m,n)^2 \max(m,n))$ — prohibitive at every step. Muon instead approximates $UV^\top$ via the Newton-Schulz iteration:
+
+$$X \leftarrow a X + b (X X^\top) X + c (X X^\top)^2 X$$
+
+run for $T = 5$ steps, starting from $X_0 = G / \|G\|_F$. The coefficients $(a, b, c) = (3.4445, -4.7750, 2.0315)$ (Cesista, 2024) were found by numerically optimising convergence speed. The iteration is stably runnable in bfloat16, unlike SVD (whose numerical precision requirements effectively demand FP32).
+
+The full Muon update:
+
+```
+v_t = β · v_{t-1} + g_t           # standard heavy-ball momentum (β = 0.95)
+G_t = NS_5(v_t)                    # 5-step Newton-Schulz orthogonalisation
+θ_{t+1} = θ_t - η · G_t           # apply orthogonal update
+```
+
+FLOP overhead relative to the forward/backward pass: approximately 0.5–0.7% for typical LLM training, since the Newton-Schulz matrix multiplications are small compared to the token-parallel matmuls in the main computation graph.
+
+### Scope: which parameters get Muon?
+
+Muon is defined for two-dimensional weight matrices. It is applied to the weight matrices in MLP blocks and attention projection layers (see [transformer block architecture](/textbook/00a-transformer#mlp-block)). It is **not** applied to:
+
+- Token embedding matrices (typically higher-dimensional and require AdamW's sparse-gradient handling)
+- Output projection / LM head
+- Bias vectors, normalisation parameters (which typically use AdamW or are excluded from optimisation)
+
+In all published Muon implementations, these remaining parameters use standard AdamW.
+
+### Worked example
+
+Consider a $4 \times 4$ weight matrix. After SGD-momentum, the momentum matrix $v_t$ has singular values $\{3.0,\ 0.5,\ 0.1,\ 0.01\}$. After applying Adam (column-wise normalisation by $\sqrt{\hat{v}_t}$), the update still reflects the dominant singular direction — parameter dimensions aligned with the $3.0$ singular vector move much faster than those aligned with $0.01$.
+
+After Muon orthogonalisation, the update matrix has singular values $\{1.0,\ 1.0,\ 1.0,\ 1.0\}$ — the network advances equally in all four directions. In terms of the loss landscape, this is the intuition behind Muon's faster convergence: no singular direction is neglected, and none overshoots.
+
+### Performance results
+
+- **NanoGPT speedrun (October 2024):** Muon achieved a 1.35× speed-up to 3.28 validation loss versus the previous record. It held or improved every one of the 12 subsequent NanoGPT record updates as the optimizer of choice.
+- **1.5B parameter transformer:** GPT-2 XL-level HellaSwag performance in 10 H100-hours, versus 13.3 hours with AdamW — a 25% wall-clock saving.
+
+### Scaling to production: Moonlight (Liu et al., 2025)
+
+The February 2025 Moonlight report (arXiv:2502.16982) from Moonshot AI and UCLA was the first published evidence of Muon working at production LLM scale. Moonlight is a 16B-parameter MoE (3B activated) trained on 5.7 trillion tokens. Two stabilisation techniques were required beyond the basic Muon formulation:
+
+1. **Weight decay 0.1:** Prevents BF16 weight overflow over long training runs.
+2. **RMS-normalised updates:** Per-parameter update RMS is scaled to a target of 0.2, matching the typical AdamW update range, to ensure learning-rate hyperparameters transfer from AdamW baselines.
+
+At compute-optimal scale, Moonlight requires approximately 52% of the FLOPs of an AdamW-trained model to reach the same benchmark performance — a factor-of-two compute efficiency improvement.
+
+### Essential AI: large-batch advantage (Shah et al., 2025)
+
+The Essential AI paper (arXiv:2505.02222, May 2025) — from the lab founded by Ashish Vaswani — validates Muon at 4B parameters with $\mu$P hyperparameter transfer. A key finding: Muon's advantage over AdamW grows at batch sizes far beyond the critical batch size. AdamW loses data efficiency (more tokens needed per unit of loss improvement) at very large batches; Muon maintains it. This has direct implications for training at scale with large-scale data parallelism.
+
+### MuonClip: stability at 1T parameters (Kimi K2, July 2025)
+
+The Kimi K2 report (arXiv:2507.20534) describes training a 1-trillion-parameter MoE model (32B activated) on 15.5 trillion tokens using a Muon variant called MuonClip. The core problem at this scale: Muon's orthogonal update, which discards scale information, caused attention logit values to exceed 1000 on models with 9B+ activated parameters, triggering loss spikes.
+
+MuonClip adds a **QK-clip** operation: after each Muon step, if the maximum query-key attention score exceeds a threshold $t$, rescale $W_Q$ and $W_K$ by $\eta_{\text{clip}} = t / \text{max\_score}$, distributed asymmetrically between the two matrices via a tunable exponent $\alpha$. The result: zero loss spikes across the full 15.5T-token training run.
+
+<Callout variant="info" title="QK-clip and QK-norm">
+The attention-logit instability addressed by MuonClip's QK-clip is the same instability that QK-norm addresses architecturally — normalising the query and key vectors before computing attention scores. See [normalisation and initialisation, §QK-norm](/textbook/00d-normalization-and-init#qk-norm) for the architectural treatment. QK-clip is an optimiser-level patch; QK-norm is a model-architecture patch. Both suppress the same failure mode.
+</Callout>
+
+### Newton-Muon: theoretical grounding (Du & Su, April 2026)
+
+The Newton-Muon paper (arXiv:2604.01472, April 2026) adds right-preconditioning using the inverse of the activation second-moment matrix, giving Muon a cleaner theoretical connection to second-order optimisation. Newton-Muon can be interpreted as a natural-gradient approximation under the Kronecker-factored Fisher, bridging Muon and Shampoo/SOAP.
+
+### Muon adoption trajectory
+
+| Date | Event |
+|------|-------|
+| October 2024 | Keller Jordan releases Muon; NanoGPT 1.35× record |
+| February 2025 | Moonlight report (Liu et al., arXiv:2502.16982); first published production-scale validation |
+| May 2025 | Essential AI publishes 4B validation with $\mu$P (Shah et al., arXiv:2505.02222) |
+| July 2025 | Kimi K2 (1T parameters) ships MuonClip (arXiv:2507.20534); zero spikes on 15.5T tokens |
+| April 2026 | Newton-Muon adds right-preconditioning and theoretical grounding (Du & Su, arXiv:2604.01472) |
+
+As of May 2026, Muon is confirmed in production at Moonshot AI and has been validated by Essential AI. No public pretraining reports from OpenAI, Anthropic, Google, or Meta confirm Muon adoption.
+
+---
+
+## Shampoo and SOAP {#shampoo}
+
+Shampoo and SOAP belong to a different class of optimisers: they approximate the full Hessian by a Kronecker product of per-dimension matrices, giving second-order-like updates at a cost below a full Newton step.
+
+### Shampoo (Gupta, Koren & Singer, ICML 2018)
+
+For a weight matrix $W \in \mathbb{R}^{m \times n}$ with gradient $G_t$, Shampoo maintains two preconditioner matrices:
+
+$$L_t = L_{t-1} + G_t G_t^\top \in \mathbb{R}^{m \times m}, \qquad R_t = R_{t-1} + G_t^\top G_t \in \mathbb{R}^{n \times n}$$
+
+The preconditioned update is:
+
+$$\tilde{G}_t = L_t^{-1/4} \, G_t \, R_t^{-1/4}$$
+
+Intuitively, $L_t$ captures how the gradient covaries along the row dimension of $W$; $R_t$ along the column dimension. The $-1/4$ power (rather than $-1/2$) is chosen because both $L_t$ and $R_t$ appear, and their combined effect approximates the $-1/2$ power of the full Kronecker product.
+
+**Memory cost:** $O(m^2 + n^2)$ per layer, compared to $O(mn)$ for Adam. For a 4096×4096 weight matrix, Shampoo requires approximately $2 \times 4096^2 \times 4 = 134$ MB of preconditioner storage versus $4096^2 \times 4 = 67$ MB for the Adam moment (roughly 2× the overhead). The matrix inversion (or eigendecomposition) of an $m \times m$ matrix costs $O(m^3)$.
+
+**Distributed Shampoo** (Shi et al., 2023) won the 2023 MLCommons optimisation efficiency benchmark by distributing preconditioner computation across devices and amortising the inversion cost.
+
+### SOAP: Shampoo via Adam in the Eigenbasis (Vyas et al., ICLR 2025)
+
+The SOAP paper (arXiv:2409.11321) makes the following observation: Shampoo with exponent $p = 1/2$ is equivalent to running Adafactor in the eigenbasis of the Kronecker-product preconditioner. Adafactor discards the running second-moment average (refreshing it each step), which loses momentum information. SOAP corrects this by running **Adam** (not Adafactor) in the current eigenbasis, preserving the running $\hat{v}_t$ across preconditioner updates.
+
+The SOAP algorithm, in outline:
+
+```
+Every T_prec steps: re-eigendecompose L_t → (Q_L, Λ_L), R_t → (Q_R, Λ_R)
+Each step: rotate gradient into eigenbasis: G̃_t = Q_L^T G_t Q_R
+           run Adam update on G̃_t to get Δ̃_t
+           rotate back: Δ_t = Q_L Δ̃_t Q_R^T
+           apply: θ_{t+1} = θ_t - η Δ_t - ηλ θ_t
+```
+
+`T_prec` is the only additional hyperparameter beyond Adam. The preconditioning frequency trades off quality (more frequent = better-conditioned) against compute (less frequent = cheaper).
+
+### Empirical results
+
+SOAP achieves more than 40% fewer iterations than AdamW and more than 35% less wall-clock time on 360M and 660M LLM pretraining benchmarks in the ICLR 2025 paper. Compared to Shampoo, SOAP achieves approximately 20% improvement on both metrics. At `T_prec = 100`, the amortised eigendecomposition cost is manageable.
+
+### Frontier-lab practice
+
+Shampoo is deployed in production at Google (the Google Ads CTR model). SOAP was published by Nikhil Vyas while at Harvard/MIT; Vyas subsequently moved to OpenAI, but there is no public confirmation of SOAP use in OpenAI production training as of May 2026. The memory cost ($O(m^2 + n^2)$ preconditioners) at the scale of 400B+ parameter models remains a practical barrier; distributed implementations with partial preconditioning (DASH, NorMuon, 2025–2026) are active research.
+
+<Callout variant="note" title="SOAP + Muon">
+Follow-up work by Vyas (2025) shows that combining SOAP's eigenbasis preconditioning with Muon's Newton-Schulz orthogonalisation step outperforms either method alone per step. SOAP displays the largest per-step gain among matrix-whitening optimisers in tuned comparisons. This line of work converges with Newton-Muon (§5.4) in its theoretical motivation.
+</Callout>
+
+---
+
+## Frontier-lab optimiser comparison {#frontier-optimizer-table}
+
+The following table collects published training-recipe details from major frontier model reports. Rows with "(inferred)" reflect architectural information from the tech report but undisclosed optimiser hyperparameters. GPT-4, Claude 3/3.5/3.7, and Gemini 1.5/2 did not publish pretraining optimiser details and are omitted rather than speculated.
+
+<ComparisonTable
+  caption="Frontier-model optimiser choices, calibrated to public reports as of May 2026. Rows marked (inferred) reflect absence of disclosed hyperparameters in the source report."
+  columns={["Model", "Optimiser", "β₁ / β₂", "Weight decay λ", "LR schedule", "Peak LR", "Grad clip", "Source"]}
+  rows={[
+    ["GPT-3 175B (2020)", "Adam (≈AdamW)", "0.9 / 0.95", "0.1", "Cosine, warmup 375M tok", "6e-5", "1.0 (global norm)", "Brown et al. 2020, §B"],
+    ["LLaMA-2 70B (2023)", "AdamW", "0.9 / 0.95", "0.1", "Cosine to 10% peak, 2k step warmup", "3e-4", "1.0", "Touvron et al. 2023, §2.2"],
+    ["Llama 3 405B (2024)", "AdamW", "0.9 / 0.95", "0.1 × η (decaying)", "Cosine, 8k step warmup", "8e-5", "1.0", "Meta 2024, arXiv:2407.21783 §3.3"],
+    ["Mistral 7B (2023)", "AdamW (inferred)", "0.9 / 0.95 (inferred)", "— (not disclosed)", "Cosine (inferred)", "—", "—", "Jiang et al. 2023, arXiv:2310.06825; exact hparam not disclosed"],
+    ["Gemma 2 9B/27B (2024)", "AdamW (inferred)", "— (not disclosed)", "— (not disclosed)", "— (not disclosed)", "—", "—", "Gemma 2 report arXiv:2408.00118; optimizer hparam not disclosed"],
+    ["Qwen 2.5 72B (2024)", "AdamW", "0.9 / 0.95", "0.1", "Cosine", "—", "1.0 (inferred)", "Qwen 2.5 tech report arXiv:2412.15115 §3.2"],
+    ["DeepSeek-V3 671B (2024)", "AdamW (BF16 moments)", "0.9 / 0.95", "0.1", "WSD-like: warmup→stable→cosine→stable", "2.2e-4", "1.0", "DeepSeek-V3 arXiv:2412.19437 §3.1"],
+    ["Phi-4 14B (2024)", "AdamW (inferred)", "— (not disclosed)", "0.1", "Linear warmup + decay", "3e-4", "—", "Abdin et al. 2024, arXiv:2412.08905 §A"],
+    ["MiniCPM 2B (2024)", "AdamW", "0.9 / 0.95", "0.1", "WSD (original proposal)", "—", "1.0", "Hu et al. 2024, arXiv:2404.06395"],
+    ["Moonlight 16B / 3B active (2025)", "Muon (hidden layers) + AdamW (embed/output)", "β = 0.95 (Muon momentum)", "0.1", "Cosine", "4.2e-4", "1.0", "Liu et al. 2025, arXiv:2502.16982 §3"],
+    ["Kimi K2 1T / 32B active (2025)", "MuonClip (hidden) + AdamW (embed/output)", "—", "—", "—", "—", "QK-clip (optimizer-integrated)", "Kimi K2 arXiv:2507.20534 §3.2"]
+  ]}
+/>
+
+<Sidenote>The GPT-3 paper uses "Adam" but with $\lambda = 0.1$ applied as decoupled weight decay, which is functionally AdamW. The naming inconsistency was common before AdamW became the standard term.</Sidenote>
+
+---
+
+## Learning-rate schedules {#lr-schedules}
+
+The learning rate does not remain constant through a training run. The schedule — how $\eta_t$ changes from step 1 through the end of training — interacts with the optimiser's moment statistics and has a measurable effect on final model quality.
+
+### Warmup {#lr-schedules}
+
+The near-universal opening phase is a linear ramp from 0 to $\eta_{\max}$ over $W$ steps. The motivation has two components:
+
+1. **Adam moment instability:** At step 1, $v_t \approx (1-\beta_2) g_0^2$ — a severe underestimate of the true gradient variance. Without warmup, bias-correction amplifies this to produce a near-full-size step from a poorly calibrated denominator. A few hundred steps of warmup allows $v_t$ to accumulate enough history to give stable normalisation.
+
+2. **Gradient variance:** At random initialisation, gradient distributions are not yet calibrated. Large initial steps can push the network into regions of the loss landscape far from any sensible solution.
+
+Typical warmup lengths in frontier models: 2,000–8,000 steps (0.05–0.3% of total training tokens). Llama-3 405B: 8,000 steps. DeepSeek-V3: 2,000 steps.
+
+### Cosine decay
+
+$$\eta(t) = \eta_{\min} + \frac{1}{2}\left(\eta_{\max} - \eta_{\min}\right)\!\left(1 + \cos\!\left(\frac{\pi t}{T}\right)\right)$$
+
+where $T$ is the total training steps and $\eta_{\min} = 0.1 \times \eta_{\max}$ in most implementations. Origin: SGDR (Loshchilov & Hutter, ICLR 2017). Cosine decay replaced the step-drop schedules of earlier deep-learning practice because its smooth, continuously declining profile avoids the abrupt curvature change that step drops introduce.
+
+The critical limitation: cosine decay requires specifying $T$ before training begins. In practice, total token budget often shifts mid-training — new data arrives, compute budgets change, or the model needs to continue past the original target. Fixing $T$ upfront makes the schedule brittle to these changes.
+
+### WSD: Warmup-Stable-Decay {#wsd}
+
+Proposed in the MiniCPM paper (Hu et al., April 2024, arXiv:2404.06395), WSD restructures the schedule into three phases:
+
+1. **Warmup** ($s < W$): $\eta(s) = (s/W) \cdot \eta_{\max}$
+2. **Stable** ($W \leq s \leq T$): $\eta(s) = \eta_{\max}$ (constant)
+3. **Decay** ($s > T$): $\eta(s) = f(s - T) \cdot \eta_{\max}$, where $f$ is a fast exponential or cosine decay
+
+The key empirical finding is that the decay phase needs to occupy only approximately 10% of total training steps to achieve full convergence. The stable phase can run for an arbitrary number of steps — training can be paused, extended, or resumed from any stable-phase checkpoint without quality loss, and the decay is triggered on-demand when the run is ready to terminate.
+
+<Callout variant="info" title="The river-valley interpretation (Wu et al., 2024)">
+Wu et al. (arXiv:2410.05192) offer an intuitive account of WSD's advantage. During the stable phase, the constant learning rate keeps the model exploring along the valley floor of the loss landscape — making horizontal progress. The decay phase then drops the model to the valley bottom. Cosine decay blends both motions simultaneously, which is less efficient: late in a cosine schedule, the learning rate is so small that meaningful valley-floor progress stops well before the run ends.
+</Callout>
+
+**WSD-S** is a variant that, rather than reverting to the last stable checkpoint before each decay, reuses previously computed decay checkpoints as additional starting points. This enables more efficient multi-checkpoint evaluations.
+
+**Frontier-lab adoption:** DeepSeek-V3 (December 2024) uses a four-phase schedule — warmup, constant, cosine decay, constant — that is functionally WSD with a flat tail. MiniCPM used WSD from inception.
+
+### Infinite / constant LR schedules
+
+A growing body of evidence (Ibrahim et al., TMLR 2024; "Beyond Cosine Decay," arXiv:2503.02844, 2025) supports a simpler alternative: warmup followed by a permanently constant learning rate, never decaying. Findings include:
+
+- **Flatter loss minima:** Cosine decay compresses the final steps into a small region; the resulting minima have sharper curvature and are harder to fine-tune from. Constant LR produces flatter minima that are more plastic for downstream SFT.
+- **Continual pretraining:** When a model needs to be further trained on domain-specific data after initial pretraining, a constant-LR continuation avoids needing to know the total final token count upfront.
+- **Downstream benchmark performance:** Ibrahim et al. find that with experience replay (mixing new-domain data with original pretraining data), the constant-LR schedule gives the best average cross-domain benchmark performance.
+
+The tradeoff is that constant-LR runs often do not achieve the same training-loss minimum as a well-tuned cosine or WSD decay — they sacrifice some final convergence in exchange for checkpoint flexibility and fine-tuning plasticity.
+
+---
+
+## Gradient clipping {#grad-clip}
+
+Gradient clipping prevents a single anomalous gradient from taking a step large enough to destabilise training. It is applied after the backward pass and before the optimiser update.
+
+### Global norm clipping (standard)
+
+The standard method clips the global gradient norm to a threshold $\tau$:
+
+$$\text{if } \|g\|_2 > \tau: \quad g \leftarrow g \cdot \frac{\tau}{\|g\|_2}$$
+
+$\tau = 1.0$ is the near-universal default in frontier LLM training (GPT-3, LLaMA-3, DeepSeek-V3, Qwen). The threshold is not arbitrary: gradient norms in typical LLM training are centred near 1.0 during the stable phase, so $\tau = 1.0$ clips only the anomalous top percentile of steps while leaving normal-magnitude updates untouched.
+
+**Per-parameter clipping** clips each parameter's gradient independently. This is more conservative and avoids the cross-parameter magnitude information loss of global clipping, but is less common for LLMs due to implementation overhead and the coupling that global clipping preserves between layers.
+
+### Loss spikes and the SIO problem
+
+Loss spikes — gradient norm eruptions 100–1000× the typical value — occur occasionally in LLM pretraining. They are a recognised practical hazard. The mechanistic accounts in the literature include data contamination, attention logit overflow (the mechanism targeted by MuonClip, §5.3), numerical precision accumulation, and learning-rate noise. The literature does not yet converge on a single dominant cause.
+
+The standard recovery procedure: detect the spike (a sudden large increase in loss or gradient norm), rewind to a checkpoint 100–500 steps prior, skip or rearrange the offending data batch.
+
+### Adaptive clipping methods (2024–2025)
+
+Recent work proposes methods that set the clip threshold dynamically rather than fixing it:
+
+**SPAM (2024):** Spike-Aware Adam with Momentum Reset. Detects spikes by a threshold criterion, then resets the momentum vectors $m_t$ and $v_t$ to zero at the detected step rather than rewinding to a checkpoint. The intuition: the corrupted gradient that triggered the spike has been absorbed into $m_t$ and $v_t$ and will continue influencing updates for $1/(1-\beta_1)$ and $1/(1-\beta_2)$ steps respectively; resetting the state removes this corruption.
+
+**AdaGC (arXiv:2502.11034, February 2025):** Adaptive per-parameter gradient clipping. Sets each parameter's clip threshold from a local estimate of its gradient norm history, rather than applying a uniform global threshold. Addresses the fact that different layers in a transformer have systematically different gradient norms — global clipping may clip the right amount for some layers and too aggressively for others.
+
+**ZClip (arXiv:2504.02507, April 2025):** Z-score anomaly detection over the gradient norm history. Maintain an exponential moving average of the gradient norm mean $\mu_g$ and standard deviation $\sigma_g$; set the clipping threshold at $\mu_g + k \sigma_g$ for a tunable $k$ (typically $k = 3$). The threshold adapts as training progresses. Validated on LLaMA 1B: ZClip prevents all catastrophic divergences (vs. several with fixed clipping at the same base LR), expands the feasible learning-rate range, and reduces total pretraining steps by up to 35% at the same final quality.
+
+**MuonClip QK-clip (Kimi K2, July 2025):** As described in §5.3, this is an optimiser-integrated spike-prevention mechanism that clips *attention logits* rather than gradient norms. It targets the root cause (attention logit overflow from Muon's scale-discarding update) rather than the symptom (a large gradient norm).
+
+<Callout variant="exercise">
+Consider a training run with global norm clipping at $\tau = 1.0$. The gradient norm at step $t$ is $\|g_t\|_2 = 8.0$. (a) What is the scaling factor applied to $g_t$ before the optimiser update? (b) If $\beta_2 = 0.95$ in AdamW and the clipped gradient has magnitude $1.0$, what is the second moment $v_t$ one step later if the prior second moment was $v_{t-1} = 0.01$? (c) Compare this to what $v_t$ would be if clipping were absent and the gradient had magnitude 8.0.
+
+*Answers: (a) $1.0/8.0 = 0.125$. (b) $v_t = 0.95 \times 0.01 + 0.05 \times 1.0^2 = 0.0095 + 0.05 = 0.0595$. (c) Without clip: $v_t = 0.95 \times 0.01 + 0.05 \times 64 = 0.0095 + 3.2 = 3.2095$. The unclipped second moment blows up, and subsequent Adam steps for this parameter become very small ($1/\sqrt{3.2}$) — a persistent under-stepping that lasts for $\sim 1/(1-\beta_2) = 20$ steps until $v_t$ decays back to a normal range.*
+</Callout>
+
+---
+
+## A note on $\mu$P and optimiser hyperparameter transfer
+
+$\mu$P (Yang et al., 2022; see [normalisation and initialisation, §μP](/textbook/00d-normalization-and-init#mup)) establishes that, with appropriate parameterisation, the optimal learning rate remains constant as model width scales. This makes it practical to tune optimiser hyperparameters ($\eta$, $\beta_1$, $\beta_2$, $\lambda$) at a small proxy model and transfer them to the large model without re-sweeping.
+
+$\mu$P was originally formulated for Adam/AdamW. Its extension to Muon requires additional care: the orthogonalisation in Muon introduces a per-matrix scale that does not appear in Adam, and the telescoping algorithm described in Shah et al. (2025) is needed to correctly account for all error sources in the proxy-to-production transfer. For Shampoo/SOAP, $\mu$P transfer is less studied as of May 2026.
+
+The practical implication: if a lab is running Muon+$\mu$P, the small-model hyperparameter sweeps need to use Muon (not AdamW) to get valid transfer. Running a Muon sweep at 100M parameters and then switching to AdamW at 70B would invalidate the transfer.
+
+---
+
+<Sources items={[
+  {
+    authors: "Kingma, D. P. & Ba, J.",
+    year: 2015,
+    title: "Adam: A Method for Stochastic Optimization",
+    venue: "ICLR 2015",
+    url: "https://arxiv.org/abs/1412.6980",
+    note: "Original Adam paper. Bias-correction derivation and per-coordinate adaptivity analysis."
+  },
+  {
+    authors: "Loshchilov, I. & Hutter, F.",
+    year: 2019,
+    title: "Decoupled Weight Decay Regularization",
+    venue: "ICLR 2019",
+    url: "https://arxiv.org/abs/1711.05101",
+    note: "AdamW definition. Proof that L2 regularisation ≠ weight decay in adaptive methods. 15% relative error improvement on CIFAR-10/ImageNet32x32."
+  },
+  {
+    authors: "Loshchilov, I. & Hutter, F.",
+    year: 2017,
+    title: "SGDR: Stochastic Gradient Descent with Warm Restarts",
+    venue: "ICLR 2017",
+    url: "https://arxiv.org/abs/1608.03983",
+    note: "Cosine annealing definition and warmup conventions. Foundation for cosine LR schedules in LLMs."
+  },
+  {
+    authors: "Brown, T. et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "GPT-3 optimizer details: β₁=0.9, β₂=0.95, clip=1.0, cosine to 10% of peak LR."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "LLaMA-2 AdamW β=(0.9, 0.95), λ=0.1, cosine to 10% peak, 2k step warmup."
+  },
+  {
+    authors: "Meta Llama Team",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3 405B: AdamW, 8k step warmup, cosine, peak LR 8e-5, weight decay proportional to LR."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "AdamW β₁=0.9, β₂=0.95, λ=0.1, BF16 moments, 4-phase WSD-like schedule, peak LR 2.2e-4."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "AdamW β₁=0.9, β₂=0.95, ε=1e-8, λ=0.1, cosine schedule."
+  },
+  {
+    authors: "Chen, X. et al.",
+    year: 2023,
+    title: "Symbolic Discovery of Optimization Algorithms",
+    venue: "NeurIPS 2023",
+    url: "https://arxiv.org/abs/2302.06675",
+    note: "Lion optimizer. Program-search discovery. β₁=0.9, β₂=0.99, LR 3–10× lower than AdamW. Deployed in Google Ads CTR."
+  },
+  {
+    authors: "Jordan, K. et al.",
+    year: 2024,
+    title: "Muon: An optimizer for hidden layers in neural networks",
+    venue: "Blog post + GitHub, October 2024",
+    url: "https://kellerjordan.github.io/posts/muon/",
+    note: "Muon definition. Newton-Schulz coefficients (3.4445, −4.7750, 2.0315). NanoGPT 1.35× record."
+  },
+  {
+    authors: "Liu, J. et al.",
+    year: 2025,
+    title: "Muon is Scalable for LLM Training",
+    venue: "arXiv:2502.16982",
+    url: "https://arxiv.org/abs/2502.16982",
+    note: "Moonlight model (16B/3B active). 52% FLOPs vs. AdamW at compute-optimal scale. Two stabilisation techniques: weight decay + RMS normalisation."
+  },
+  {
+    authors: "Shah, S. et al. (Essential AI)",
+    year: 2025,
+    title: "Practical Efficiency of Muon for Pretraining",
+    venue: "arXiv:2505.02222",
+    url: "https://arxiv.org/abs/2505.02222",
+    note: "Muon+μP at 4B scale. Large-batch advantage. Telescoping algorithm for hyperparameter transfer. May 2025."
+  },
+  {
+    authors: "Kimi Team",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "MuonClip and QK-clip mechanism. 1T-parameter MoE. Zero loss spikes on 15.5T tokens. July 2025."
+  },
+  {
+    authors: "Du, Z. & Su, Y.",
+    year: 2026,
+    title: "The Newton-Muon Optimizer",
+    venue: "arXiv:2604.01472",
+    url: "https://arxiv.org/abs/2604.01472",
+    note: "Right-preconditioning with inverse activation second moment. Theoretical connection to natural gradient and Shampoo. April 2026."
+  },
+  {
+    authors: "Vyas, N. et al.",
+    year: 2025,
+    title: "SOAP: Improving and Stabilizing Shampoo using Adam for Language Modeling",
+    venue: "ICLR 2025",
+    url: "https://arxiv.org/abs/2409.11321",
+    note: "Shampoo–Adafactor equivalence. Adam-in-eigenbasis construction. >40% fewer iterations than AdamW on 360M/660M LLM pretraining."
+  },
+  {
+    authors: "Gupta, V., Koren, T. & Singer, Y.",
+    year: 2018,
+    title: "Shampoo: Preconditioned Stochastic Tensor Optimization",
+    venue: "ICML 2018",
+    url: "https://arxiv.org/abs/1802.09568",
+    note: "Original Shampoo. Kronecker preconditioner. Convergence guarantees. Foundation for SOAP and Newton-Muon."
+  },
+  {
+    authors: "Hu, S. et al.",
+    year: 2024,
+    title: "MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies",
+    venue: "arXiv:2404.06395",
+    url: "https://arxiv.org/abs/2404.06395",
+    note: "WSD schedule proposal. 10% decay phase sufficient. Branching checkpoint strategy."
+  },
+  {
+    authors: "Wu, Y. et al.",
+    year: 2024,
+    title: "Understanding Warmup-Stable-Decay Learning Rates: A River Valley Loss Landscape Perspective",
+    venue: "arXiv:2410.05192",
+    url: "https://arxiv.org/abs/2410.05192",
+    note: "River-valley conjecture for WSD. WSD-S variant. 0.1B–1.2B scale validation."
+  },
+  {
+    authors: "Kumar, A. et al.",
+    year: 2025,
+    title: "ZClip: Adaptive Spike Mitigation for LLM Pre-Training",
+    venue: "arXiv:2504.02507",
+    url: "https://arxiv.org/abs/2504.02507",
+    note: "Z-score gradient clipping. LLaMA 1B validation. Up to 35% step reduction. April 2025."
+  },
+  {
+    authors: "Wang, Y. & Aitchison, L.",
+    year: 2024,
+    title: "How to Set AdamW's Weight Decay as You Scale Model and Dataset Size",
+    venue: "arXiv:2405.13698",
+    url: "https://arxiv.org/abs/2405.13698",
+    note: "Scaling rules for λ: decrease with dataset size, increase with model size under μP."
+  },
+  {
+    authors: "Yang, G. et al.",
+    year: 2022,
+    title: "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer",
+    venue: "arXiv:2203.03466",
+    url: "https://arxiv.org/abs/2203.03466",
+    note: "μP parameterisation. LR transfer across width scales. See also Chapter 4 (normalisation and init), §μP."
+  },
+  {
+    authors: "Ibrahim, A. et al.",
+    year: 2024,
+    title: "Simple and Scalable Strategies to Continually Pre-train Large Language Models",
+    venue: "TMLR 2024",
+    url: "https://openreview.net/forum?id=DimPeeCxKO",
+    note: "Infinite/constant LR schedule for continual pretraining. Replay strategy. Flatter minima and better fine-tuning plasticity vs. cosine decay."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "Phi-4 14B training details. Linear warmup + decay schedule, peak LR 3e-4."
+  }
+]} />

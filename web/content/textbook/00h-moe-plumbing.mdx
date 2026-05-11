@@ -1,0 +1,578 @@
+---
+slug: 00h-moe-plumbing
+title: Mixture-of-experts plumbing
+description: Why MoE, routing functions (top-k, expert choice, soft), auxiliary losses (load-balance, z-loss), capacity factors, and the 2026 frontier-MoE landscape from DeepSeek-V3 through inferred Anthropic / OpenAI / Google designs.
+order: 8
+chapter: 8
+reading_minutes: 32
+depends_on: [00a-transformer, 00e-activations-and-gating]
+provides: [top-k-routing, expert-choice, aux-losses, capacity-factor, expert-parallelism]
+last_reviewed: 2026-05-11
+---
+
+## Compute capacity and parameter capacity are not the same thing {#why-moe}
+
+A dense transformer MLP applies the same weight matrices to every token that passes through it. That constraint ties two quantities together: the number of parameters in the model and the number of floating-point operations performed per token. Double the width of the MLP and you double both. This coupling is fine at modest scale but becomes expensive as you push toward trillion-parameter models, because training and inference cost is gated by FLOPs, not by parameter count alone.
+
+**Sparse mixture-of-experts (MoE)** breaks this coupling. The idea is to replace the single FFN in each transformer block with $E$ independent FFN modules — called *experts* — and route each token to only $k$ of them, where $k \ll E$. Total parameter count grows with $E$; FLOPs per token grow only with $k$. The parameter capacity of the model (its ability to store diverse representations) can therefore be made far larger than the compute budget would allow in a dense design.
+
+This compute-capacity decoupling was first stated clearly by Shazeer et al. (2017) in the context of sparsely-gated LSTM-MoE layers, where a 1000x increase in parameter count came with only a 50% increase in FLOPs. The same principle was brought to the transformer in 2021 via Switch Transformer (top-1 routing) and GShard (top-2 routing), and has since become a standard pattern in frontier language model design.
+
+### The quantitative argument
+
+Let $d_\text{model}$ be the transformer's residual stream width and $d_{ff}$ be the FFN intermediate dimension. A standard two-projection MLP (without gating) costs roughly:
+
+$$
+C_\text{dense} = 2 \times d_\text{model} \times d_{ff} \quad \text{(FLOPs per token)}
+$$
+
+where the factor of 2 accounts for the multiply-accumulate convention (each multiply-add is counted as 2 FLOPs). A MoE layer with $E$ experts, each of hidden size $d_\text{expert} = d_{ff} / G$ (for granularity factor $G$), and top-$k$ routing costs:
+
+$$
+C_\text{MoE} = 2 \times k \times d_\text{model} \times d_\text{expert} = 2 \times k \times d_\text{model} \times \frac{d_{ff}}{G}
+$$
+
+Setting $k = G$ makes $C_\text{MoE} = C_\text{dense}$ — the per-token FLOPs are identical to the dense baseline. Yet the total parameter count in the MoE layer is $E \times 2 \times d_\text{model} \times d_\text{expert}$, which can be made much larger than $2 \times d_\text{model} \times d_{ff}$ by choosing $E \gg G$.
+
+**Worked example.** Take a dense baseline with $d_\text{model} = 4096$ and $d_{ff} = 16384$.
+
+- Dense FLOPs per token: $2 \times 4096 \times 16384 = 134.2$ MFLOPs (collapsing both projections into one product).
+- Dense parameter count in this layer: $2 \times 4096 \times 16384 = 134.2\text{M}$.
+
+Now define a MoE variant with $E = 64$ experts, each of size $d_\text{expert} = 2048$, and top-$k = 2$:
+
+- MoE FLOPs per token: $2 \times 2 \times 4096 \times 2048 = 67.1$ MFLOPs — half the dense baseline.
+- MoE parameter count: $64 \times 2 \times (4096 \times 2048 + 2048 \times 4096) = 64 \times 2 \times 16.8\text{M} = 2.15\text{B}$.
+
+The MoE layer has **16× more parameters at half the FLOPs per token** compared to the dense baseline.
+
+This arithmetic is what makes DeepSeek-V3 (December 2024) compelling: 671B total parameters, 37B activated per token, trained in 2.788 million H800 GPU-hours — a training cost comparable to a 40–50B dense model, yet with access to 671B parameters' worth of specialised knowledge capacity.
+
+<Callout variant="note" title="When MoE does not help">
+The FLOPs savings require that routing be reasonably balanced across experts and that the batch be large enough to amortise the expert dispatch overhead. At inference with batch size 1 (single-token autoregressive decode), expert diversity is low and the communication overhead can partially or fully offset the FLOP savings. Expert parallelism (covered in [§ Expert parallelism](#expert-parallelism)) adds further communication cost that is non-trivial at small batch sizes.
+</Callout>
+
+Each expert is an MLP block — typically a SwiGLU two-gate projection in modern designs. If you need a refresher on the MLP structure, see [The transformer block](/textbook/00a-transformer#mlp-block); for SwiGLU's gating arithmetic, see [Activations and gating](/textbook/00e-activations-and-gating#swiglu).
+
+---
+
+## Top-k routing {#top-k-routing}
+
+The simplest and most widely deployed routing strategy is **token-choice top-k gating**: for each token, a lightweight router selects the $k$ experts with the highest affinity score and sends the token to those experts. The final layer output is a weighted sum of the $k$ expert outputs, using the (renormalised) gate values as weights.
+
+### Mechanism
+
+Let $\mathbf{x} \in \mathbb{R}^{d_\text{model}}$ be a token's representation and $\mathbf{W}_r \in \mathbb{R}^{E \times d_\text{model}}$ be the router weight matrix. The forward pass proceeds as:
+
+1. **Compute logits:** $\mathbf{l} = \mathbf{W}_r \mathbf{x} \in \mathbb{R}^E$
+2. *(Optional)* **Add noise:** $\tilde{l}_i = l_i + \varepsilon_i$, where $\varepsilon_i \sim \mathcal{N}(0, \text{Softplus}((\mathbf{x} \cdot \mathbf{W}_\text{noise})_i))$ — the *noisy top-k* variant from Shazeer et al. (2017), intended to improve load balance during training.
+3. **Top-k mask:** retain the $k$ largest values; set the rest to $-\infty$.
+4. **Softmax over survivors:** $\mathbf{g} = \text{Softmax}(\text{KeepTopK}(\mathbf{l}, k))$
+5. **Compute expert outputs:** for each selected expert $i$, compute $e_i(\mathbf{x})$.
+6. **Combine:** $\mathbf{y} = \sum_{i \in \text{TopK}} g_i \cdot e_i(\mathbf{x})$
+
+DeepSeek-V3 uses a sigmoid-based variant: per-expert affinities $s_{i,t} = \sigma(\mathbf{u}_t^\top \mathbf{e}_i)$ are computed without an explicit softmax over all experts, then renormalised only among the selected top-$k$ experts. This removes the competition among non-selected experts' gradients.
+
+### Worked numerical example (top-2, E = 4)
+
+Suppose $d_\text{model} = 4$ and the router produces logits:
+
+$$\mathbf{l} = [0.8,\ 2.1,\ {-0.3},\ 1.4]$$
+
+Top-2 selects indices $\{1, 3\}$ (values 2.1 and 1.4). After the top-k mask:
+
+$$\mathbf{l}' = [-\infty,\ 2.1,\ -\infty,\ 1.4]$$
+
+Softmax:
+
+$$g_1 = \frac{e^{2.1}}{e^{2.1} + e^{1.4}} = \frac{8.166}{12.221} \approx 0.668, \qquad g_3 = \frac{e^{1.4}}{e^{2.1} + e^{1.4}} \approx 0.332$$
+
+Output: $\mathbf{y} = 0.668 \cdot e_1(\mathbf{x}) + 0.332 \cdot e_3(\mathbf{x})$.
+
+### Top-1 vs top-2
+
+**Top-1** (Switch Transformer) is the simplest case: each token goes to exactly one expert. This halves the routing cost, simplifies capacity arithmetic (an overflow token can only affect one expert), and is computationally cheaper. The quality penalty relative to top-2 was shown to be small in the Switch Transformer paper. Meta's Llama 4 family (April 2025) uses top-1 routing on MoE layers.
+
+**Top-2** (GShard, GLaM, Mixtral) provides more robust routing and generally better model quality at equal FLOPs, at the cost of twice the expert-dispatch volume. Mixtral 8x7B and 8x22B both use top-2 across 8 experts with no token dropping during production inference.
+
+### Load-imbalance problem
+
+Token-choice routing has a self-reinforcing feedback loop: experts that receive more tokens train faster, become better, attract more tokens, and train even faster. Unchecked, this leads to *routing collapse* — a state where one or two experts handle nearly all tokens and the remainder receive almost no gradient signal. Every production MoE system incorporates some mechanism to prevent this; the main options are auxiliary losses (covered in [§ Auxiliary losses](#aux-losses)) and bias-based balancing.
+
+<Callout variant="warning" title="Routing collapse">
+Routing collapse is not just a quality problem — it is a compute-waste problem. An expert that receives no tokens trains no parameters; device-hours allocated to that expert are wasted. In expert-parallel setups (see [§ Expert parallelism](#expert-parallelism)), collapse also causes straggler effects where some devices finish instantly and wait.
+</Callout>
+
+---
+
+## Expert-choice routing {#expert-choice}
+
+Expert-choice routing, introduced by Zhou et al. (NeurIPS 2022), inverts the routing direction: instead of each token selecting $k$ experts, **each expert selects the top-$K$ tokens** (by affinity score) from the current batch. This guarantees perfectly uniform expert utilisation by construction, without any auxiliary loss.
+
+### Mechanism and math
+
+For a batch of $T$ tokens with representations $\mathbf{X} \in \mathbb{R}^{T \times d_\text{model}}$:
+
+1. **Affinity matrix:** $\mathbf{A} \in \mathbb{R}^{T \times E}$, where $A_{t,i} = \text{Softmax}(\mathbf{X}_t \mathbf{W}_r)_i$. Each entry is the probability that token $t$ should go to expert $i$ under the router's view.
+2. **Expert selection:** For each expert $i$, compute $S_i = \text{TopK}(\{A_{t,i} \mid t = 1 \ldots T\},\, K)$ — the $K$ tokens with highest affinity for expert $i$.
+3. **Expert computation:** Expert $i$ processes the tokens in $S_i$.
+4. **Combination:** Token $t$'s output is assembled from the contributions of whichever experts selected it.
+
+Setting $K = T / E$ ensures each expert processes exactly $T/E$ tokens, giving perfectly uniform load. Zhou et al. (2022) report a 2x+ training convergence speedup on an 8B/64-expert model compared to Switch Transformer and GShard configurations.
+
+### The token-heterogeneity problem
+
+The cost of perfect load balance is that individual tokens receive variable amounts of expert computation. A token with high affinity for many experts may be processed by several; a token with low affinity for all experts in a dense batch may be processed by none. This heterogeneity — variable-length "output sequences" per token — complicates batched inference, since modern GPU kernels are most efficient on fixed-shape tensors.
+
+As of May 2026, no widely-deployed production inference serving system has adopted expert-choice routing as its primary routing strategy, largely because of this inference-time complexity. Token-choice routing remains dominant for production deployment; expert-choice is more prevalent in research and training-focused implementations.
+
+<ComparisonTable
+  caption="Top-k (token-choice) vs. expert-choice routing."
+  columns={["Property", "Top-k (token-choice)", "Expert-choice"]}
+  rows={[
+    ["Load balance", "Requires auxiliary losses or bias-based balancing", "Perfect by construction"],
+    ["Training convergence", "Baseline", "2x+ faster (Zhou et al. 2022)"],
+    ["Token coverage", "Every token sees exactly k experts", "Some tokens may see 0 or many experts"],
+    ["Inference batching", "Fixed compute per token; easy to batch", "Variable compute per token; harder to batch"],
+    ["Dropped tokens", "Yes, if capacity factor < demand", "No overflow (each expert gets exactly K tokens)"],
+    ["Adoption (May 2026)", "Mixtral, DeepSeek-V3, Llama 4, Qwen3, Grok-1", "Research; Google-internal training systems"],
+  ]}
+/>
+
+---
+
+## Soft routing
+
+**Soft MoE**, introduced by Puigcerver et al. (2023), removes discrete token assignment entirely. Each expert processes a *slot* — a weighted combination of all input tokens — and each token's output is assembled from a weighted combination of all expert slot outputs. Routing is fully differentiable.
+
+### Mechanism (sketch)
+
+For $T$ tokens, $E$ experts, and $S$ slots per expert:
+
+- **Dispatch weights** $\Phi \in \mathbb{R}^{T \times (E \cdot S)}$: each token's contribution to each expert slot, computed via softmax over learned dispatch parameters.
+- **Combine weights** $\Psi \in \mathbb{R}^{(E \cdot S) \times T}$: each slot's contribution to each token's output, computed via a second softmax.
+- Expert $i$ processes its $S$ slots — each a $\Phi$-weighted average of all tokens — and returns results that are $\Psi$-weighted back into the per-token output stream.
+
+There is no top-k, no capacity factor, no dropped tokens, and no routing collapse: $\Phi$ and $\Psi$ are always positive (softmax outputs), so every expert always participates.
+
+### Why soft routing is not dominant (May 2026)
+
+The combination step means every token's output depends on every expert's computation — inference cost scales with $E$, not with $k$. For frontier LLMs with 64–256 experts, this restores the original problem: FLOPs per token grow with $E$, erasing the capacity-efficiency advantage of MoE. Soft MoE remains practical for modest expert counts in vision models and small-scale language models, but as of May 2026 no published large-scale frontier language model uses it.
+
+<Sidenote>Puigcerver, J. et al. (2023), "From sparse to soft mixtures of experts," arXiv:2308.00951. The paper demonstrates Soft MoE in image classification settings (ViT-scale) where $E$ is small enough that the output-combination step does not dominate cost.</Sidenote>
+
+---
+
+## Auxiliary losses {#aux-losses}
+
+Token-choice routing requires external pressure to prevent routing collapse. Three loss families address this; they operate on different failure modes.
+
+### A. Load-balance loss
+
+The *load-balance loss* from Switch Transformer (Fedus et al., JMLR 2022) encourages a uniform distribution of tokens across experts:
+
+$$
+\mathcal{L}_\text{balance} = \alpha \sum_{i=1}^{E} f_i \cdot P_i
+$$
+
+where:
+
+- $f_i = \frac{1}{T} \sum_{t=1}^T \mathbf{1}[\text{expert } i \text{ is selected for token } t]$ — the fraction of tokens actually routed to expert $i$ (a discrete quantity, but treated as a constant for gradient computation).
+- $P_i = \frac{1}{T} \sum_{t=1}^T g_i(\mathbf{x}_t)$ — the mean router probability mass on expert $i$ across the batch (differentiable; gradient flows through this term).
+- $\alpha \approx 0.01$ in Switch Transformer (a hyperparameter to tune per model).
+
+The product $f_i \cdot P_i$ is minimised when both $f_i$ and $P_i$ equal $1/E$ uniformly. If one expert has $f_i = 0$ (no tokens routed) but $P_i > 0$ (router gives it probability), the gradient through $P_i$ nudges the router to route more tokens to that expert, breaking the collapse.
+
+<Callout variant="warning" title="The alpha tension">
+Setting $\alpha$ too large suppresses expert specialisation: the router learns uniform routing to minimise $\mathcal{L}_\text{balance}$, but then the experts all see the same distribution of tokens and do not specialise. Setting $\alpha$ too small allows routing collapse. Every team that has published ablations reports this tension. Switch Transformer used $\alpha = 10^{-2}$; smaller MoE systems have used as low as $10^{-3}$.
+</Callout>
+
+### B. Router z-loss
+
+The *router z-loss* from ST-MoE (Zoph et al., 2022) addresses a different problem: numerical instability from large pre-softmax logits.
+
+$$
+\mathcal{L}_z = \frac{1}{B} \sum_{j=1}^{B} \left[ \log \sum_{i=1}^{E} \exp(x_{ij}) \right]^2
+$$
+
+where $x_{ij}$ are the pre-softmax routing logits for token $j$ in batch of size $B$.
+
+If the log-sum-exp term is large, the exponentials risk overflowing float16/bfloat16. The z-loss penalises large logit *magnitude* without constraining which expert wins the argmax — it only pushes the logit scale down, leaving the routing distribution shape intact. This is the key distinction from the load-balance loss: $\mathcal{L}_z$ does not push toward uniformity, only toward numerical sanity.
+
+Zoph et al. (2022) find that the router z-loss "significantly improves training stability without quality degradation." A typical coefficient is $10^{-3}$ to $10^{-2}$, similar to the load-balance loss.
+
+### C. Auxiliary-loss-free load balancing
+
+Wang et al. (arXiv:2408.15664, ICLR 2025), and subsequently DeepSeek-V3 (arXiv:2412.19437), advocate removing the auxiliary loss entirely and instead using **per-expert bias terms** $b_i$ added to routing scores before the top-$K$ selection:
+
+$$
+g'_{i,t} = \begin{cases} s_{i,t} & \text{if } (s_{i,t} + b_i) \in \text{TopK}(\{s_{j,t} + b_j \mid j = 1 \ldots E\},\, K) \\ 0 & \text{otherwise} \end{cases}
+$$
+
+At the end of each training step, the biases are updated:
+
+$$
+b_i \leftarrow b_i - \gamma \quad \text{if expert } i \text{ is overloaded}
+$$
+$$
+b_i \leftarrow b_i + \gamma \quad \text{if expert } i \text{ is underloaded}
+$$
+
+with $\gamma = 0.001$ in DeepSeek-V3's published implementation (for the first 14.3T training tokens; $\gamma = 0$ for the final 500B tokens).
+
+The key insight is that $b_i$ affects *which* tokens get routed to expert $i$ (via the TopK selection), but *not* the output weighting: the combination step uses $s_{i,t}$ directly, not $s_{i,t} + b_i$. This means the gradient of the main language-modelling objective flows through $s_{i,t}$ without any auxiliary-loss interference. The claim is that this preserves the model's ability to specialise experts, since no extra gradient pressure is added to the router.
+
+<Sidenote>DeepSeek-V3 also applies a very small sequence-wise balance loss with $\alpha = 0.0001$ (100x smaller than Switch Transformer's default) to prevent extreme within-sequence imbalance. The authors treat this as a guard rather than a primary balancing mechanism. Source: arXiv:2412.19437v1, §2.2.</Sidenote>
+
+DeepSeek-V3's 14.8T-token training run — 671B parameters, no reported irrecoverable loss spikes — is the strongest published evidence (as of May 2026) that bias-based balancing can match or exceed traditional auxiliary-loss approaches at frontier scale.
+
+<ComparisonTable
+  caption="Auxiliary loss strategies for MoE load balancing."
+  columns={["Method", "What it penalises", "Typical coefficient", "Gradient interference", "Frontier adoption (May 2026)"]}
+  rows={[
+    ["Load-balance loss (Switch / GShard)", "Uneven token-to-expert distribution", "α ≈ 0.01", "Yes — router gradient modified", "Switch, GShard, ST-MoE, Qwen3"],
+    ["Router z-loss (ST-MoE)", "Large pre-softmax logit magnitude", "β ≈ 0.001–0.01", "Yes — logit scale constrained", "ST-MoE, older systems"],
+    ["Bias-based (auxiliary-loss-free)", "None — bias update rule, no loss term", "γ = 0.001 (step size)", "No — bias outside main gradient", "DeepSeek-V3 (Dec 2024)"],
+  ]}
+/>
+
+---
+
+## Capacity factor {#capacity-factor}
+
+Even with auxiliary losses, routing is never perfectly balanced. Some experts will receive more tokens than others in any finite batch. The **capacity factor** $\text{CF}$ defines how much over-subscription buffer each expert is given.
+
+### Definition
+
+For a batch of $T$ tokens and $E$ experts, the ideal per-expert allocation is $T/E$ tokens. The expert capacity is:
+
+$$
+C = \left\lfloor \text{CF} \times \frac{T}{E} \right\rfloor
+$$
+
+If more than $C$ tokens are routed to a single expert, the excess tokens overflow. Three strategies handle overflow:
+
+1. **Drop:** excess tokens pass through the layer unchanged via the residual connection (bypassing the expert entirely). Used by Switch Transformer.
+2. **Pad:** add zero-valued entries to keep tensor shapes static, accepted silently. Common in JAX/TPU implementations.
+3. **Redirect:** overflow tokens are sent to a less-loaded expert — typically a random secondary selection (used in GShard).
+
+### Training-time implications
+
+Typical training CF values range from 1.0 to 2.0. CF = 1.25 (Switch Transformer, GLaM) is a common default: the 25% buffer absorbs routing variance without excessive memory waste. At CF = 1.0, even small deviations from perfect balance cause drops.
+
+A dropped token's representation passes through via the residual stream (see [The transformer block](/textbook/00a-transformer#residual-stream)) — it still influences downstream layers but does not receive expert processing at that layer. Empirically, dropping 10–15% of tokens at peak imbalance is tolerable; dropping 30%+ consistently degrades model quality.
+
+**Worked example.** $T = 1024$ tokens, $E = 8$ experts, $\text{CF} = 1.25$:
+
+$$
+C = \lfloor 1.25 \times 1024 / 8 \rfloor = \lfloor 160 \rfloor = 160 \text{ tokens/expert}
+$$
+
+Perfect balance expects $128$ tokens per expert; the buffer of 32 absorbs variance. If the busiest expert receives 175 tokens, $175 - 160 = 15$ tokens overflow and are dropped (passed through the residual).
+
+### Inference-time: a different regime
+
+At inference, the bottleneck is not FLOPs but memory. All $E$ experts must reside in VRAM simultaneously regardless of how many activate per token. Mixtral 8x7B (46.7B total parameters) requires approximately 87 GB for 8-bit weights even though only 2 of 8 experts activate per token per layer. The CF at inference can be set freely — there are no competing tokens to overflow — but memory cost is proportional to $E$, not $k$.
+
+This asymmetry motivates the distinction between *total* and *active* parameter counts in the frontier-model landscape table below: total parameters determine inference memory requirements; active parameters determine per-token FLOPs.
+
+<Callout variant="info" title="Capacity-aware inference (2026)">
+Recent work at ICLR 2026 ("Capacity-Aware Inference: Mitigating the Straggler Effect in Mixture of Experts") shows that dynamically dropping tokens at inference with CF < 1 can yield a 30% speedup with only 0.9% performance degradation on OLMoE, using calibration to identify which tokens are most expendable at which layers. This is an active engineering area as of May 2026.
+</Callout>
+
+---
+
+## Expert parallelism {#expert-parallelism}
+
+When total expert parameter count is large (671B in DeepSeek-V3), it is impractical to replicate all experts on every device. **Expert parallelism (EP)** assigns different subsets of experts to different devices: device $d$ holds experts $\{d \cdot (E/D), \ldots, (d+1) \cdot (E/D) - 1\}$ for $D$ EP devices.
+
+### Conceptual forward pass
+
+Non-MoE layers (attention, norms, embeddings) behave like ordinary data parallelism — each device processes its shard of the token batch independently. At an MoE layer, two all-to-all communication operations are required:
+
+1. **Dispatch (all-to-all \#1):** Each device's tokens are routed to whichever device holds the selected expert. Tokens scatter across devices.
+2. **Expert computation:** Each device runs its local experts on the tokens it received.
+3. **Gather (all-to-all \#2):** Tokens return to their originating devices. Outputs are combined using the gate values.
+
+This two-shot all-to-all is the dominant communication cost in MoE training; Meta Engineering (2025) reports it consuming 40%+ of runtime in large-scale EP deployments.
+
+### EP vs tensor parallelism
+
+Tensor parallelism (TP) shards each weight matrix across devices, requiring an AllReduce after every operation. EP is coarser: each device holds whole experts and communicates only at MoE layer boundaries. For MoE, EP typically outperforms TP because expert computation is embarrassingly parallel per expert. The constraint is that each expert must fit on a single device (or be further sharded within it).
+
+### Node-limited routing (DeepSeek-V3)
+
+DeepSeek-V3 uses 64-way EP across 8 nodes (8 devices per node). To limit all-to-all communication volume, each token's routing is *node-limited*: of the 256 routed experts distributed across 8 nodes, the router first selects the top-$M = 4$ nodes by summed affinity, then selects the top-8 experts within those 4 nodes. This constraint means no more than $4/8 = 50\%$ of nodes participate in each token's routing, substantially reducing cross-node traffic at a small routing-quality cost.
+
+### Straggler effect
+
+Load imbalance at runtime means devices with overloaded experts finish later than others, causing stragglers. The all-to-all gather at step 3 above must wait for the last device to finish before any device can proceed. Load balancing is therefore important not only for model quality but for hardware utilisation: a perfectly balanced MoE layer has zero straggler overhead; an imbalanced one wastes device-hours proportional to the imbalance.
+
+<Callout variant="note" title="Full EP treatment deferred">
+The ZeRO-1 + EP + pipeline-parallel combination used in DeepSeek-V3 training (64-way EP, 16-way pipeline parallel), overlap strategies (compute-communication overlap via ScMoE, MegaScale-MoE), and inference-serving EP (vLLM Expert Parallel Load Balancer) are covered in the future 04-distributed-training module. The account here is conceptual only.
+</Callout>
+
+---
+
+## Frontier MoE landscape {#frontier-moe-landscape}
+
+This section surveys MoE designs in frontier models as of May 2026. All claims are dated; closed-model rows are clearly marked as inferred.
+
+### The fine-grained shared-expert pattern
+
+The dominant design pattern in 2024–2026 is the **fine-grained shared-expert** architecture, introduced by DeepSeekMoE (Dai et al., ACL 2024) and refined through DeepSeek-V2 and V3. Two ideas distinguish it from earlier MoE designs:
+
+1. **Fine-grained experts:** Instead of $N$ large experts, use $N \times G$ smaller experts (granularity factor $G$). Smaller experts produce more diverse routing combinations ($\binom{N \cdot G}{k}$ vs $\binom{N}{k}$), expanding the effective representational capacity without increasing per-token FLOPs.
+
+2. **Shared experts:** A fixed set of $K_s$ always-activated experts run on every token, absorbing common knowledge that all tokens need (function words, syntax, basic semantics). The remaining experts are *routed* and specialize in less-common patterns. DeepSeek-V3 uses 1 shared expert plus 256 routed experts, selecting 8 routed experts per token.
+
+DeepSeek-V3 (December 2024) is the clearest production embodiment: 671B total parameters, 37B active per token, no token dropping during training, trained at roughly 2.788 million H800 GPU-hours. The V3.1 and V3.2 releases (2025–2026) retain the same MoE configuration; architectural changes in those releases primarily affect sparse attention mechanisms, not routing.
+
+### Minimal-complexity designs
+
+Mistral's Mixtral 8x7B (January 2024) and 8x22B (April 2024) use a simpler design: top-2 routing across 8 experts per layer, no shared experts, no token dropping in production inference. The Mixtral paper provides a proof of concept that clean sparse MoE, without fine-grained or shared-expert complexity, achieves strong quality at modest scale. Load balancing details are not published in the public paper.
+
+Grok-1 (xAI, March 2024) is a 314B open-weights model with 8 experts per layer and top-2 routing (~25% parameter activation rate). Architecture and routing details beyond these basics are not published.
+
+### Industrial hybrid designs
+
+**DBRX** (Databricks, March 2024) uses 16 experts with top-4 routing in a 132B/36B-active model. A notable implementation detail: DBRX uses MegaBlocks *dropless* MoE, which avoids token dropping by using block-sparse GPU kernels that work with variable-length expert inputs natively, without requiring padding.
+
+**Snowflake Arctic** (April 2024) is a 480B/17B-active dense-MoE hybrid: a ~10B dense component handles standard attention and FFN, while 128 fine-grained experts handle a separate "residual" FFN computation, with top-2 routing among the 128 experts. The 128-expert top-2 routing provides $\binom{128}{2} \approx 8128$ possible expert combinations per MoE layer. Auxiliary loss details are not published.
+
+### Meta Llama 4
+
+Llama 4 Scout (109B/17B active, 16 routed experts + 1 shared) and Llama 4 Maverick (400B/17B active, 128 routed experts + 1 shared) were released in April 2025 as the first natively multimodal open-weights MoE models from Meta. Both use *alternating* dense and MoE layers — not every layer is a MoE layer — and top-1 routing among routed experts on MoE layers (effectively 2 experts per MoE layer per token when counting the shared expert). Load-balancing strategy and capacity-factor details are not published.
+
+### Qwen3 MoE
+
+The Qwen Team's Qwen3-30B-A3B (30.5B total, 3.3B active, 128 experts, top-8) and Qwen3-235B-A22B (235B total, 22B active, 128 experts, top-8) were released in May 2025. Both use global-batch load-balance loss — the traditional auxiliary-loss approach — without shared experts. The Qwen3 technical report explicitly notes the removal of shared experts compared to Qwen2's MoE design, without providing ablation data for this choice.
+
+<Sidenote>Krajewski et al. (2024), "Scaling Laws for Fine-Grained Mixture of Experts" (arXiv:2402.07871) establish that granularity $G$ follows a power-law improvement with increasing granularity, with diminishing returns. The paper derives an optimal $G$ formula and finds up to 40× compute efficiency improvements over dense at $10^{25}$ FLOPs budgets. Liu et al. (2025), "Parameters vs FLOPs: Scaling Laws for Optimal Sparsity for Mixture-of-Experts Language Models" (arXiv:2501.12370) extend Chinchilla-style laws to include sparsity, finding a parabolic optimal sparsity and noting that reasoning-heavy tasks are more sensitive to low active-parameter counts.</Sidenote>
+
+### Comparison table
+
+<ComparisonTable
+  caption="Frontier MoE landscape, May 2026. All rows sourced. Closed-model rows marked as inferred. Dates indicate first public release."
+  columns={["Model", "Lab", "Date", "Total params", "Active params", "Routed experts", "Shared experts", "Top-k", "Aux-loss strategy", "Source"]}
+  rows={[
+    ["Mixtral 8x7B", "Mistral", "Jan 2024", "46.7B", "12.9B", "8", "0", "2", "Auxiliary loss (details unpublished)", "arXiv:2401.04088"],
+    ["Mixtral 8x22B", "Mistral", "Apr 2024", "141B", "39B", "8", "0", "2", "Auxiliary loss (details unpublished)", "Mistral AI blog, Apr 2024"],
+    ["DBRX", "Databricks", "Mar 2024", "132B", "36B", "16", "0", "4", "Dropless MoE (MegaBlocks)", "Databricks blog, Mar 2024; arXiv:2211.15841"],
+    ["Snowflake Arctic", "Snowflake", "Apr 2024", "480B", "17B", "128 (residual MoE)", "0 (dense component separate)", "2", "Auxiliary loss (details unpublished)", "Snowflake Arctic blog, Apr 2024"],
+    ["Grok-1", "xAI", "Mar 2024", "314B", "~79B (~25%)", "8", "0", "2", "Unspecified", "xAI open release, Mar 2024"],
+    ["DeepSeek-V2", "DeepSeek", "May 2024", "236B", "21B", "160", "2", "6", "Expert + device-level balance losses", "arXiv:2405.04434"],
+    ["DeepSeek-V3", "DeepSeek", "Dec 2024", "671B", "37B", "256", "1", "8", "Bias-based (aux-loss-free) + tiny seq-balance (α=0.0001)", "arXiv:2412.19437"],
+    ["Llama 4 Scout", "Meta", "Apr 2025", "109B", "17B", "16", "1", "1 (routed)", "Not published", "Meta AI Blog, Apr 2025"],
+    ["Llama 4 Maverick", "Meta", "Apr 2025", "400B", "17B", "128", "1", "1 (routed)", "Not published", "Meta AI Blog, Apr 2025"],
+    ["Qwen3-30B-A3B", "Alibaba/Qwen", "May 2025", "30.5B", "3.3B", "128", "0", "8", "Global-batch balance loss", "arXiv:2505.09388"],
+    ["Qwen3-235B-A22B", "Alibaba/Qwen", "May 2025", "235B", "22B", "128", "0", "8", "Global-batch balance loss", "arXiv:2505.09388"],
+    ["Gemini 1.5 Pro", "Google DeepMind", "Feb 2024", "Undisclosed", "Undisclosed", "Undisclosed", "Unknown", "Unknown", "Unknown", "arXiv:2403.05530 (confirms MoE; no specs published)"],
+    ["GPT-4 (inferred)", "OpenAI", "Mar 2023", "~1.76T (rumoured)", "~220B (estimated)", "~8 (rumoured)", "Unknown", "Unknown", "Unknown", "Inferred from public leaks; unconfirmed by OpenAI — treat as unverified"],
+    ["Claude 3.x / 4.x", "Anthropic", "2024–2026", "Undisclosed", "Undisclosed", "Undisclosed", "Unknown", "Unknown", "Unknown", "Architecture not disclosed; consistent with dense Transformer or very-light MoE based on available evidence"],
+  ]}
+/>
+
+<Callout variant="warning" title="Closed-model rows">
+The GPT-4 row is based on unverified third-party leaks (statements attributed to George Hotz, Soumith Chintala, and others in 2023). OpenAI has not published any technical report confirming GPT-4's architecture. Do not treat those numbers as facts. The Gemini 1.5 row is sourced from the published tech report (arXiv:2403.05530) which confirms MoE architecture but publishes no expert counts or routing details. The Claude row reflects the absence of any public Anthropic statement about MoE; the "architecture not disclosed" description is accurate and should not be interpreted as denial.
+</Callout>
+
+### Patterns and trajectories
+
+Reading across the table, several trends are visible:
+
+**Active-parameter efficiency is improving.** The ratio of active-to-total parameters has declined from roughly 30% (Mixtral 8x7B: 12.9B/46.7B = 28%) to around 9% (Qwen3-235B: 22B/235B = 9%) and under 6% for DeepSeek-V3 (37B/671B = 5.5%). This reflects an increase in expert count and a reduction in the proportion of parameters activated per token.
+
+**Expert count is increasing.** Early deployments used 8–16 experts; 2024–2025 designs cluster around 128–256 experts. Larger expert pools enable more specialised representations but increase inference memory requirements proportionally.
+
+**Shared experts appear and then disappear.** DeepSeek-V2 and V3 use shared experts; Qwen3 explicitly removes them compared to Qwen2; Meta's Llama 4 uses one shared expert. The shared-expert design has not yet reached consensus adoption.
+
+**Auxiliary-loss-free balancing is a 2024–2025 development.** DeepSeek-V3 is the only published frontier model as of May 2026 to use bias-based balancing at this scale. Most other teams continue to use traditional auxiliary losses or provide no details.
+
+---
+
+<Sources items={[
+  {
+    authors: "Shazeer, N. et al.",
+    year: 2017,
+    title: "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer",
+    venue: "ICLR 2017",
+    url: "https://arxiv.org/abs/1701.06538",
+    note: "First sparse MoE applied to LSTMs. Introduces noisy top-k gating, the compute-capacity decoupling argument, and the capacity concept."
+  },
+  {
+    authors: "Lepikhin, D. et al.",
+    year: 2020,
+    title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding",
+    venue: "ICLR 2021",
+    url: "https://arxiv.org/abs/2006.16668",
+    note: "First large-scale MoE Transformer. Top-2 routing. Introduces capacity factor and the token-dropping mechanism."
+  },
+  {
+    authors: "Fedus, W., Zoph, B., Shazeer, N.",
+    year: 2022,
+    title: "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity",
+    venue: "JMLR 23 (2022) 1–40",
+    url: "https://arxiv.org/abs/2101.03961",
+    note: "Top-1 routing. Defines the load-balance auxiliary loss (α ≈ 0.01). Capacity factor discussion. Residual pass-through for dropped tokens."
+  },
+  {
+    authors: "Zoph, B. et al.",
+    year: 2022,
+    title: "ST-MoE: Designing Stable and Transferable Sparse Expert Models",
+    venue: "arXiv:2202.08906",
+    url: "https://arxiv.org/abs/2202.08906",
+    note: "Introduces router z-loss. Comprehensive stability analysis of MoE training."
+  },
+  {
+    authors: "Zhou, Y. et al.",
+    year: 2022,
+    title: "Mixture-of-Experts with Expert Choice Routing",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2202.09368",
+    note: "Defines expert-choice routing. 2x+ training convergence speedup on 8B/64E vs. Switch and GShard."
+  },
+  {
+    authors: "Puigcerver, J. et al.",
+    year: 2023,
+    title: "From Sparse to Soft Mixtures of Experts",
+    venue: "arXiv:2308.00951",
+    url: "https://arxiv.org/abs/2308.00951",
+    note: "Introduces Soft MoE. Fully differentiable routing via dispatch and combine weight matrices."
+  },
+  {
+    authors: "Gale, T. et al.",
+    year: 2023,
+    title: "MegaBlocks: Efficient Sparse Training with Mixture-of-Experts",
+    venue: "MLSys 2023",
+    url: "https://arxiv.org/abs/2211.15841",
+    note: "Block-sparse GPU kernels for dropless MoE. Used in DBRX. 40% speedup over Tutel."
+  },
+  {
+    authors: "Dai, D. et al.",
+    year: 2024,
+    title: "DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models",
+    venue: "ACL 2024",
+    url: "https://arxiv.org/abs/2401.06066",
+    note: "Introduces fine-grained expert segmentation and shared expert isolation. Defines the DeepSeekMoE design pattern."
+  },
+  {
+    authors: "Jiang, A. et al.",
+    year: 2024,
+    title: "Mixtral of Experts",
+    venue: "arXiv:2401.04088",
+    url: "https://arxiv.org/abs/2401.04088",
+    note: "Mixtral 8x7B. Top-2 routing across 8 experts. No token dropping at inference. Apache 2.0."
+  },
+  {
+    authors: "Krajewski, J. et al.",
+    year: 2024,
+    title: "Scaling Laws for Fine-Grained Mixture of Experts",
+    venue: "arXiv:2402.07871",
+    url: "https://arxiv.org/abs/2402.07871",
+    note: "Power-law improvement with granularity G. Derives optimal G formula. 40x compute efficiency over dense at 10^25 FLOPs."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "236B/21B active. 160 routed experts + 2 shared. Device-level balance loss."
+  },
+  {
+    authors: "Wang, X. et al.",
+    year: 2024,
+    title: "Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts",
+    venue: "arXiv:2408.15664 (ICLR 2025)",
+    url: "https://arxiv.org/abs/2408.15664",
+    note: "Formal introduction of bias-term balancing. Update rule b_i ± γ. No gradient interference claim."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "671B/37B active. 256 routed experts + 1 shared. Bias-based aux-loss-free balancing. Sigmoid affinity. Node-limited routing. 2.788M H800-hours."
+  },
+  {
+    authors: "Mistral AI",
+    year: 2024,
+    title: "Mixtral 8x22B announcement",
+    venue: "Mistral AI blog, April 2024",
+    url: "https://mistral.ai/news/mixtral-8x22b",
+    note: "141B/39B active. Same top-2/8 design as 8x7B."
+  },
+  {
+    authors: "Databricks",
+    year: 2024,
+    title: "Introducing DBRX: A New State-of-the-Art Open LLM",
+    venue: "Databricks blog, March 2024",
+    url: "https://www.databricks.com/blog/introducing-dbrx-new-state-art-open-llm",
+    note: "132B/36B active. 16 experts top-4. Dropless MoE via MegaBlocks."
+  },
+  {
+    authors: "Snowflake AI Research",
+    year: 2024,
+    title: "Snowflake Arctic: Introducing the Best LLM for Enterprise AI",
+    venue: "Snowflake blog, April 2024",
+    note: "480B/17B active. Dense-MoE hybrid. 128 fine-grained experts top-2."
+  },
+  {
+    authors: "xAI",
+    year: 2024,
+    title: "Open Release of Grok-1",
+    venue: "xAI blog, March 2024",
+    url: "https://x.ai/news/grok-os",
+    note: "314B. 8 experts. Top-2. Apache 2.0."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI Blog, April 2025",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Scout 109B/17B (16 routed experts + 1 shared). Maverick 400B/17B (128 routed experts + 1 shared). Alternating dense+MoE layers. Top-1 routing."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Qwen3-30B-A3B (30.5B/3.3B active, 128 experts, top-8). Qwen3-235B-A22B (235B/22B active). Global-batch balance loss. No shared experts."
+  },
+  {
+    authors: "Team, Google DeepMind",
+    year: 2024,
+    title: "Gemini 1.5: Unlocking multimodal understanding across millions of tokens of context",
+    venue: "arXiv:2403.05530",
+    url: "https://arxiv.org/abs/2403.05530",
+    note: "Confirms MoE architecture. No expert count or routing details published."
+  },
+  {
+    authors: "Liu, Z. et al.",
+    year: 2025,
+    title: "Parameters vs FLOPs: Scaling Laws for Optimal Sparsity for Mixture-of-Experts Language Models",
+    venue: "arXiv:2501.12370",
+    url: "https://arxiv.org/abs/2501.12370",
+    note: "Extends Chinchilla-style laws to include sparsity. Parabolic optimal sparsity. Reasoning tasks sensitive to low active-parameter counts."
+  },
+  {
+    authors: "Meta Engineering",
+    year: 2025,
+    title: "Scaling LLM Inference: Innovations in Tensor Parallelism, Context Parallelism, and Expert Parallelism",
+    venue: "Meta Engineering Blog, October 2025",
+    url: "https://engineering.fb.com/2025/10/17/ai-research/scaling-llm-inference-innovations-tensor-parallelism-context-parallelism-expert-parallelism/",
+    note: "All-to-all overhead statistics in production EP. Expert parallelism latency breakdown; 40%+ runtime in large-scale setups."
+  },
+  {
+    authors: "HuggingFace",
+    year: 2024,
+    title: "Mixture of Experts Explained",
+    venue: "HuggingFace Blog",
+    url: "https://huggingface.co/blog/moe",
+    note: "Comprehensive tutorial covering load-balance loss, z-loss, capacity factor, and expert parallelism. Good pedagogical complement to primary sources."
+  }
+]} />

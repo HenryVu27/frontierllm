@@ -1,0 +1,575 @@
+---
+slug: 00a-transformer
+title: The transformer block
+description: The residual-stream framing, attention as kernel, the MLP block, and how blocks stack — the canonical building block of every frontier language model.
+order: 1
+chapter: 1
+reading_minutes: 28
+depends_on: []
+provides: [residual-stream, attention-math, mlp-block, pre-norm, flops-per-token]
+last_reviewed: 2026-05-11
+---
+
+## Overview
+
+Every frontier language model built today — Llama 3, DeepSeek-V3, Gemma 3, Qwen3, and the closed-weight models from OpenAI and Anthropic — is a transformer. The specific choices each model makes (which positional encoding, which activation function, how many key-value heads) vary, but the underlying skeleton has not changed since Vaswani et al. introduced it in 2017. Understanding that skeleton in detail is the goal of this chapter.
+
+The chapter proceeds in five sections. The first introduces the *residual-stream framing*, a mental model that makes the whole architecture legible as a communication channel rather than a stack of opaque layers. The second derives scaled dot-product attention from first principles and works through a complete numerical example. The third covers the MLP sub-layer. The fourth addresses how blocks stack and why the placement of normalisation layers became the subject of active research through 2024–2026. The fifth derives the compute and memory cost of a single block so that you can reason quantitatively about training budgets and inference hardware.
+
+Later chapters cover the major modifications the field has made to this baseline: [attention variants including GQA and MLA](/textbook/00b-attention-variants#gqa-math), [positional encodings and RoPE](/textbook/00c-positional-encodings#rope-rotation), [RMSNorm versus LayerNorm](/textbook/00d-normalization-and-init#rmsnorm-vs-layernorm), [SwiGLU and the gating family](/textbook/00e-activations-and-gating#swiglu-formula), and [mixture-of-experts routing](/textbook/00h-moe-plumbing#moe-routing). This chapter introduces each of those topics at the signpost level and defers depth to the relevant chapter.
+
+**Notation.** Throughout this chapter: $d$ or $d_{model}$ is the model dimension (the width of the residual stream); $L$ is the number of transformer blocks; $h$ is the number of attention heads; $d_k = d/h$ is the per-head key and query dimension; $d_v = d/h$ is the per-head value dimension (standard parameterisation); $d_{ff}$ is the FFN hidden dimension, defaulting to $4d$; $T$ is sequence length; $N$ denotes total non-embedding parameters. Weight matrices are indexed as $W_i^Q \in \mathbb{R}^{d \times d_k}$ for head $i$; the output projection as $W^O \in \mathbb{R}^{hd_v \times d}$.
+
+---
+
+## The residual stream {#residual-stream}
+
+### The architecture as a communication channel
+
+The most useful mental model for the transformer is not "a stack of layers" but a *shared communication channel* — the residual stream — that every component reads from and writes to via linear projections.
+
+Formally, let $\mathbf{x}^{(0)} \in \mathbb{R}^d$ be the token embedding for a single position. After block $\ell$, the stream state is:
+
+$$\mathbf{x}^{(\ell)} = \mathbf{x}^{(\ell-1)} + \Delta_{\text{attn}}^{(\ell)} + \Delta_{\text{mlp}}^{(\ell)}$$
+
+where $\Delta_{\text{attn}}^{(\ell)}$ is the output of the attention sub-layer applied to the stream (or a normalised version of it — the exact form depends on norm placement, covered in §[Pre-norm vs post-norm](#pre-norm-vs-post-norm)), and $\Delta_{\text{mlp}}^{(\ell)}$ is the output of the MLP sub-layer. The stream itself performs no computation; it is the running sum of all component contributions on top of the initial embedding.
+
+This framing was made precise by Elhage et al. (2021) in a mechanistic interpretability context, but it is equally useful as an engineering mental model. The key observations are:
+
+**The stream has linear read-write structure.** Every component reads from the stream with a left-multiplication by a weight matrix and writes back via an additive contribution. Attention head $i$ at layer $\ell$ reads $\mathbf{x}$ through $W_i^Q$, $W_i^K$, $W_i^V$, computes a context-weighted value, and writes the result back through $W_i^O$. The MLP reads $\mathbf{x}$ through $W_1$ and writes back through $W_2$. Neither the attention head nor the MLP modifies the stream in-place; they produce a residual that is added to it.
+
+**Heads are independent and additive.** Because each head's contribution is added separately to the residual stream, the $h$ heads in a layer behave identically whether their outputs are concatenated-then-projected or summed after individual projection. The concatenation formulation in Vaswani et al. is algebraically equivalent to $h$ independent projections summed over the stream. This means head ordering within a layer is arbitrary, and heads at the same layer can in principle be computed in any order or in parallel.
+
+**No privileged basis.** Any invertible rotation applied consistently to all projection matrices would produce identical model behaviour. The stream does not have a canonical coordinate system, which means individual stream dimensions are not interpretable without additional analysis. This is a feature of the architecture, not a bug, and has no practical consequence for training or inference.
+
+**Why it matters for training stability.** The residual connection is the main highway for gradient flow. At any depth, the gradient of the loss with respect to $\mathbf{x}^{(0)}$ includes a direct path through the accumulated sums — the identity connections — that is independent of the sublayer weights. This is what makes transformers trainable at 100+ layers without the vanishing-gradient problems that afflicted deep RNNs. The norm-placement section below will show how the exact placement of normalisation affects this gradient highway.
+
+**Scope.** The residual-stream framing describes all transformer models without exception. GPT-3 (2020), Llama 3.1 (2024), DeepSeek-V3 (2024), Gemma 3 (2025), and every other publicly reported frontier model implements this structure. The differences between them lie in what operations the attention and MLP components perform, not in whether the residual-stream skeleton holds.
+
+---
+
+## Attention math {#attention-math}
+
+### Scaled dot-product attention
+
+Scaled dot-product attention takes three matrices — queries $Q$, keys $K$, and values $V$ — and produces an output that is a weighted sum of value rows:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+
+where $Q, K, V \in \mathbb{R}^{T \times d_k}$ for a single head, $T$ is sequence length, and $d_k$ is the head dimension.
+
+The $1/\sqrt{d_k}$ scaling is not arbitrary. Consider two random vectors of dimension $d_k$ with independent unit-variance entries. Their dot product has expected value zero and variance $d_k$, so the standard deviation grows as $\sqrt{d_k}$. Without the scaling factor, dot products at large $d_k$ would produce large logits that push the softmax into its saturation regime, yielding near-one-hot attention weights and near-zero gradients. Dividing by $\sqrt{d_k}$ restores unit-variance logits and keeps the softmax in a well-conditioned range throughout training.
+
+Attention is most naturally understood as a *kernel smoother*: for each query $\mathbf{q}_t$, it produces a convex combination of value rows, with mixing weights determined by the exponentiated dot-product similarity between $\mathbf{q}_t$ and every key $\mathbf{k}_{t'}$. The weights sum to one (by construction of softmax) and are non-negative, so the output is always in the convex hull of the value rows. What makes attention more expressive than classical fixed-kernel smoothers is that the kernel is *data-dependent*: the keys and queries are computed from the input itself, so the mixing weights can change arbitrarily across inputs.
+
+### Causal masking
+
+For autoregressive (decoder-only) language models, a token at position $t$ is not permitted to attend to future positions $t' > t$. This is enforced by adding $-\infty$ to the pre-softmax logits wherever $t' > t$:
+
+$$A_{tt'} = \begin{cases} \dfrac{\mathbf{q}_t \cdot \mathbf{k}_{t'}}{\sqrt{d_k}} & t' \leq t \\ -\infty & t' > t \end{cases}$$
+
+After softmax, $-\infty$ entries become exactly zero and do not contribute to the output. In practice, $-\infty$ is replaced by a large negative constant such as $-10^4$ to avoid floating-point issues with `inf - inf` in edge cases.
+
+Getting the causal mask right is a common source of silent bugs. An off-by-one error that allows position $t$ to see position $t+1$ does not crash training; it merely leaks future information and degrades model quality in a way that can be hard to detect without a targeted diagnostic. The standard check is a single forward pass on a sequence where positions are distinct tokens: verify that the attention weights at position $t$ are exactly zero for all $t' > t$.
+
+### Multi-head attention
+
+Multi-head attention projects the input $X \in \mathbb{R}^{T \times d}$ into $h$ independent heads, computes scaled dot-product attention in each head's subspace, and combines the results:
+
+$$\text{head}_i = \text{Attention}(X W_i^Q,\; X W_i^K,\; X W_i^V), \quad i = 1, \ldots, h$$
+
+$$\text{MHA}(X) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)\, W^O$$
+
+where $W_i^Q, W_i^K \in \mathbb{R}^{d \times d_k}$, $W_i^V \in \mathbb{R}^{d \times d_v}$, and $W^O \in \mathbb{R}^{hd_v \times d}$. In the standard Vaswani parameterisation, $d_k = d_v = d/h$, so the concatenated output has dimension $h \cdot (d/h) = d$ before the $W^O$ projection.
+
+The purpose of multiple heads is to let the model attend to different positional relationships or semantic roles simultaneously. In practice, different heads do develop distinct specialisations — some track syntactic dependencies, others copy information over short ranges — though this specialisation emerges from training rather than being explicitly encoded.
+
+**Parameter count.** The $h$ query projection matrices $W_i^Q$ together constitute a $d \times d$ block (the concatenation of all $W_i^Q$ stacked along the output dimension), and similarly for keys and values. The three projection blocks plus $W^O$ contribute $4d^2$ parameters per layer in standard MHA.
+
+<Callout variant="note" title="Attention is permutation-equivariant without positional encoding">
+Attention is invariant to the order of key-value pairs for any fixed query. If you shuffle the positions of the input tokens (but apply the same shuffle consistently to Q, K, and V), the attention output for each token is unchanged. This means that without positional information injected somewhere, a transformer is a bag-of-words model — all permutations of the same token set produce the same output. Positional encodings (covered in [Chapter 00c](/textbook/00c-positional-encodings)) are the mechanism by which order enters the model. Every frontier model uses rotary positional encodings (RoPE) as of 2025–2026.
+</Callout>
+
+### Worked numerical example
+
+The following example computes multi-head attention end-to-end for a minimal model. All arithmetic is exact; a calculator is sufficient to reproduce it.
+
+**Setup:** $d_{model} = 8$, $h = 2$ heads, $d_k = d_v = 4$, $T = 4$ tokens, causal mask. We work through head 1 in detail.
+
+**Step 1 — Input matrix.** Suppose the residual stream at four token positions is the $4 \times 8$ identity-like matrix:
+
+$$X = \begin{bmatrix} 1 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 & 0 & 0 & 0 & 0 \\ 0 & 0 & 1 & 0 & 0 & 0 & 0 & 0 \\ 0 & 0 & 0 & 1 & 0 & 0 & 0 & 0 \end{bmatrix}$$
+
+This is a clean choice for a worked example: each token's stream vector is an orthogonal unit vector. Real stream vectors are dense and non-orthogonal after even one forward pass.
+
+**Step 2 — Projection (head 1).** Let the weight matrices for head 1 select the first 4 dimensions of the stream: $W_1^Q = W_1^K = W_1^V = [I_4 \mid 0_{4 \times 4}]^\top \in \mathbb{R}^{8 \times 4}$. Then:
+
+$$Q = K = V = X \, W_1^Q = X[\,:,\, :4] = I_4 \in \mathbb{R}^{4 \times 4}$$
+
+**Step 3 — Attention scores.** The $4 \times 4$ score matrix before scaling and masking is:
+
+$$S_{\text{raw}} = Q K^\top = I_4 \cdot I_4^\top = I_4$$
+
+After dividing by $\sqrt{d_k} = \sqrt{4} = 2$:
+
+$$S = \frac{QK^\top}{\sqrt{4}} = \frac{1}{2} I_4$$
+
+Every off-diagonal score is $0$; every diagonal score is $0.5$.
+
+**Step 4 — Causal mask.** Entries above the diagonal are masked to $-\infty$. The score matrix becomes:
+
+$$S_{\text{masked}} = \begin{bmatrix} 0.5 & -\infty & -\infty & -\infty \\ 0 & 0.5 & -\infty & -\infty \\ 0 & 0 & 0.5 & -\infty \\ 0 & 0 & 0 & 0.5 \end{bmatrix}$$
+
+**Step 5 — Softmax, row by row.** Each row is softmaxed independently. For row $i = 2$ (token index 2, which can attend to tokens 0, 1, 2):
+
+$$\text{softmax}([0,\; 0,\; 0.5]) = \frac{[e^0,\; e^0,\; e^{0.5}]}{e^0 + e^0 + e^{0.5}} = \frac{[1,\; 1,\; 1.649]}{3.649} \approx [0.274,\; 0.274,\; 0.452]$$
+
+For row $i = 0$ (can attend only to token 0): softmax of $[0.5]$ is $[1.0]$.
+
+For row $i = 1$ (tokens 0–1): $\text{softmax}([0, 0.5]) = [e^0, e^{0.5}] / (1 + e^{0.5}) = [1, 1.649] / 2.649 \approx [0.377, 0.623]$.
+
+For row $i = 3$ (tokens 0–3): $\text{softmax}([0, 0, 0, 0.5])$. Numerically: $[1, 1, 1, 1.649] / 4.649 \approx [0.215, 0.215, 0.215, 0.355]$.
+
+**Step 6 — Weighted sum.** The output for each row is the softmax weights multiplied by $V = I_4$. Since $V$ is the identity, each output row is just the softmax weight vector padded with zeros. For token 2: output is $[0.274, 0.274, 0.452, 0]$.
+
+This is a *mixture* of the first three token representations (0, 1, 2), weighted toward the current position (0.452 on token 2's own key, 0.274 on each earlier token). The current-position bias arises because the diagonal of the score matrix is $0.5$ while off-diagonal entries are $0$, so each token's own key matches its query more strongly than any other key.
+
+**Step 7 — Output projection.** In a two-head model, head 1 and head 2 each produce a $4$-dimensional output per position. These are concatenated to form an $8$-dimensional vector, which is then multiplied by $W^O \in \mathbb{R}^{8 \times 8}$ and added to the residual stream.
+
+**Takeaway.** Attention redistributes information across positions proportionally to dot-product similarity between queries and keys. Without positional encodings, the only distinction between positions is the content of their stream vectors. With real weight matrices (not the identity toy), the model learns which query-key similarity patterns are useful for the task. RoPE (Chapter 00c) modulates key-query similarity as a function of the distance between positions, breaking the position-invariance demonstrated here.
+
+<Callout variant="warning" title="Failure mode: attention logit blow-up at scale">
+At large $d_k$ or after extended training, attention logits can grow in magnitude despite the $1/\sqrt{d_k}$ factor. The result is a near-degenerate softmax distribution (near-one-hot attention), which reduces the effective mixing and can cause training instability. QK-norm — normalising the query and key vectors before the dot product — is the mitigation adopted by Gemma 3 (2025), OLMo 2 (2025), and several other recent models. The full treatment is in [Chapter 00d](/textbook/00d-normalization-and-init#qk-norm). This issue does not appear at small scale (toy examples, models up to a few hundred million parameters) but has been reported repeatedly in training runs above 1B parameters with long training horizons.
+</Callout>
+
+---
+
+## The MLP block {#mlp-block}
+
+### Structure and parameters
+
+The MLP sub-layer in the original Vaswani (2017) transformer is a position-wise fully connected network applied identically and independently at each token position. It takes the $d$-dimensional stream vector at one position and applies a two-layer network:
+
+$$\text{FFN}(x) = W_2 \cdot \text{ReLU}(W_1 x + b_1) + b_2$$
+
+where $x \in \mathbb{R}^d$, $W_1 \in \mathbb{R}^{d_{ff} \times d}$, $W_2 \in \mathbb{R}^{d \times d_{ff}}$, and the standard width is $d_{ff} = 4d$. The network expands the representation to $4d$ dimensions, applies a non-linearity, and compresses back to $d$. Most frontier models drop the bias terms $b_1$ and $b_2$ (they are redundant given the preceding layer norm).
+
+**Parameter count per layer.** The two weight matrices contribute $d \cdot d_{ff} + d_{ff} \cdot d = 2 d d_{ff}$ parameters. With $d_{ff} = 4d$: $8d^2$ MLP parameters per layer. The attention sub-layer contributes $4d^2$ (three projection matrices at $d \times d_k$ each plus $W^O$, totalling $4d^2$ for standard MHA with $d_k = d/h$, $h$ heads). The MLP therefore holds twice as many parameters as the attention sub-layer in a standard block.
+
+**Parameter ratio.** With GQA reducing the number of K/V heads (see [Chapter 00b](/textbook/00b-attention-variants#gqa-math)), the K and V projection matrices shrink proportionally. If the model uses $h_{kv}$ KV heads instead of $h$, the total attention parameters are $(h + 2 h_{kv}) d_k \cdot d + d^2$ rather than $4d^2$. For Llama 3.1 (2024) with $h = 32$, $h_{kv} = 8$, the attention parameters are approximately $(32 + 16)/32 \times d^2 = 1.5 d^2$ per head-parameter block — roughly half the standard MHA count, making the MLP even more dominant by parameter count.
+
+### Activation history and frontier practice
+
+The original transformer used ReLU as the activation function in the MLP. GPT-2 (Radford et al., 2019) replaced ReLU with GELU (Gaussian Error Linear Unit), which has a smooth approximation to the ReLU's piecewise-linear behaviour and avoids dead units. The key qualitative difference is that GELU is differentiable at zero and produces non-zero gradients for small negative inputs, avoiding the "dead neuron" failure mode of ReLU.
+
+By 2023–2026, essentially all frontier models replaced the standard two-layer MLP with a *gated* variant — SwiGLU — that introduces a multiplicative gate:
+
+$$\text{SwiGLU}(x) = (W_1 x) \odot \text{Swish}(W_3 x)$$
+
+$$\text{FFN}_{\text{gated}}(x) = W_2 \cdot \text{SwiGLU}(x)$$
+
+where $\odot$ is element-wise multiplication and $\text{Swish}(z) = z \cdot \sigma(z)$. This architecture uses three weight matrices per MLP block instead of two and adjusts $d_{ff}$ to $\frac{8}{3} d$ (approximately $2.67d$) to maintain the same parameter count as a $4d$ non-gated MLP. The full derivation of the $8/3$ factor and why gating helps empirically is in [Chapter 00e](/textbook/00e-activations-and-gating#swiglu-formula).
+
+For the purposes of this chapter, the important point is that the *role* of the MLP block is the same regardless of activation choice: it performs per-position computation on the updated residual stream, independently for each token. The attention sub-layer is responsible for mixing information across positions; the MLP is responsible for transforming the per-position representation.
+
+### What the MLP computes
+
+The division of labour between attention (inter-position routing) and MLP (intra-position transformation) is a useful mental model but should not be taken as absolute. Attention is clearly the mechanism for moving information between positions. The MLP, which sees only one token's stream vector at a time, cannot directly mix positional information.
+
+Interpretability work has found that MLP layers also store factual associations. Geva et al. (2021) showed that individual MLP neurons can be associated with specific factual recall patterns — the "knowledge neuron" hypothesis — suggesting that the MLP is doing more than generic feature transformation. The practical implication for engineers is that reducing MLP capacity (shrinking $d_{ff}$) can disproportionately harm performance on knowledge-intensive tasks.
+
+<Callout variant="info" title="Dead ReLU units">
+With ReLU activation, a neuron that receives a consistently negative pre-activation will have zero gradient and never update — a "dead" unit. In practice, initialising biases to zero and using small Gaussian weight initialisation (standard deviation $\sim 1/\sqrt{d}$) prevents this in most cases. Models using GELU or SwiGLU do not have this failure mode because both functions have non-zero gradient at zero and produce non-zero output for small negative inputs.
+</Callout>
+
+---
+
+## Pre-norm vs post-norm {#pre-norm-vs-post-norm}
+
+### The original formulation: post-norm
+
+The Vaswani et al. (2017) transformer applies layer normalisation *after* the residual addition, wrapping the entire sum:
+
+$$\mathbf{y} = \text{LayerNorm}(\mathbf{x} + \text{Sublayer}(\mathbf{x}))$$
+
+This is "post-norm" in the sense that normalisation follows (post-dates) the residual addition. The same formulation applies to both the attention and MLP sub-layers.
+
+Post-norm training is sensitive to the learning rate schedule. Vaswani et al. used a specific warm-up then decay schedule that was not obviously derivable from first principles, and subsequent work found that different warm-up durations caused post-norm training to diverge at large scales. The instability is particularly severe in models with many layers: a GPT-3-scale model (96 layers) trained with post-norm requires extreme care in the learning rate schedule to avoid early training collapse.
+
+### The change: pre-norm
+
+GPT-2 (Radford et al., 2019) moved the normalisation to the *input* of each sub-layer, inside the residual branch:
+
+$$\mathbf{y} = \mathbf{x} + \text{Sublayer}(\text{LayerNorm}(\mathbf{x}))$$
+
+This is "pre-norm." An additional normalisation is applied after the final transformer block. GPT-3 (Brown et al., 2020, 175B parameters, 96 layers) confirmed that pre-norm enables stable training at this scale, and the choice propagated to essentially all subsequent large models.
+
+**Why pre-norm is more stable.** Liu et al. (2020) provide a gradient-flow analysis. In post-norm, the normalisation is applied to $\mathbf{x} + \text{Sublayer}(\mathbf{x})$. Early in training, the sublayer output is near zero, so $\mathbf{x} + \text{Sublayer}(\mathbf{x}) \approx \mathbf{x}$ and the LayerNorm Jacobian is approximately $\partial \text{LN}(\mathbf{x})/\partial \mathbf{x}$, which projects out the direction of $\mathbf{x}$. This Jacobian gates the gradient flowing through the residual connection. Across $L$ layers, the product of $L$ such Jacobians approaches zero, producing vanishing gradients at the early layers of a deep post-norm model.
+
+Pre-norm avoids this because the residual stream $\mathbf{x}$ bypasses the normalisation entirely. Gradients flow through $\mathbf{x}$ unimpeded along the identity path; the normalisation only gates the gradient within the sublayer branch.
+
+**The tradeoff.** Pre-norm is stable but allows the residual stream to grow in magnitude without bound across layers — the sublayer contributions are normalised before being added to the (unnormalised) stream, so the stream's scale is dominated by the accumulated sum rather than by any individual sublayer. Liu et al. (2020) note that this can cause "representation collapse" in very deep pre-norm models, where the later layers contribute diminishingly little because the early-layer residuals dominate the stream. In practice at frontier scale (30B–700B parameters), the perplexity gap between well-tuned post-norm and pre-norm closes, and no frontier lab has successfully trained a 100B+ parameter model with vanilla post-norm as of 2026.
+
+<Sidenote>Liu et al. (2020, EMNLP) formalise the gradient-flow argument and propose an "Admin" initialisation that stabilises post-norm training by scaling residual weights at initialisation. Admin was not widely adopted in frontier practice; the field instead converged on pre-norm. The Keel paper (Chen et al., 2026) revisits this line of work with gated residual connections; see the comparison table in this section.</Sidenote>
+
+### Norm-placement variants in 2024–2026
+
+The pre-norm/post-norm dichotomy has fractured in recent work. Four named variants are active in the literature as of May 2026.
+
+**Peri-LN (Nguyen et al., 2025).** Applies normalisation both before and after each sub-layer:
+
+$$\mathbf{y} = \mathbf{x} + \text{LayerNorm}(\text{Sublayer}(\text{LayerNorm}(\mathbf{x})))$$
+
+The outer normalisation bounds the magnitude of the sub-layer's output before it is added to the stream, addressing the representation-collapse concern of pre-norm while preserving the clean gradient highway. Nguyen et al. (2025) showed that Gemma 2 (Google DeepMind, June 2024) and OLMo 2 (AllenAI, January 2025) had independently adopted this placement before the paper formalised it. The paper found consistent improvement over both pre-norm and post-norm at model sizes of 400M, 1.5B, and 3.2B parameters.
+
+**HybridNorm (Zhuo et al., 2025).** Applies per-tensor normalisation to the Q, K, V matrices inside the attention mechanism and uses post-norm placement in the FFN block. The motivation is that the Q and K normalisation addresses attention logit blow-up (the problem QK-norm also solves; see [Chapter 00d](/textbook/00d-normalization-and-init#qk-norm)), while post-norm in the FFN provides the representation quality benefits of post-norm without the gradient instability. Zhuo et al. report a 1.4× pretraining convergence speedup relative to pre-norm, tested on 550M and 1B dense models and mixture-of-experts variants.
+
+**NormFormer (Shleifer et al., 2021).** Adds three extra normalisation operations per block: a LayerNorm after the self-attention output, head-wise scaling of the attention outputs, and a LayerNorm after the first linear layer of the MLP. The parameter overhead is 0.4%. In a 1.3B model, this reached equal perplexity 24% faster than the baseline, or 0.27 perplexity lower at the same compute. NormFormer predates the 2024–2026 wave of norm-placement research and is included as the conceptual precursor to Peri-LN; no major open-weight model publicly adopted NormFormer as its norm scheme.
+
+**Keel (Chen et al., 2026).** Replaces the standard additive residual connection in post-norm with a Highway-style gated connection. Gating allows the model to interpolate between full residual bypass and full sub-layer output, making deep post-norm models trainable at depths exceeding 1,000 layers. Chen et al. (2026) report that Keel outperforms pre-norm on perplexity at matched compute budgets in their experiments. As of May 2026, no confirmed production-model adoption of Keel has been reported; the work is research-stage.
+
+### Frontier-lab choices as of May 2026
+
+<ComparisonTable
+  caption="Normalisation type and placement across frontier and open-weight models. Source: model technical reports and Raschka (2025) for models without a separate arch paper."
+  columns={["Model", "Year", "Norm type", "Norm placement", "Source"]}
+  rows={[
+    ["Vaswani (original)", "2017", "LayerNorm", "Post-norm", "Vaswani et al. 2017, NeurIPS"],
+    ["GPT-2", "2019", "LayerNorm", "Pre-norm", "Radford et al. 2019, OpenAI Blog"],
+    ["GPT-3", "2020", "LayerNorm", "Pre-norm", "Brown et al. 2020, NeurIPS"],
+    ["Llama 3.1", "2024", "RMSNorm", "Pre-norm", "Meta Llama 3 report, arXiv 2407.21783"],
+    ["DeepSeek-V3", "2024", "RMSNorm", "Pre-norm", "DeepSeek-AI, arXiv 2412.19437"],
+    ["Gemma 2", "2024", "RMSNorm", "Peri-LN (pre + post per sublayer)", "Gemma Team 2024, arXiv 2408.00118"],
+    ["OLMo 2", "2025", "RMSNorm", "Post-norm (inside residual)", "AllenAI, arXiv 2501.00656"],
+    ["Gemma 3", "2025", "RMSNorm", "Peri-LN (pre + post hybrid)", "Gemma Team 2025, arXiv 2503.19786"],
+    ["Mistral Small 3.1", "2025", "RMSNorm", "Pre-norm", "Raschka 2025"],
+    ["Llama 4", "2025", "RMSNorm", "Pre-norm", "Raschka 2025"],
+    ["Qwen3", "2025", "RMSNorm", "Pre-norm", "Raschka 2025"],
+    ["gpt-oss-20b / 120b", "2025", "RMSNorm", "Pre-norm", "Raschka 2025 (inferred from public reports / API behaviour)"],
+    ["OLMo 3", "2025", "RMSNorm", "Post-norm (inside residual)", "Raschka 2025"],
+    ["DeepSeek V3.2", "2025", "RMSNorm", "Pre-norm", "Raschka 2025"],
+  ]}
+/>
+
+Two patterns are unambiguous from this table. First, RMSNorm has replaced LayerNorm in every model trained after 2023; this convergence is discussed in detail in [Chapter 00d](/textbook/00d-normalization-and-init#rmsnorm-vs-layernorm). Second, pre-norm remains the plurality choice, but Peri-LN adoption is accelerating with Gemma 2, OLMo 2, Gemma 3, and OLMo 3. The norm-placement question is not settled as of 2026, in the sense that the field has not converged to a single dominant choice the way it converged to pre-norm in 2020–2023.
+
+For closed-weight models (the GPT-4 generation, Claude, Gemini 1.5 and later), the norm type and placement are not publicly reported. Based on the convergence visible in open-weight models, pre-norm RMSNorm is the most probable choice, but this is inference from industry trends rather than confirmed fact.
+
+---
+
+## FLOPs per token {#flops-per-token}
+
+### Component-by-component derivation
+
+Understanding how much compute a transformer block requires is necessary for reasoning about training budgets, hardware selection, and the tradeoffs introduced by modifications like GQA, SwiGLU, and MoE. This section derives the count from first principles for a standard MHA + ReLU-MLP block.
+
+**Counting convention.** One multiply-add (a single multiply followed by a single add) counts as 2 FLOPs. A matrix-vector product of shape $(m, n) \times (n, 1)$ costs $2mn$ FLOPs.
+
+**Symbols:** $d = d_{model}$, $d_{ff} = 4d$, $L$ = layers, $T$ = sequence length, $N$ = total non-embedding parameters.
+
+The per-token FLOPs for each component of one transformer block are:
+
+**QKV projection.** Each input token is projected into queries, keys, and values for all $h$ heads simultaneously. The combined QKV projection is a single matrix multiplication of size $(3d, d)$ applied to a $d$-dimensional vector:
+
+$$C_\text{QKV} = 2 \times 3d \times d = 6d^2 \text{ FLOPs/token}$$
+
+**Attention dot-product (sequence-length term).** For each query token, computing the dot product with all $T$ key vectors costs $2d_k \cdot T = 2(d/h) \cdot T$ FLOPs per head, and there are $h$ heads, giving $2dT$ FLOPs per token. This is the quadratic term: per-token cost grows with $T$. At moderate context ($T \sim 1{,}000$, $d \sim 4{,}096$), this is $2 \times 4{,}096 \times 1{,}000 = 8.2 \times 10^6$ FLOPs/token, while the weight-matrix terms each contribute $O(d^2) = O(1.7 \times 10^7)$ FLOPs — so the sequence term is significant but not dominant at moderate context.
+
+**Output projection.** $W^O \in \mathbb{R}^{d \times d}$ applied to a $d$-dimensional vector:
+
+$$C_{W^O} = 2d^2 \text{ FLOPs/token}$$
+
+**MLP layer 1.** $W_1 \in \mathbb{R}^{4d \times d}$:
+
+$$C_\text{MLP-1} = 2 \times 4d \times d = 8d^2 \text{ FLOPs/token}$$
+
+**MLP layer 2.** $W_2 \in \mathbb{R}^{d \times 4d}$:
+
+$$C_\text{MLP-2} = 2 \times d \times 4d = 8d^2 \text{ FLOPs/token}$$
+
+**Total per-layer forward FLOPs (weight terms only):**
+
+$$C_{\text{fwd, layer}} = 6d^2 + 2d^2 + 8d^2 + 8d^2 = 24d^2 \text{ FLOPs/token}$$
+
+Summing over $L$ layers: $C_{\text{fwd}} = 24Ld^2$ FLOPs/token.
+
+### Connecting to the parameter count
+
+The non-embedding parameters per layer are:
+
+- Attention: QKV ($3d^2$) + output projection ($d^2$) = $4d^2$
+- MLP: two matrices of size $4d \times d$ = $8d^2$
+- Total: $12d^2$ per layer
+
+For $L$ layers: $N \approx 12Ld^2$, so $24Ld^2 = 2N$, giving:
+
+$$\boxed{C_{\text{fwd}} \approx 2N \text{ FLOPs/token}}$$
+
+### The 6N training rule
+
+The backward pass requires computing two sets of gradients per weight matrix: the gradient with respect to the input (needed to propagate gradients to earlier layers) and the gradient with respect to the weights (needed to update the weights). Each costs approximately the same as a forward-pass matrix multiplication. Total backward-pass cost is approximately $4N$ FLOPs per token.
+
+Adding forward and backward:
+
+$$C_{\text{train}} \approx 2N + 4N = 6N \text{ FLOPs/token}$$
+
+For $D$ tokens of training data:
+
+$$C_{\text{total}} = 6ND$$
+
+This is the 6N rule established empirically by Kaplan et al. (2020) and confirmed by Hoffmann et al. (2022, Chinchilla). It is an approximation — it excludes the attention dot-product sequence-length term, the embedding and unembedding layers, and activation functions — but it is accurate to within 10–20% for typical frontier model configurations where $T \ll d_{model}$.
+
+<Callout variant="info" title="When the 6N approximation breaks down">
+The 6N rule assumes the sequence-length term $2dT$ per layer is negligible. This holds when $T \ll d$ — for example, $T = 2{,}048$ and $d = 8{,}192$ (roughly GPT-3 scale), giving a sequence-term contribution of about 12% of total attention FLOPs. At long context ($T = 128{,}000$, $d = 4{,}096$), the sequence term is $2 \times 4{,}096 \times 128{,}000 \approx 10^9$ FLOPs/token per layer, vastly exceeding the $24d^2 \approx 4 \times 10^8$ weight-matrix term. In this regime the quadratic attention cost dominates and the 6N rule significantly underestimates actual FLOPs — by a factor of 3× or more at the context lengths used by frontier models as of 2026.
+</Callout>
+
+### KV cache during inference
+
+Autoregressive inference generates one token at a time. For each new token, the model must compute attention over all previous positions. Recomputing the keys and values for all previous positions at each step would cost $O(T^2)$ total work for a sequence of length $T$. The standard solution is to cache the key and value tensors after they are computed for each position.
+
+The KV cache memory per token stored is:
+
+$$\text{KV cache per token} = 2 \times L \times h_{kv} \times d_k \times \text{bytes per element}$$
+
+The factor of 2 accounts for K and V separately; $h_{kv}$ is the number of KV heads (equal to $h$ in standard MHA, reduced in GQA).
+
+**Example: Llama 3.1 8B, bfloat16.** $L = 32$, $d = 4{,}096$, $h = 32$ query heads, $h_{kv} = 8$ KV heads (GQA), $d_k = 128$, 2 bytes per element:
+
+$$\text{KV cache per token} = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072 \text{ bytes} \approx 128 \text{ KB/token}$$
+
+At a context of 8,192 tokens: $128 \text{ KB} \times 8{,}192 \approx 1.05 \text{ GB}$ per sequence. This is the memory that must be available at the serving layer in addition to model weights.
+
+**Example: a standard MHA model at 175B scale, bfloat16.** Using the published GPT-3 configuration: $L = 96$, $d = 12{,}288$, $h = h_{kv} = 96$, $d_k = 128$:
+
+$$\text{KV cache per token} = 2 \times 96 \times 96 \times 128 \times 2 = 4{,}718{,}592 \text{ bytes} \approx 4.5 \text{ MB/token}$$
+
+At 2,048 tokens: $\approx 9.2 \text{ GB}$ of KV cache per sequence. This is why GQA, which reduces $h_{kv}$ from $h$ to $h/g$ for some group count $g$, was a critical efficiency gain for long-context serving: an 8× reduction in KV heads cuts the per-sequence KV cache by 8×. The arithmetic and tradeoffs of GQA, MQA, and MLA are treated in detail in [Chapter 00b](/textbook/00b-attention-variants#gqa-math).
+
+### Activation memory during training
+
+During training, intermediate activations must be retained in memory for the backward pass. Without any recomputation, the full activation memory per transformer layer per token is approximately $34d$ bytes in bfloat16 — this accounts for the QKV projection inputs and outputs, the attention weight matrix, the softmax output, the MLP intermediates, and the layer-norm inputs. Across $L$ layers and a training batch of $B$ tokens:
+
+$$\text{Activation memory} \approx 34 \times B \times L \times d \text{ bytes}$$
+
+For a 7B model ($L = 32$, $d = 4{,}096$) with a batch of $B = 1{,}024$ tokens, this gives $34 \times 1{,}024 \times 32 \times 4{,}096 \approx 4.6 \text{ GB}$ — roughly comparable to the model weight size itself.
+
+**Selective recomputation.** Korthikanti et al. (2022) showed that the attention weight matrix (size $T^2$ per head per layer) dominates activation memory at long sequence lengths but is cheap to recompute relative to the FFN activations. The "selective recomputation" strategy stores only the residual-stream tensor at each block boundary ($2 \times L \times B \times d$ bytes, much smaller) and recomputes everything else during the backward pass. This reduces activation memory by approximately 5× at the cost of roughly one additional forward pass worth of FLOPs (a ~34% overhead over the total training compute). The EleutherAI Transformer Math post provides the detailed formula, which also incorporates tensor-parallel degree.
+
+<ComparisonTable
+  caption="FLOPs per token per layer for each component of a standard MHA + ReLU-MLP block (d = d_model, d_ff = 4d). Source: Casson (2023), EleutherAI Transformer Math 101, Google Scaling Book (2024)."
+  columns={["Component", "FLOPs / token / layer", "Formula", "Note"]}
+  rows={[
+    ["QKV projection", "6d²", "2 × 3d × d", "Weight-matrix term only"],
+    ["Attention dot-product", "4dT (total); 4d per position in output", "O(T · d) per token", "Grows with context T; excluded from 6N rule"],
+    ["Output projection", "2d²", "2 × d × d", "Weight-matrix term"],
+    ["MLP layer 1", "8d²", "2 × 4d × d", "Standard d_ff = 4d"],
+    ["MLP layer 2", "8d²", "2 × d × 4d", "Standard d_ff = 4d"],
+    ["Total (weight terms)", "24d² ≈ 2N/L", "N ≈ 12Ld²", "Forward pass; multiply by 3 for training"],
+    ["Training total", "6N per token", "2N fwd + 4N bwd", "The 6N rule; excludes sequence-length term"],
+  ]}
+/>
+
+---
+
+## Where modern blocks diverge from the 2017 baseline {#frontier-divergences}
+
+This chapter has introduced the transformer block as Vaswani et al. defined it in 2017. Every frontier model today is built on the same skeleton — residual stream, attention sub-layer, MLP sub-layer — but diverges from the 2017 baseline in a predictable set of ways. The following table maps those divergences to the chapters that cover them.
+
+<ComparisonTable
+  caption="Modifications to the 2017 transformer baseline adopted by frontier labs, with approximate adoption timeline and pointer to the chapter treating each in depth."
+  columns={["Modification", "What changed from 2017", "When broadly adopted", "Chapter"]}
+  rows={[
+    ["RMSNorm", "Remove mean subtraction from LayerNorm; cheaper compute, similar quality", "2019–2022; universal in frontier models by 2023", "00d"],
+    ["Pre-norm placement", "Move LayerNorm inside the residual branch, before each sublayer", "GPT-2 (2019); standard by GPT-3 (2020)", "00d, and this chapter §Pre-norm vs post-norm"],
+    ["RoPE positional encoding", "Replace learned absolute embeddings with rotary encoding in attention", "GPT-NeoX (2022), Llama (2023); universal by 2024", "00c"],
+    ["GQA / MQA", "Reduce K/V heads from h to h/g; cuts KV cache by factor g at modest quality cost", "GQA paper (2023); Llama 2+ (2023–2024)", "00b"],
+    ["MLA (Multi-head Latent Attention)", "Compress K/V into a low-rank latent; further reduces KV cache", "DeepSeek-V2 (2024)", "00b"],
+    ["SwiGLU activation", "Replace ReLU/GELU with gated linear unit; three weight matrices, d_ff = 8/3 d", "PaLM (2022), Llama (2023); standard by 2024", "00e"],
+    ["QK-norm", "Normalise Q and K vectors before dot-product; prevents attention logit blow-up", "Gemma 3 (2025), OLMo 2 (2025)", "00d"],
+    ["Mixture-of-experts MLP", "Replace dense MLP with sparse top-k routing over expert sub-networks", "Mixtral (2023), DeepSeek-V3 (2024)", "00h"],
+    ["Context extension: YaRN / LongRoPE", "Rescale RoPE base frequencies or interpolate positions for longer context", "2023–2024, used in Llama 3.1 and others", "00c"],
+  ]}
+/>
+
+The skeleton — residual stream, scaled dot-product attention, MLP, residual addition — has remained unchanged throughout this progression. Modifications are layered on top of or swapped into specific positions within the skeleton. This modularity is why the field can share results across model families: GQA is a drop-in replacement for MHA at the projection level; RMSNorm is a drop-in replacement for LayerNorm at the normalisation level; SwiGLU is a drop-in replacement for ReLU-MLP at the activation level.
+
+---
+
+<Sources items={[
+  {
+    authors: "Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original transformer: post-norm placement, MHA, ReLU-MLP, scaled dot-product attention with 1/√d_k scaling."
+  },
+  {
+    authors: "Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I.",
+    year: 2019,
+    title: "Language Models are Unsupervised Multitask Learners",
+    venue: "OpenAI Blog",
+    url: "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf",
+    note: "GPT-2: introduced pre-norm placement, GELU activation, and 1/√N output-projection scaling."
+  },
+  {
+    authors: "Brown, T., Mann, B., Ryder, N., et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "GPT-3: 175B parameters, 96 layers, d_model = 12 288, 96 heads; confirmed pre-norm at scale."
+  },
+  {
+    authors: "Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and Amodei, D.",
+    year: 2020,
+    title: "Scaling Laws for Neural Language Models",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2001.08361",
+    note: "Establishes the 6N FLOPs/token rule; compute-optimal training budget as a function of N and D."
+  },
+  {
+    authors: "Elhage, N., Nanda, N., Olsson, C., Henighan, T., Joseph, N., Mann, B., Askell, A., Bai, Y., Chen, A., Conerly, T., DasSarma, N., Drain, D., Ganguli, D., Hatfield-Dodds, Z., Hernandez, D., Jones, A., Kernion, J., Lovitt, L., Ndousse, K., Amodei, D., Brown, T., Clark, J., Kaplan, J., McCandlish, S., and Olah, C.",
+    year: 2021,
+    title: "A Mathematical Framework for Transformer Circuits",
+    venue: "Transformer Circuits Thread",
+    url: "https://transformer-circuits.pub/2021/framework/index.html",
+    note: "Introduces the residual-stream framing: linear read/write, heads as independent operations, no privileged basis."
+  },
+  {
+    authors: "Liu, L., Liu, X., Gao, J., Chen, W., and Han, J.",
+    year: 2020,
+    title: "Understanding the Difficulty of Training Transformers",
+    venue: "EMNLP 2020",
+    url: "https://arxiv.org/abs/2004.08249",
+    note: "Gradient-flow analysis of post-norm instability; introduces Admin initialisation; motivates pre-norm adoption."
+  },
+  {
+    authors: "Shleifer, S., Weston, J., and Ott, M.",
+    year: 2021,
+    title: "NormFormer: Improved Transformer Pretraining with Extra Normalization",
+    venue: "arXiv / ICLR",
+    url: "https://arxiv.org/abs/2110.09456",
+    note: "Three extra normalisation operations per block; 24% faster convergence on a 1.3B model; conceptual precursor to Peri-LN."
+  },
+  {
+    authors: "Korthikanti, V., Casper, J., Lym, S., McAfee, L., Andersch, M., Shoeybi, M., and Catanzaro, B.",
+    year: 2022,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "MLSys 2023",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Selective activation recomputation: store only block-boundary tensors, recompute the rest; ~5× memory reduction."
+  },
+  {
+    authors: "Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., Casas, D. de L., Hendricks, L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican, K., Driessche, G. van den, Damoc, B., Guy, A., Osindero, S., Simonyan, K., Elsen, E., Rae, J. W., Vinyals, O., and Sifre, L.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models (Chinchilla)",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "Confirms the 6N FLOPs/token rule; shows optimal allocation of compute between N and D."
+  },
+  {
+    authors: "Meta Llama Team",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama 3.1 405B: 126 layers, d_model = 16 384, 128 query heads, 8 KV heads (GQA), pre-norm RMSNorm, SwiGLU, RoPE."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "671B total / 37B active; MLA attention; DeepSeekMoE; pre-norm RMSNorm; multi-token prediction."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "First major adoption of Peri-LN (pre + post normalisation per sublayer); GQA; RMSNorm."
+  },
+  {
+    authors: "AllenAI",
+    year: 2025,
+    title: "OLMo 2: Smarter Language Models",
+    venue: "arXiv / COLM 2025",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "Post-norm placement inside residual; QK-norm; fully open weights and training code."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2025,
+    title: "Gemma 3 Technical Report",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2503.19786",
+    note: "Continues Peri-LN; QK-norm instead of soft-capping; interleaved sliding-window and global attention."
+  },
+  {
+    authors: "Nguyen, D., Chiley, V., Baskaran, M., Nguyen, T., Shah, V., Reza, M., Young, J., Garg, A., Kley, H., Mathur, N., Shen, A., and DeCoste, D.",
+    year: 2025,
+    title: "Peri-LN: Revisiting Layer Normalization in the Transformer Architecture",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2502.02732",
+    note: "Formalises Peri-LN; demonstrates Gemma 2 and OLMo 2 independently adopted it; ablations at 400M–3.2B."
+  },
+  {
+    authors: "Zhuo, B., Zhao, Y., Chen, Y., Ma, J., Liu, Z., and Ren, T.",
+    year: 2025,
+    title: "HybridNorm: Towards Stable and Efficient Transformer Training via Hybrid Normalization",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2503.04598",
+    note: "QKV normalisation in attention + post-norm FFN; 1.4× convergence speedup vs. pre-norm; NeurIPS 2025 per abstract listing."
+  },
+  {
+    authors: "Chen, C., Zhang, T., Li, Y., Peng, B., Xu, S., and Song, Y.",
+    year: 2026,
+    title: "Post-LayerNorm Is Back: Stable, Expressive, and Deep",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2601.19895",
+    note: "Keel: Highway-style gated residuals enable stable post-LN training at >1 000 layers. Research-stage as of May 2026; no confirmed production adoption."
+  },
+  {
+    authors: "Casson, A.",
+    year: 2023,
+    title: "Transformer FLOPs",
+    venue: "adamcasson.com",
+    url: "https://www.adamcasson.com/posts/transformer-flops",
+    note: "Clean derivation of per-component FLOPs; derivation of the 2N forward and 6N training rules."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2022,
+    title: "Transformer Math 101",
+    venue: "EleutherAI Blog",
+    url: "https://blog.eleuther.ai/transformer-math/",
+    note: "Practical formulas for FLOPs, activation memory (with tensor-parallel degree), and KV cache sizing."
+  },
+  {
+    authors: "Google (JAX team)",
+    year: 2024,
+    title: "How to Scale Your Model (Scaling Book)",
+    venue: "jax-ml.github.io",
+    url: "https://jax-ml.github.io/scaling-book/transformers/",
+    note: "FLOPs per component, KV cache formulas, numerical MoE examples; the most complete public compute accounting."
+  },
+  {
+    authors: "kipply",
+    year: 2022,
+    title: "Transformer Inference Arithmetic",
+    venue: "kipp.ly",
+    url: "https://kipp.ly/p/transformer-inference-arithmetic",
+    note: "KV cache sizing, memory bandwidth requirements, compute-bound vs. memory-bound analysis for serving."
+  },
+  {
+    authors: "Raschka, S.",
+    year: 2025,
+    title: "The Big LLM Architecture Comparison",
+    venue: "Ahead of AI",
+    url: "https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison",
+    note: "Comparative architecture table covering 18 models from 2024–2025; definitive survey of frontier choices as of early 2025."
+  },
+]} />

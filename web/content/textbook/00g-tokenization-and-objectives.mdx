@@ -1,0 +1,669 @@
+---
+slug: 00g-tokenization-and-objectives
+title: Tokenisation, embeddings, and training objectives
+description: BPE and SentencePiece, glitch-token failure modes, tied embeddings, embedding-norm growth, and the menagerie of pretraining objectives (CLM, FIM, MTP, label smoothing) in 2026.
+order: 7
+chapter: 7
+reading_minutes: 30
+depends_on: [00a-transformer]
+provides: [bpe, sentencepiece, tied-embeddings, embedding-norm-growth, causal-lm, fim, mtp]
+last_reviewed: 2026-05-11
+---
+
+## From raw bytes to training signal
+
+Every frontier language model begins with the same problem: the real-valued computations inside a transformer have no natural interface to the variable-length, discrete byte sequences that make up text. The tokeniser is the adapter between those two worlds. It discretises a byte stream into a finite vocabulary of subword units, each of which receives an embedding vector that enters the residual stream. At the other end of the model, the same embedding matrix (or a separate one) projects back to a probability distribution over vocabulary. The training objective then defines what that distribution must predict.
+
+This chapter traces the full pipeline: how modern tokenisers are built (§ [BPE](#bpe) and § [SentencePiece](#sentencepiece)), what goes wrong when the tokeniser and the training corpus are misaligned (§ [Glitch tokens](#glitch-tokens)), how the embedding layer is parametrised and why its norms can grow dangerously during training (§ [Tied embeddings](#tied-embeddings) and § [Embedding-norm growth](#embedding-norm-growth)), and finally the family of training objectives that supervise the model (§ [Causal LM](#causal-lm), § [FIM](#fim), § [MTP](#mtp), § [Label smoothing](#label-smoothing)).
+
+<Callout variant="note" title="Calibration date">
+Content calibrated to frontier-model practice as of May 2026. The underlying algorithms are stable; the vocabulary-size and objective-choice tables age fastest. Recheck every 6–12 months.
+</Callout>
+
+**Notation used in this chapter.** $V$ denotes vocabulary size. $d$ denotes the model (residual-stream) dimension, written $d_{\text{model}}$ where disambiguation is needed. $T$ is sequence length in tokens. $E \in \mathbb{R}^{V \times d}$ is the input embedding matrix; $W_U \in \mathbb{R}^{d \times V}$ is the output (unembedding) matrix. Log and entropy are in nats unless otherwise noted (matching PyTorch and JAX defaults).
+
+---
+
+## Byte pair encoding {#bpe}
+
+### Mechanism
+
+Byte pair encoding (BPE) is a greedy, bottom-up subword segmentation algorithm originally proposed for data compression by Gage (1994) and adapted for neural machine translation by Sennrich, Haddow & Birch (2016).<Sidenote>Sennrich et al. (ACL 2016, arXiv:1508.07909) introduced BPE for vocabulary control in NMT, replacing the ad hoc heuristic of splitting on hyphens and rare words.</Sidenote>
+
+**Construction algorithm.** Given a target vocabulary size $V$ and a training corpus:
+
+1. Initialise the vocabulary with all character types that appear in the corpus (or all 256 byte values in byte-level BPE).
+2. Count every adjacent pair of symbols in the corpus.
+3. Find the most frequent pair $(a, b)$.
+4. Create a new symbol $ab$ and add a merge rule $a \, b \to ab$ to the ordered merge table.
+5. Replace every occurrence of $a \, b$ in the corpus with $ab$.
+6. Repeat steps 2–5 until the vocabulary reaches size $V$.
+
+The output is an ordered list of merge rules. To tokenise new text, apply those rules greedily in merge order: scan left to right, apply the earliest applicable rule, repeat.
+
+**Byte-level BPE (GPT-2).** Radford et al. (2019) used all 256 byte values as the base vocabulary, guaranteeing that any Unicode input can be represented without an unknown-token fallback. GPT-2 uses a regex pre-tokeniser that splits input on categories such as letters, digits, punctuation, and whitespace before applying merges — this prevents merges from crossing character-category boundaries, which improves tokenisation of code and numeric strings. The final vocabulary is 50,257 (256 bytes + 50,000 merges + one end-of-text token).
+
+**tiktoken.** OpenAI's production tokenisation library implements byte-level BPE in Rust, using the same pre-tokeniser logic as GPT-2 but at higher throughput. The two current production vocabularies are `cl100k_base` (~100,256 tokens, used by GPT-4) and `o200k_base` (~199,997 tokens, used by GPT-4o and GPT-5) — the larger vocabulary adds broader non-Latin script coverage. Meta's Llama 3 tokeniser is tiktoken-based with vocabulary size 128,256, and Meta reports it encodes English text in roughly 15% fewer tokens than the Llama 2 SentencePiece tokeniser at 32K vocabulary.
+
+### Math
+
+Let the corpus be a multiset of character-split word forms, each annotated with its count. Define the pair frequency $f(a,b)$ as the total count of adjacent symbol pair $(a,b)$ across all word occurrences in the corpus. Each merge selects:
+
+$$\text{merge}^* = \arg\max_{(a,b)} f(a,b)$$
+
+This is greedy and globally suboptimal: merging the most frequent pair now may prevent merging an even-more-useful pair later. BPE makes no claim of optimality — it is efficient and empirically effective.
+
+### Worked example
+
+Consider the toy corpus below (word: count format):
+
+| Word | Count |
+|------|-------|
+| `low` | 5 |
+| `lower` | 2 |
+| `newest` | 6 |
+| `widest` | 3 |
+
+After character splitting with an end-of-word marker (written `·`), the representations are:
+
+```
+l o w ·  (×5)
+l o w e r ·  (×2)
+n e w e s t ·  (×6)
+w i d e s t ·  (×3)
+```
+
+**Step 1.** Count all adjacent pairs. The pair `e s` appears: 6 times (in `newest`) + 3 times (in `widest`) = **9 times** — the maximum. Merge rule 1: $e \, s \to es$.
+
+After merge:
+
+```
+l o w ·  (×5)
+l o w e r ·  (×2)
+n e w es t ·  (×6)
+w i d es t ·  (×3)
+```
+
+**Step 2.** Re-count pairs. The pair `es t` appears: 6 + 3 = **9 times**. Merge rule 2: $es \, t \to est$.
+
+After merge:
+
+```
+l o w ·  (×5)
+l o w e r ·  (×2)
+n e w est ·  (×6)
+w i d est ·  (×3)
+```
+
+**Step 3.** Highest-frequency pair: `est ·` appears 9 times. Merge rule 3: $est \, \cdot \to est·$.
+
+**Step 4.** Now `l o` (frequency 7) becomes the leader. Merge rule 4: $l \, o \to lo$.
+
+**Step 5.** `lo w` (frequency 7). Merge rule 5: $lo \, w \to low$.
+
+After five merges the vocabulary has grown from the base 12 characters to 17 entries, and the word `lowest` (if it appeared) would now be split `low est·` rather than six individual characters. The merge table is ordered — tokenisation of unseen text applies these rules in the same sequence, step 1 through step $N$, giving deterministic segmentation.
+
+### Vocabulary-size tradeoffs
+
+<ComparisonTable
+  caption="Frontier model tokeniser vocabulary sizes as of May 2026. Larger vocabularies reduce sequence length but increase embedding matrix size."
+  columns={["Model", "Vocabulary size", "Algorithm", "Source"]}
+  rows={[
+    ["GPT-2 (2019)", "50,257", "Byte-level BPE", "Radford et al. 2019"],
+    ["LLaMA 2 (2023)", "32,000", "SentencePiece BPE", "Touvron et al. 2023"],
+    ["GPT-4 (2023)", "~100,256 (cl100k_base)", "Byte-level BPE", "tiktoken docs"],
+    ["LLaMA 3 (2024)", "128,256", "Byte-level BPE (tiktoken-based)", "Meta blog, April 2024"],
+    ["DeepSeek-V3 (2024)", "128,000", "Byte-level BPE", "arXiv:2412.19437"],
+    ["GPT-4o / GPT-5 (2024+)", "~199,997 (o200k_base)", "Byte-level BPE", "tiktoken docs"],
+    ["Gemini (2024)", "262,000", "SentencePiece", "Community analysis; not officially confirmed"],
+  ]}
+/>
+
+The embedding matrix $E \in \mathbb{R}^{V \times d}$ grows linearly with $V$. At $d = 4096$ and $V = 128\text{k}$, the embedding matrix holds $128000 \times 4096 \approx 524\text{M}$ parameters — roughly 7.5% of a 7B model's total parameter count. At $V = 256\text{k}$ that doubles to ~1.05B, which is non-trivial even in a 70B model. The vocabulary-size decision therefore involves a three-way tradeoff: smaller $V$ yields longer sequences (quadratic attention cost), larger $V$ compresses sequences but inflates embedding cost and increases the risk of undertrained tokens.
+
+---
+
+## SentencePiece and the unigram language model {#sentencepiece}
+
+### Mechanism
+
+Where BPE builds a vocabulary by merging up from characters, the unigram language model tokeniser (Kudo 2018) starts from a large candidate vocabulary and prunes down. The algorithm:
+
+1. Initialise a large candidate set (typically all substrings up to a length limit, or a large initial BPE vocabulary).
+2. Assign an initial probability to each candidate token by maximum-likelihood estimation over the corpus.
+3. Compute, for each token $t$ in the vocabulary, the increase in total corpus log-likelihood if $t$ were removed — formally, the loss $\ell(t)$ from pruning $t$.
+4. Remove the $p$\% of tokens with the smallest $\ell(t)$ (i.e., those whose removal costs the least).
+5. Repeat steps 2–4 until the vocabulary reaches size $V$.
+
+Segmentation of a string $x$ uses the Viterbi algorithm to find the most probable segmentation:
+
+$$\mathbf{s}^* = \arg\max_{\mathbf{s} \in \mathcal{S}(x)} \prod_{i} p(s_i)$$
+
+where $\mathcal{S}(x)$ is the set of all segmentations of $x$ into vocabulary tokens and $p(s_i)$ is the unigram probability of token $s_i$.
+
+**Probabilistic sampling.** Unlike BPE, the unigram model can sample from the full distribution over segmentations during training (not just use the Viterbi-optimal one). This introduces a form of data augmentation: the same string appears with different segmentations across training steps, acting as a regulariser. Kudo (2018) called this "subword regularisation" and reported improvements in downstream NMT quality.
+
+**SentencePiece library.** Kudo & Richardson (2018) packaged both BPE and unigram LM into the SentencePiece library, with one critical difference from character-level BPE: SentencePiece operates directly on raw text without a whitespace pre-tokeniser. Leading whitespace is encoded as a special `▁` character, making segmentation language-independent. This is why SentencePiece models can handle Japanese, Thai, and other whitespace-free scripts natively. SentencePiece powers T5, Gemma, LLaMA 1 and 2, Mistral, and most non-OpenAI frontier models requiring strong multilingual coverage.
+
+### Algorithm comparison
+
+<ComparisonTable
+  caption="Comparison of the four main subword tokenisation algorithms. Frontier model users reflect 2024–2026 deployment."
+  columns={["Attribute", "BPE", "Byte-level BPE", "Unigram LM (SentencePiece)", "WordPiece"]}
+  rows={[
+    ["Merge direction", "Bottom-up greedy", "Bottom-up greedy (byte base)", "Top-down probabilistic pruning", "Bottom-up, likelihood-maximising"],
+    ["Deterministic?", "Yes", "Yes", "No — stochastic sampling available", "Yes"],
+    ["Handles OOV?", "No — needs `<unk>` fallback", "Yes — byte decomposition", "Yes — character fallback", "Partial (`##UNK`)"],
+    ["Pre-tokenisation required?", "Yes — whitespace split", "No — raw bytes", "No — `▁` prefix encodes whitespace", "Yes — whitespace split"],
+    ["Frontier model users (2024–2026)", "GPT-2, LLaMA 2", "GPT-3/4/4o, LLaMA 3, DeepSeek-V3", "T5, Gemma, LLaMA 1/2, Mistral", "BERT, DeBERTa"],
+    ["Primary source", "Sennrich et al. 2016", "Radford et al. 2019", "Kudo 2018; Kudo & Richardson 2018", "Schuster & Nakamura 2012"],
+  ]}
+/>
+
+---
+
+## Glitch tokens and tokeniser failure modes {#glitch-tokens}
+
+### The structural mismatch
+
+Tokenisers are trained on one corpus snapshot (often a large web crawl) and then frozen. The model's pretraining corpus is almost always a different — and usually larger — corpus assembled later. Tokens that appear frequently enough in the tokeniser training data to receive a merge rule may appear rarely or not at all in the model's actual pretraining data. The corresponding embedding row then receives negligible gradient signal and remains near its random initialisation.
+
+This mismatch is structural, not accidental: tokeniser training and model pretraining are separate processes with separate data pipelines.
+
+### SolidGoldMagikarp and the failure mode
+
+The problem was first documented publicly by Rumbelow & Watkins (January 2023) in an Alignment Forum post titled "SolidGoldMagikarp (plus, prompt generation)." The username "SolidGoldMagikarp" — from the Reddit community r/counting — appeared heavily in the tokeniser training corpus (which included large Reddit dumps) but was apparently absent or near-absent in the GPT-3 family's actual pretraining data. When the model was prompted to repeat the token, it would produce semantically unrelated outputs or deflect entirely — behaviour consistent with an embedding vector that points in an essentially arbitrary direction and has no stable downstream association.
+
+The failure modes cluster into three observable patterns:
+
+- **Repetition failure.** Prompt `Repeat the word X` where X is a glitch token; the model changes topic, repeats a different word, or produces grammatically incoherent output.
+- **Definition confabulation.** Prompt `What does X mean?`; the model invents a confident but internally inconsistent definition.
+- **Adversarial exploitation.** Glitch tokens appear in adversarial suffix attacks designed to bypass instruction-following fine-tuning, because the refusal-trained behaviour was never activated during training for those token inputs.
+
+### Systematic detection
+
+Land & Bartolo (2024) — "Fishing for Magikarp" (EMNLP 2024, arXiv:2405.05417) — developed three complementary detection methods:
+
+1. **Tokeniser-corpus frequency analysis.** Count the raw frequency of each token in the tokeniser training corpus. Tokens below a frequency threshold are candidates.
+2. **Weight-space indicators.** Examine embedding rows: anomalously low L2 norm or anomalously low cosine similarity to the token's nearest neighbours in vocabulary space both flag undertrained tokens.
+3. **Prompting-based detection.** Ask the model to repeat or define each candidate token; check for inconsistent or semantically displaced outputs.
+
+Across 3 million predictions on GPT-2, 510 of its 50,257 tokens were never output by the model at all. 85% of glitch tokens identified by the weight-space and prompting methods fell within that never-output set. The code is publicly available at https://github.com/cohere-ai/magikarp/.
+
+GlitchMiner (arXiv:2410.15052, 2024) extends this with gradient-guided discrete search, efficiently finding glitch tokens without brute-force enumeration over the full vocabulary.
+
+### BPE subtoken artefacts
+
+A related but distinct failure mode: two tokens that differ only in a leading space — e.g., `" ory"` and `"ory"` — may occupy very different regions of embedding space despite representing what feels like the same morpheme. This "BPE Subtoken Artefact" (BSA) pattern was described in a 2024 LessWrong post and has not been peer-reviewed as of May 2026, but the underlying observation (inconsistent embeddings for adjacent-whitespace variants) is consistent with the known structure of byte-level BPE.
+
+### Mitigations
+
+<Callout variant="warning" title="Audit before training">
+For a new model, audit token frequency against the actual pretraining corpus before the run begins. Rare tokens — those appearing fewer than, say, 100 times across the entire corpus — should either be removed from the vocabulary or initialised by averaging the byte-decomposition embeddings of their constituent bytes rather than randomly.
+</Callout>
+
+Three mitigations appear in the literature:
+
+1. **Pre-training frequency audit.** Remove or re-initialise tokens whose frequency in the pretraining corpus falls below a threshold before the training run. This cannot be done retroactively for deployed models.
+2. **Token-boundary stochastic splitting.** DeepSeek-V3 (December 2024, arXiv:2412.19437) mentions randomly splitting certain multi-byte tokens during training, which ensures their constituent sub-tokens also receive gradient signal.
+3. **Corpus scale.** Larger pretraining corpora give more coverage to rare tokens organically; at 15T+ tokens, even niche tokens may appear thousands of times. This is not a principled mitigation but partially explains why glitch tokens were more prominent in GPT-2 (WebText, ~40B tokens) than in models trained on modern trillion-token corpora.
+
+---
+
+## Tied vs untied embeddings {#tied-embeddings}
+
+### The two matrices
+
+A transformer language model has two weight matrices that interface between token space and model space:
+
+- **Input embedding matrix** $E \in \mathbb{R}^{V \times d}$: maps token index $i$ to a $d$-dimensional vector $e_i = E[i, :]$ that enters the residual stream.
+- **Output (unembedding) matrix** $W_U \in \mathbb{R}^{d \times V}$: maps the final residual-stream vector $h \in \mathbb{R}^d$ to unnormalised logits $\ell = W_U^{\top} h \in \mathbb{R}^V$, which are then softmaxed to a probability distribution.
+
+"Tied embeddings" sets $W_U = E^{\top}$, sharing a single $V \times d$ parameter matrix for both operations.
+
+### Parameter savings
+
+For $V = 128\text{k}$, $d = 4096$:
+
+- **Untied:** $2 \times 128000 \times 4096 = 1{,}048\text{M}$ parameters for the two matrices.
+- **Tied:** $128000 \times 4096 = 524\text{M}$ parameters — a saving of $\approx 524\text{M}$.
+
+For a 7B model, this saving is roughly 7.5% of total parameters; for a 70B model, roughly 0.75% — diminishing relative importance at scale.
+
+### Origin and rationale
+
+Press & Wolf (2017) — "Using the Output Embedding to Improve Language Models" (EACL 2017, arXiv:1608.05859) — observed that in trained models the untied output embedding evolves to resemble the input embedding in geometric structure: words with similar meanings end up close in both matrices. This redundancy suggested that tying them would be lossless or beneficial. Their experiments showed tying improved perplexity on language modelling benchmarks and halved the size of the embedding component.
+
+### Why untied wins at scale
+
+A March 2026 paper (arXiv:2603.26663) by Anthropic-adjacent authors<Sidenote>The paper's institution is not publicly confirmed as of May 2026; the citation should be taken as "arXiv:2603.26663" without asserting the authorship.</Sidenote> proposed a mechanism: during early training, output gradients (from the unembedding direction) dominate because the loss is largest and most of the gradient flows back through $W_U$. When $W_U = E^{\top}$, those output gradients overwrite the input embedding matrix, biasing it toward the unembedding function rather than toward a general representation of token identity. Tuned-lens analysis of models trained with tied vs. untied embeddings showed that tied models have weaker contributions from early layers to the final prediction — consistent with the embedding rows being pulled toward a specialised output direction.
+
+<Callout variant="note" title="Rule of thumb (2025)">
+Tie embeddings for models at or below 3B parameters, where the parameter saving is proportionally significant and the representation-quality loss is small. Untie for models at 7B and above, where representation quality matters more than the marginal saving.
+</Callout>
+
+<ComparisonTable
+  caption="Tied vs untied embedding practice across frontier models (May 2026)."
+  columns={["Model", "Tied?", "Vocab size", "Parameter saving (approx.)", "Source"]}
+  rows={[
+    ["GPT-2 117M (2019)", "Yes", "50,257", "~100M (large fraction of small model)", "Radford et al. 2019"],
+    ["LLaMA 2 7B (2023)", "Yes", "32,000", "~262M", "Touvron et al. 2023"],
+    ["LLaMA 3 8B (2024)", "No", "128,256", "—", "Meta blog, April 2024"],
+    ["OLMo 2 (2024)", "No", "—", "—", "AI2, 2024"],
+    ["Qwen3 small (2025)", "Yes", "—", "—", "Qwen3 blog, 2025"],
+    ["Qwen3 large (2025)", "No", "—", "—", "Qwen3 blog, 2025"],
+    ["DeepSeek-V3 (2024)", "Not reported", "128,000", "—", "arXiv:2412.19437 (not disclosed)"],
+  ]}
+/>
+
+---
+
+## Embedding-norm growth at scale {#embedding-norm-growth}
+
+### The problem
+
+The residual stream entering the first transformer block is simply the embedding $E[x_t]$. Ideally this vector has the same scale as the hidden representations produced by later layers — both contribute additively through the residual connection. In practice, the L2 norms of embedding rows grow during training, and in runs with aggressive learning rates this growth can be large. Buzdugan et al. (2024, arXiv:2410.16682) measured that in diverging training runs, the L2 norms of QKV and projection layer outputs grew by 2× or more relative to converging runs during the same window.
+
+Because queries and keys are linear projections of the residual stream, a large embedding norm at layer 0 propagates into large attention logits:
+
+$$\text{logit}_{ij} = \frac{(W_Q h_i) \cdot (W_K h_j)^{\top}}{\sqrt{d_h}}$$
+
+If $\| h_i \|$ doubles, logits grow proportionally, the softmax sharpens toward one-hot, and gradients for non-attended positions vanish. This is the attention-logit blowup discussed in the context of QK-norm in chapter [00d — Normalisation and initialisation](/textbook/00d-normalization-and-init#qk-norm); the embedding layer is the upstream source of the instability.
+
+### Two complementary fixes
+
+**Fix 1: Embedding LayerNorm.** Place a LayerNorm immediately after the embedding lookup, before the first residual block. This forces the embedding output to unit variance before it enters the residual stream. Without it, embedding vectors can be an order of magnitude larger than attention outputs at initialisation or early in training, dominating the residual signal.
+
+**Fix 2: QK-norm.** Apply LayerNorm to the query and key tensors just before the dot product. This caps the maximum attention logit regardless of the upstream residual-stream magnitude. Buzdugan et al. (2024) report that QKV-norm and QK-norm-cap enable stable training at 1.5× higher learning rate than the baseline, with perplexity reaching 10.85 vs. 11.19 on 0.2T tokens.
+
+The two fixes address different links in the causal chain: embedding LayerNorm prevents the large norm from entering the residual stream at all; QK-norm prevents whatever large norm does enter from causing attention collapse. Frontier models typically apply at least one; some apply both.
+
+<Callout variant="info" title="Peri-LayerNorm (2025)">
+Peri-LN (arXiv:2502.02732, 2025) applies LayerNorm both before and after each attention and MLP sub-layer, normalising both the residual-stream input and the sub-layer output. This creates self-regulating activation variance across depth, allowing stable training at extreme model depths without the exponential norm growth sometimes seen with standard Pre-LN. As of May 2026 this is a research result, not confirmed standard practice in any published frontier model.
+</Callout>
+
+---
+
+## Causal language modelling {#causal-lm}
+
+### Mechanism
+
+Causal language modelling (CLM) is the pretraining objective for every frontier autoregressive model in production as of May 2026: GPT-4 and GPT-5, LLaMA 3, Qwen 3, Mistral, and DeepSeek-V3 all use it as their primary loss. Given a sequence of tokens $(x_1, x_2, \dots, x_T)$, CLM trains the model to assign high probability to each token given all preceding tokens:
+
+$$\mathcal{L}_{\text{CLM}} = -\frac{1}{T} \sum_{t=1}^{T} \log p_\theta(x_t \mid x_1, \dots, x_{t-1})$$
+
+The causal attention mask enforces the autoregressive constraint: position $i$ can only attend to positions $j \leq i$.
+
+### Why CLM displaced MLM and prefix LM
+
+Wang et al. (2022) — "What Language Model Architecture and Pretraining Objective Work Best for Zero-Shot Generalization?" (ICML 2022, arXiv:2204.05832) — ran systematic comparisons of causal decoder, non-causal decoder, and encoder-decoder architectures with multiple objectives. The finding: causal decoder with CLM provides the best zero-shot generalisation on a multi-task benchmark, and the margin increases with scale. Combined with compute efficiency (CLM processes each sequence exactly once; masked LM must process masked positions separately or wastes capacity on non-masked positions), this established CLM as the consensus objective by 2022–2023.
+
+**Masked LM (legacy).** BERT (Devlin et al., 2018) masked 15% of input tokens and trained a bidirectional encoder to reconstruct them. MLM produces strong representations for classification and NLU — DeBERTa and domain-specific BERT variants remain in production for these tasks — but the architecture cannot naturally generate open-ended text: there is no causal ordering to extend. As of 2024–2026, MLM is a legacy encoder pre-training objective; no frontier generation model uses pure MLM.
+
+**Prefix LM.** A prefix of tokens attends bidirectionally; the continuation is generated autoregressively. T5's span-corruption denoising is a variant. Wang et al. (2022) showed prefix LM offers no generalisation advantage over pure CLM, and it complicates KV-cache management. No frontier generation model as of May 2026 uses prefix LM as its primary objective.
+
+### What loss at scale means
+
+Cross-entropy in nats is the standard unit. Converting between representations:
+
+$$\text{PPL} = e^{\mathcal{L}_{\text{CLM}}}$$
+$$\text{bits-per-token} = \mathcal{L}_{\text{CLM}} \times \log_2(e) \approx \mathcal{L}_{\text{CLM}} \times 1.4427$$
+
+Calibration anchors (May 2026):
+
+| Reference point | Loss (nats) | Perplexity |
+|---|---|---|
+| Uniform over $V = 128\text{k}$ | $\ln(128000) \approx 11.76$ | 128,000 |
+| GPT-2 117M on WebText (2019) | ~3.5 | ~33 |
+| LLaMA 3 8B on its holdout set (inferred) | ~2.3–2.5 | ~10–12 |
+| Frontier 70–100B models (estimated) | ~1.8–2.2 | ~6–9 |
+| Human inter-annotator entropy (familiar text) | ~1.2–1.7 | ~3–5 |
+
+<Callout variant="warning" title="Cross-model loss comparisons are confounded">
+A loss of 2.0 nats for one model is not directly comparable to 2.0 nats for another model if they use different tokenisers (different $V$, different average token granularity) or different evaluation domains. Bits-per-character (BPC) is the tokenisation-agnostic metric: $\text{BPC} = \mathcal{L} \times \log_2(e) / \overline{c}$ where $\overline{c}$ is the mean number of characters per token. Shannon entropy of English is estimated at 0.6–1.2 bits per character depending on context window; frontier models are approaching but have not consistently reached this range.
+</Callout>
+
+---
+
+## Fill-in-the-middle {#fim}
+
+### Mechanism
+
+Fill-in-the-middle (FIM) trains an autoregressive model to generate a middle span of text given its prefix and suffix, without any change to the model architecture. The trick is sequence rearrangement at training time: a fraction of training sequences are transformed into an infilling format before being fed to the same causal LM objective.
+
+Bavarian et al. (OpenAI, 2022, arXiv:2207.14255) proposed two rearrangement modes:
+
+**PSM (Prefix–Suffix–Middle):**
+
+$$\langle\texttt{fim\_prefix}\rangle \; P \; \langle\texttt{fim\_suffix}\rangle \; S \; \langle\texttt{fim\_middle}\rangle \; M \; \langle\texttt{eos}\rangle$$
+
+**SPM (Suffix–Prefix–Middle):**
+
+$$\langle\texttt{fim\_suffix}\rangle \; S \; \langle\texttt{fim\_prefix}\rangle \; P \; \langle\texttt{fim\_middle}\rangle \; M \; \langle\texttt{eos}\rangle$$
+
+Given a sequence $(P, M, S)$ split at two random positions, the model is trained to predict $M$ after seeing $P$ and $S$ — using the same cross-entropy loss that drives CLM. No additional parameters are required.
+
+**Why FIM matters.** Code completion in production IDE tools (GitHub Copilot, Cursor, JetBrains AI) is predominantly an infilling task: the cursor is inside existing code, and the model must generate tokens that fit the surrounding context. A left-to-right CLM model can only extend from the left edge; without FIM training it has no native capacity for infilling.
+
+### The FIM-rate hyperparameter
+
+Bavarian et al. (2022) claimed the "FIM-for-free" property: applying FIM transformation to fraction $r$ of training sequences up to $r = 0.9$ does not degrade left-to-right generation quality. This claim is optimistic. Code models trained since 2022 use more conservative rates:
+
+- StarCoder (Li et al., 2023): $r \approx 0.5$
+- DeepSeek-Coder (Guo et al., 2024): $r \approx 0.5$
+- DeepSeek-V3 (December 2024, arXiv:2412.19437): $r = 0.1$ (PSM format, document-level)
+
+The FIM-for-free property at $r = 0.9$ does not reliably replicate across architectures and data mixes; a conservative rate around 0.5 for code-specialist models and 0.1 for general models reflects 2024–2025 practice.
+
+### Special tokens in DeepSeek-V3
+
+DeepSeek-V3 uses three FIM special tokens: `<|fim_begin|>`, `<|fim_hole|>`, and `<|fim_end|>`. These are reserved vocabulary entries added during tokeniser construction and initialised at training time alongside the standard vocabulary.
+
+### Extensions (2025–2026)
+
+Structure-Aware FIM (AST-FIM, arXiv:2506.00204, 2025) replaces random span selection with AST-subtree masking: entire syntactically coherent code units (functions, blocks, expressions) are selected as the hole, better matching real developer editing patterns.
+
+Horizon-Length Prediction (HLP, arXiv:2410.03103, 2024) adds an auxiliary prediction head that forecasts the length of the missing middle segment before generating it, improving FIM pass@1 by up to 24% on standard code benchmarks.
+
+---
+
+## Multi-token prediction {#mtp}
+
+### Motivation
+
+Standard CLM predicts one token at each position: given $x_1, \dots, x_t$, predict $x_{t+1}$. Multi-token prediction (MTP) extends this: given the same context, simultaneously predict $x_{t+1}, x_{t+2}, \dots, x_{t+n}$. This provides $n$ gradient signals per position instead of one, increasing training efficiency per forward pass and potentially encouraging the model to maintain representations that are useful for predicting multiple steps ahead.
+
+### Meta FAIR formulation (2024)
+
+Gloeckle et al. (2024) — "Better & Faster Large Language Models via Multi-token Prediction" (Meta FAIR, arXiv:2404.19737) — used $n$ independent output heads operating on the shared model trunk. The trunk is unchanged; only the output layer is multiplied:
+
+$$\mathcal{L}_{\text{MTP}} = -\frac{1}{T} \sum_{t=1}^{T} \sum_{k=1}^{n} \log p_\theta^{(k)}\!\left(x_{t+k} \mid x_1, \dots, x_t\right)$$
+
+Each head $k$ has its own projection from the final hidden state to the vocabulary; there is no conditioning between heads — head $k$ does not see head $k-1$'s prediction or the ground-truth $x_{t+k-1}$. Gloeckle et al. tested $n = 4$.
+
+Results at 13B parameters: +12% on HumanEval, +17% on MBPP relative to single-token prediction. At inference, the additional heads serve as draft heads for speculative decoding: the main model verifies the draft in one forward pass. Achieved up to 3× faster generation.
+
+### DeepSeek-V3 formulation (2024)
+
+DeepSeek-V3 (arXiv:2412.19437, December 2024) uses a sequential MTP design with $D = 1$ extra token. Each MTP module has four components:
+
+1. Shared input embedding layer (same $E$ as the main trunk)
+2. A projection matrix $M_k \in \mathbb{R}^{d \times 2d}$ that combines the hidden state from depth $k-1$ with the ground-truth embedding of $x_{t+k-1}$
+3. A single additional Transformer block
+4. The shared output head $W_U$
+
+The projection step — incorporating the ground-truth previous token — is the key structural difference from the Meta formulation: each DeepSeek MTP module conditions on the actual prior token, not just the shared trunk state. This sequential conditioning makes the problem easier for each head but limits the design to small $D$ (DeepSeek uses $D = 1$ in practice).
+
+**Loss weighting.** The MTP loss is weighted by $\lambda$: $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CLM}} + \lambda \cdot \mathcal{L}_{\text{MTP}}$. DeepSeek-V3 uses $\lambda = 0.3$ for the first 10T training tokens, then reduces to $\lambda = 0.1$ for the remaining 4.8T tokens, gradually downweighting MTP as primary CLM training converges.
+
+**Inference.** The MTP head is used for speculative decoding with acceptance rate above 80%, yielding approximately 1.8× throughput improvement.
+
+### Comparison of the two formulations
+
+<ComparisonTable
+  caption="Meta FAIR vs DeepSeek-V3 multi-token prediction designs. Both use MTP heads as speculative-decoding drafters at inference."
+  columns={["Attribute", "Meta FAIR (Gloeckle et al. 2024)", "DeepSeek-V3 (DeepSeek 2024)"]}
+  rows={[
+    ["Extra heads", "n independent heads (n=4 tested)", "D=1 sequential module"],
+    ["Inter-head conditioning", "None — heads are independent", "Projection $M_k$ uses ground-truth $x_{t+k-1}$"],
+    ["Extra parameters", "n lightweight projection heads", "1 Transformer block + projection + output head"],
+    ["MTP loss weight", "Equal weight for all k", "λ=0.3 (first 10T tokens), λ=0.1 (final 4.8T)"],
+    ["Inference speedup", "Up to 3× (speculative decoding)", "~1.8× (>80% acceptance rate)"],
+    ["Primary source", "arXiv:2404.19737", "arXiv:2412.19437"],
+  ]}
+/>
+
+### The 2025–2026 landscape
+
+The field around MTP expanded significantly in 2025. An Awesome-MTP survey counts contributions from Apple, Google, ByteDance, UC Berkeley, Sony, Meta, and others. Notable developments:
+
+- **Future Summary Prediction (FSP, arXiv:2510.14751, 2025):** instead of predicting all $n$ future tokens individually, predict a compact summary of the next $N$ tokens — reducing speculative-decoding overhead while retaining the denser training signal.
+- **Parallel Token Prediction (arXiv:2512.21323, ICLR 2026):** a framework permitting consistent parallel generation and quadratic decoding verification, addressing consistency issues in earlier parallel draft schemes.
+- **ACL 2025 curriculum (aclanthology.org/2025.acl-long.1243):** pre-training curriculum beginning with standard NTP and adding extra prediction heads incrementally, reported to reduce instability during MTP warm-up.
+
+Whether Llama 4 (2025) or other closed-lab models shipped with MTP-enabled pretraining has not been confirmed in public documentation as of May 2026.
+
+---
+
+## Label smoothing {#label-smoothing}
+
+### Mechanism
+
+In standard CLM training the target distribution at each position is one-hot: the correct token receives probability 1, all others probability 0. Label smoothing (LS) replaces this with a smoothed distribution:
+
+$$p_{\text{LS}}(j \mid t) = \begin{cases} 1 - \varepsilon + \varepsilon/V & \text{if } j = y_t \\ \varepsilon / V & \text{otherwise} \end{cases}$$
+
+where $\varepsilon \in (0, 1)$ is the smoothing coefficient and $V$ is the vocabulary size. Vaswani et al. (2017) used $\varepsilon = 0.1$ in the original "Attention Is All You Need."
+
+The cross-entropy loss under label smoothing becomes:
+
+$$\mathcal{L}_{\text{LS}} = -(1 - \varepsilon) \log p_\theta(y_t) - \frac{\varepsilon}{V} \sum_{j=1}^{V} \log p_\theta(j)$$
+
+Rewriting using the cross-entropy $H(U, p_\theta)$ of the uniform distribution $U$ under the model:
+
+$$\mathcal{L}_{\text{LS}} = \mathcal{L}_{\text{CE}} + \varepsilon \bigl[H(U, p_\theta) - \log V\bigr]$$
+
+The second term penalises over-confidence: it is positive when the model assigns higher entropy than the uniform distribution, and negative (pushing toward higher entropy) when the model is over-confident.
+
+### Why it was used (2017–2021)
+
+Müller, Kornblith & Hinton (2019) — "When Does Label Smoothing Help?" (NeurIPS 2019, arXiv:1906.02629) — provided the empirical and geometric analysis:
+
+1. **Calibration.** LS prevents models from assigning probability approaching 1 to any single token, improving probability calibration on unseen data.
+2. **Beam search.** In sequence-to-sequence tasks with beam search, better calibration improves BLEU because length normalisers and hypotheses rank-order more accurately.
+3. **Representation clustering.** Examining penultimate-layer representations, LS causes within-class (same-label) representations to cluster more tightly, at a fixed margin from other classes — a geometry that supports generalisation.
+
+### Why frontier pretraining mostly dropped it (2022–2026)
+
+Two factors explain the shift away from label smoothing for pretraining:
+
+**1. Large vocabularies create intrinsic self-smoothing.** The ICLR 2025 paper "Towards Understanding Why Label Smoothing Degrades Performance in Large Vocabulary LLMs" showed that models with large hidden dimension $d$ and large vocabulary $V \gg d$ cannot produce arbitrarily low-entropy output distributions: the softmax over $V$ tokens with a $d$-dimensional logit vector has an entropy lower bound determined by the geometry. Frontier models with $V = 100\text{k}$–$200\text{k}$ tokens are already "self-smoothed" by their own parameterisation; adding explicit LS provides no additional calibration benefit.
+
+**2. LS damages knowledge distillation.** Müller et al. (2019) also showed — in the same paper that recommended LS — that LS harms distillation: a teacher trained with LS encodes less inter-class similarity in its logits (the soft targets become flatter), so the student receives a weaker learning signal. Since 2022, frontier pretraining increasingly involves data synthesised from prior model generations. Using LS in the teacher degrades the student.
+
+<Callout variant="note" title="LS at SFT vs pretraining">
+Label smoothing remains useful at the supervised fine-tuning (SFT) stage, where datasets are small (tens of thousands to a few million examples) and overfitting is a real risk. The evidence against LS applies specifically to pretraining at scale. Practitioners should not conflate the two settings.
+</Callout>
+
+No published frontier pretraining technical report from 2022 onward mentions $\varepsilon > 0$ for the primary CLM loss. The claim that frontier labs have dropped LS for pretraining is inferred from: (a) absence of LS mentions in Llama 1, PaLM, DeepSeek-V2/V3, and OLMo 2 tech reports; (b) the ICLR 2025 theoretical result; (c) community syntheses such as Nathan Lambert's "The State of Post-Training in 2025." Direct confirmation from Anthropic, OpenAI, and Google is not publicly available.
+
+---
+
+## Training objective summary {#objectives-summary}
+
+<ComparisonTable
+  caption="Training objectives used in frontier language model pretraining (May 2026). FIM and MTP are applied alongside CLM, not as replacements."
+  columns={["Objective", "Architecture bias", "Attention mask", "Used for open-ended generation?", "Frontier use (May 2026)"]}
+  rows={[
+    ["Causal LM (CLM)", "Decoder-only", "Causal (lower-triangular)", "Yes — the primary mode", "All frontier generation models"],
+    ["Masked LM (MLM)", "Encoder", "Bidirectional", "No — structurally incompatible", "BERT-family encoders only"],
+    ["Prefix LM", "Decoder / enc-dec", "Mixed (bidirectional prefix, causal continuation)", "Yes (continuation only)", "Legacy: T5, UL2; not new frontier"],
+    ["Fill-in-the-Middle (FIM)", "Decoder-only (sequence rearrangement)", "Causal (reordered)", "Infilling only", "Code models: CodeLlama, StarCoder2, DeepSeek-Coder, Qwen2.5-Coder, DeepSeek-V3"],
+    ["Multi-token prediction (MTP)", "Decoder-only + extra heads", "Causal + auxiliary heads", "Via speculative decoding", "DeepSeek-V3 (D=1, λ=0.3→0.1); Meta MTP research (n=4)"],
+  ]}
+/>
+
+<Callout variant="exercise">
+Given a 7B decoder-only model with $d = 4096$, $V = 128\text{k}$, and tied embeddings, estimate: (a) the number of parameters in the embedding component; (b) the parameter saving from tying vs untying; (c) the expected per-token loss under a uniform distribution over $V$. Then consider: at what vocabulary size does the embedding component exceed 1B parameters for $d = 4096$?
+</Callout>
+
+---
+
+<Sources items={[
+  {
+    authors: "Sennrich, R., Haddow, B., & Birch, A.",
+    year: 2016,
+    title: "Neural Machine Translation of Rare Words with Subword Units",
+    venue: "ACL 2016",
+    url: "https://arxiv.org/abs/1508.07909",
+    note: "Original BPE paper for NMT vocabulary control."
+  },
+  {
+    authors: "Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., & Sutskever, I.",
+    year: 2019,
+    title: "Language Models are Unsupervised Multitask Learners",
+    venue: "OpenAI blog",
+    url: "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf",
+    note: "GPT-2; byte-level BPE; vocab 50,257; regex pre-tokeniser."
+  },
+  {
+    authors: "Kudo, T.",
+    year: 2018,
+    title: "Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates",
+    venue: "ACL 2018",
+    url: "https://arxiv.org/abs/1804.10959",
+    note: "Unigram LM tokeniser; stochastic subword sampling."
+  },
+  {
+    authors: "Kudo, T. & Richardson, J.",
+    year: 2018,
+    title: "SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing",
+    venue: "EMNLP 2018",
+    url: "https://aclanthology.org/D18-2012/",
+    note: "SentencePiece library; ▁ whitespace encoding; language-independent."
+  },
+  {
+    authors: "Rumbelow, J. & Watkins, M.",
+    year: 2023,
+    title: "SolidGoldMagikarp (plus, prompt generation)",
+    venue: "Alignment Forum, January 2023",
+    url: "https://www.alignmentforum.org/posts/aPeJE8bSo6rAFoLqg/solidgoldmagikarp-plus-prompt-generation",
+    note: "Original public documentation of glitch tokens in GPT-3 family."
+  },
+  {
+    authors: "Land, S. & Bartolo, M.",
+    year: 2024,
+    title: "Fishing for Magikarp: Automatically Detecting Under-trained Tokens in Large Language Models",
+    venue: "EMNLP 2024",
+    url: "https://arxiv.org/abs/2405.05417",
+    note: "Systematic detection methods; 510 never-output GPT-2 tokens; code at cohere-ai/magikarp."
+  },
+  {
+    authors: "GlitchMiner authors",
+    year: 2024,
+    title: "Mining Glitch Tokens in Large Language Models via Gradient-based Discrete Optimization",
+    venue: "arXiv:2410.15052",
+    url: "https://arxiv.org/abs/2410.15052",
+    note: "Gradient-guided glitch token search without brute-force enumeration."
+  },
+  {
+    authors: "Press, O. & Wolf, L.",
+    year: 2017,
+    title: "Using the Output Embedding to Improve Language Models",
+    venue: "EACL 2017",
+    url: "https://arxiv.org/abs/1608.05859",
+    note: "Original tied-embedding paper; perplexity improvement and parameter saving."
+  },
+  {
+    authors: "Anonymous (Anthropic-adjacent authors)",
+    year: 2026,
+    title: "Weight Tying Biases Token Embeddings Towards the Output Space",
+    venue: "arXiv:2603.26663, March 2026",
+    url: "https://arxiv.org/abs/2603.26663",
+    note: "Mechanism: output gradients dominate early training, biasing tied embedding toward unembedding function."
+  },
+  {
+    authors: "Bavarian, M. et al.",
+    year: 2022,
+    title: "Efficient Training of Language Models to Fill in the Middle",
+    venue: "arXiv:2207.14255",
+    url: "https://arxiv.org/abs/2207.14255",
+    note: "FIM PSM/SPM modes; FIM-for-free claim at r up to 0.9."
+  },
+  {
+    authors: "Gloeckle, F., Idrissi, B.Y., Rozière, B., Lopez-Paz, D., & Synnaeve, G.",
+    year: 2024,
+    title: "Better & Faster Large Language Models via Multi-token Prediction",
+    venue: "Meta FAIR, arXiv:2404.19737",
+    url: "https://arxiv.org/abs/2404.19737",
+    note: "n independent MTP heads; 3× speculative decoding speedup; +12% HumanEval, +17% MBPP at 13B."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437, December 2024",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "Sequential MTP D=1; λ=0.3→0.1; FIM rate 0.1; vocab 128K; 1.8× inference speedup; token-boundary splitting."
+  },
+  {
+    authors: "Müller, R., Kornblith, S., & Hinton, G.",
+    year: 2019,
+    title: "When Does Label Smoothing Help?",
+    venue: "NeurIPS 2019",
+    url: "https://arxiv.org/abs/1906.02629",
+    note: "Calibration benefit; beam-search improvement; representation geometry; distillation harm."
+  },
+  {
+    authors: "Anonymous",
+    year: 2025,
+    title: "Towards Understanding Why Label Smoothing Degrades Performance in Large Vocabulary LLMs",
+    venue: "ICLR 2025",
+    url: "https://proceedings.iclr.cc/paper_files/paper/2025/file/9dc5accb1e4f4a9798eae145f2e4869b-Paper-Conference.pdf",
+    note: "Entropy lower bound in large-vocab models; structural self-smoothing argument."
+  },
+  {
+    authors: "Buzdugan, S. et al.",
+    year: 2024,
+    title: "Methods of Improving LLM Training Stability",
+    venue: "arXiv:2410.16682",
+    url: "https://arxiv.org/abs/2410.16682",
+    note: "QKV-norm and QK-norm-cap; 1.5× stable LR; perplexity 10.85 vs 11.19 on 0.2T tokens; norm growth measurement."
+  },
+  {
+    authors: "Wang, T. et al.",
+    year: 2022,
+    title: "What Language Model Architecture and Pretraining Objective Work Best for Zero-Shot Generalization?",
+    venue: "ICML 2022",
+    url: "https://arxiv.org/abs/2204.05832",
+    note: "Causal decoder + CLM wins for zero-shot generalisation; PrefixLM no better."
+  },
+  {
+    authors: "Meta AI",
+    year: 2024,
+    title: "Introducing Meta Llama 3",
+    venue: "Meta AI Blog, April 2024",
+    url: "https://ai.meta.com/blog/meta-llama-3/",
+    note: "Llama 3: 128,256 vocab, tiktoken-based BPE, untied embeddings, ~15% fewer tokens vs Llama 2 tokeniser."
+  },
+  {
+    authors: "Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original transformer; ε=0.1 label smoothing; CLM for sequence generation."
+  },
+  {
+    authors: "HuggingFace",
+    year: 2024,
+    title: "Tokenization Algorithms",
+    venue: "Transformers documentation",
+    url: "https://huggingface.co/docs/transformers/tokenizer_summary",
+    note: "Pedagogical reference covering BPE, WordPiece, Unigram LM, and SentencePiece."
+  },
+  {
+    authors: "Karpathy, A.",
+    year: 2024,
+    title: "minBPE",
+    venue: "GitHub",
+    url: "https://github.com/karpathy/minbpe",
+    note: "Minimal BPE implementation reproducing GPT-4 tokeniser; useful for hands-on study."
+  },
+  {
+    authors: "Gloeckle et al. / Parallel Token Prediction team",
+    year: 2026,
+    title: "Parallel Token Prediction",
+    venue: "ICLR 2026, arXiv:2512.21323",
+    url: "https://arxiv.org/abs/2512.21323",
+    note: "Consistent parallel generation with quadratic decoding verification."
+  },
+  {
+    authors: "Structure-Aware FIM authors",
+    year: 2025,
+    title: "Structure-Aware Fill-in-the-Middle (AST-FIM)",
+    venue: "arXiv:2506.00204",
+    url: "https://arxiv.org/abs/2506.00204",
+    note: "AST-subtree masking for FIM; better alignment with developer editing patterns."
+  }
+]} />

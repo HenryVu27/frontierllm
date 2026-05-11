@@ -8,6 +8,7 @@ import remarkFrontmatter from "remark-frontmatter";
 import remarkMdxFrontmatter from "remark-mdx-frontmatter";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { remarkHeadingId } from "remark-custom-heading-id";
 import rehypeKatex from "rehype-katex";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -80,6 +81,7 @@ export default defineConfig(async () => {
           [remarkMdxFrontmatter, { name: "frontmatter" }],
           remarkGfm,
           remarkMath,
+          remarkHeadingId,
         ],
         rehypePlugins: [
           rehypeSlug,

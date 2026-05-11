@@ -1,0 +1,773 @@
+---
+slug: 00c-positional-encodings
+title: Positional encodings
+description: Sinusoidal, learned, ALiBi, RoPE, and the YaRN / LongRoPE family of context-extension methods — the math, the choices, and what frontier models ship in 2026.
+order: 3
+chapter: 3
+reading_minutes: 32
+depends_on: [00a-transformer]
+provides: [sinusoidal, alibi, rope, yarn, longrope]
+last_reviewed: 2026-05-11
+---
+
+## Why transformers need a positional signal {#why-position-matters}
+
+Attention, as introduced in the [transformer block](/textbook/00a-transformer#attention-math), computes a weighted sum of value vectors using scores derived from query–key dot products. Nothing in that computation refers to order. More precisely, softmax attention is **permutation-equivariant**: if the input tokens are shuffled, the output is shuffled in exactly the same way, and per-token representations are unchanged beyond a relabelling of indices.
+
+Formally, let $\mathbf{P}_\pi$ be the $n \times n$ permutation matrix for some permutation $\pi$ of $\{1, \ldots, n\}$, and let $\mathbf{X}' = \mathbf{P}_\pi \mathbf{X}$. Then $\mathbf{Q}' = \mathbf{P}_\pi \mathbf{Q}$, $\mathbf{K}' = \mathbf{P}_\pi \mathbf{K}$, $\mathbf{V}' = \mathbf{P}_\pi \mathbf{V}$, and consequently
+
+$$
+\operatorname{Attn}(\mathbf{Q}', \mathbf{K}', \mathbf{V}') = \mathbf{P}_\pi \operatorname{Attn}(\mathbf{Q}, \mathbf{K}, \mathbf{V}).
+$$
+
+The model cannot distinguish "Dog bites man" from "Man bites dog" — those six tokens, in either order, produce identical hidden states. Language is not a set; word order is meaning-bearing. Every positional encoding scheme is an intervention that breaks this symmetry.
+
+The schemes divide into two families:
+
+- **Absolute encodings** add a position-dependent vector to each token embedding at the input layer. The attention mechanism then sees a mix of content and positional information in $\mathbf{Q}$ and $\mathbf{K}$.
+- **Relative encodings** leave the input embeddings untouched and instead inject positional information directly into the attention score computation, either as a bias added to the pre-softmax logit or as a rotation applied to the query and key vectors before the dot product.
+
+---
+
+## Absolute encodings {#sinusoidal}
+
+### Sinusoidal encoding (Vaswani et al., 2017)
+
+The original transformer (Vaswani et al., NeurIPS 2017, arXiv:1706.03762) assigns each position $\mathrm{pos}$ a deterministic vector in $\mathbb{R}^{d_\mathrm{model}}$, defined dimension-by-dimension:
+
+$$
+\mathrm{PE}(\mathrm{pos},\, 2i)   = \sin\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\mathrm{model}}}\right),
+\qquad
+\mathrm{PE}(\mathrm{pos},\, 2i+1) = \cos\!\left(\frac{\mathrm{pos}}{10000^{2i / d_\mathrm{model}}}\right).
+$$
+
+The even-indexed dimensions use sine; the odd-indexed dimensions use cosine. The denominator $10000^{2i/d_\mathrm{model}}$ creates a geometric progression of wavelengths from $2\pi$ (at dimension 0) to $10000 \cdot 2\pi$ (at dimension $d_\mathrm{model} - 1$). This encoding is added, not concatenated, to the token embedding before the first layer.
+
+The authors offered two motivations. First, for any fixed offset $k$, the encoding $\mathrm{PE}(\mathrm{pos} + k)$ can be expressed as a **linear function** of $\mathrm{PE}(\mathrm{pos})$, which they hoped would make it easy for the model to learn relative-position patterns by composition. Second, the encoding generalises to sequence lengths not seen during training — there is no learned lookup table to run out of entries.
+
+Both claims hold in a narrow technical sense but overstate the practical benefit. Vaswani et al. also tested learned absolute embeddings as a baseline and found "nearly identical results", ultimately choosing sinusoidal primarily for its conjectured extrapolation advantage. That advantage does not materialise in practice: models with sinusoidal encodings degrade rapidly at lengths beyond their training window because the model has learned to interpret specific frequency combinations, and at novel lengths those combinations shift in ways the model has not observed.
+
+<Callout variant="warning" title="Sinusoidal encodings do not extrapolate reliably">
+Despite the theoretical argument that PE(pos + k) is a linear function of PE(pos), sinusoidal-encoded models in practice show sharp perplexity increases at test lengths exceeding their training length. The theoretical extrapolation property does not compensate for the distributional shift in the attention logit magnitudes at unseen positions.
+</Callout>
+
+### Learned absolute encoding {#learned-absolute}
+
+BERT (Devlin et al., 2018, arXiv:1810.04805) and GPT-2 (Radford et al., 2019) replace the deterministic formula with a learnable embedding table $\mathbf{E} \in \mathbb{R}^{T_\mathrm{max} \times d_\mathrm{model}}$, where $T_\mathrm{max}$ is a hard upper bound on sequence length fixed at training time. BERT uses $T_\mathrm{max} = 512$; GPT-2 uses $T_\mathrm{max} = 1\,024$; GPT-3 uses $T_\mathrm{max} = 2\,048$.
+
+The row $\mathbf{E}[\mathrm{pos}]$ is added to the token embedding at position $\mathrm{pos}$. The table is updated by gradient descent alongside all other parameters.
+
+On benchmarks evaluated within training length, learned and sinusoidal encodings perform essentially identically — Vaswani et al. (2017) confirmed this in their ablation. The hard cap at $T_\mathrm{max}$ is the principal liability: inference beyond that length requires either retraining from scratch, interpolation of the embedding table (which is non-trivial and degrades quality), or a full switch to a different positional encoding scheme.
+
+Both absolute schemes share a second limitation: position 1 and position 2 are encoded as independent, unrelated vectors. There is no inductive bias encoding the idea that *nearby positions are similar in positional space*. The model must learn any such structure from data.
+
+---
+
+## Relative encodings {#relative-encodings}
+
+### T5 relative bias buckets
+
+T5 (Raffel et al., JMLR 2020, arXiv:1910.10683) adds no positional information to the input embeddings. Instead, it adds a learned scalar bias $b_{ij}$ to the pre-softmax attention logit for each token pair $(i, j)$:
+
+$$
+\mathrm{logit}(i,j) = \frac{\mathbf{q}_i \cdot \mathbf{k}_j}{\sqrt{d_k}} + b\bigl[\mathrm{bucket}(i - j)\bigr].
+$$
+
+The bias depends only on the relative offset $i - j$, not on the absolute positions. The offset is mapped to one of 32 learned scalar values via a bucketing scheme: offsets in $[-16, 16]$ each occupy their own bucket (one-to-one), while offsets with $|i - j| > 16$ are log-binned into the remaining buckets, and all offsets beyond a maximum (around 128) map to the same bucket. The 32 scalar values are shared across all attention layers but are separate per head.
+
+The log-scale bucketing gives the model fine-grained resolution for nearby tokens and coarser resolution for distant ones, matching the intuition that precise local order matters more than precise global position. All positions beyond the bucketing maximum receive the same bias, which means T5 has a weak form of extrapolation — "very far away" is a recognised category, not an unknown one — though performance still degrades on tasks requiring precise reasoning over positions outside the training distribution.
+
+### ALiBi — Attention with Linear Biases {#alibi}
+
+ALiBi (Press, Smith, Lewis, ICLR 2022, arXiv:2108.12409) simplifies relative position encoding to a single non-learned formula. Like T5, it adds no positional information at the input layer. After the query–key dot product and before softmax, it subtracts a static, distance-proportional penalty:
+
+$$
+\mathrm{logit}(i,j) = \frac{\mathbf{q}_i \cdot \mathbf{k}_j}{\sqrt{d_k}} - m_h \cdot |i - j|.
+$$
+
+The slope $m_h$ is head-specific and is computed, not trained. For a model with $H$ heads, the slopes form a geometric sequence. For $H = 8$:
+
+$$
+m_1, \ldots, m_8 = \tfrac{1}{2},\; \tfrac{1}{4},\; \tfrac{1}{8},\; \tfrac{1}{16},\; \tfrac{1}{32},\; \tfrac{1}{64},\; \tfrac{1}{128},\; \tfrac{1}{256}.
+$$
+
+For general $H$, the slopes are $2^{-k \cdot 8/H}$ for $k = 1, \ldots, H$.
+
+Because the bias depends only on $|i - j|$, the model sees only relative distances: the identity of $(i, j)$ is unknown to the attention score beyond their separation. The linear decay imposes a **recency bias**: tokens that are farther away receive a larger penalty, with the strength of that penalty controlled by the head's slope. The design intent is that different heads specialise at different attention ranges — a steep-slope head attends almost exclusively to the last few tokens; a shallow-slope head spreads attention more broadly.
+
+<Callout variant="info" title="ALiBi: efficiency gains at training time">
+Press et al. (2022) report that a 1.3 B parameter model trained on sequences of length 1 024 with ALiBi matched the perplexity of a sinusoidal-PE model trained on sequences of length 2 048, while training 11% faster and using 11% less memory — because there are no stored position embeddings and no position-gradient updates.
+</Callout>
+
+**Who shipped ALiBi.** BLOOM (BigScience, 2022, arXiv:2211.05100) and MPT-7B (MosaicML, May 2023) both used ALiBi as their production positional encoding. By 2024 the major frontier labs had converged on RoPE for new pre-training runs (see the comparison table at the end of this chapter), but ALiBi retains theoretical appeal for zero-shot extrapolation.
+
+**Limitations.** The linear decay is a strong prior: tasks requiring attention to semantically important but distant tokens can suffer, because each head's slope suppresses distant logits regardless of semantic relevance. ALiBi extrapolates gracefully on perplexity metrics at moderate length extensions, but it underperforms RoPE models that have been fine-tuned with YaRN on needle-in-a-haystack retrieval tasks at very long contexts (see §[YaRN](#yarn) below).
+
+---
+
+## Rotary Position Embedding (RoPE) {#rope}
+
+RoPE (Su, Lu, Pan, Murtadha, Wen, Liu — RoFormer, arXiv:2104.09864, published NAACL 2022) takes a different approach. Rather than adding a bias to the attention logit or a vector to the input embedding, RoPE **rotates** the query and key vectors before the dot product. The rotation angle is proportional to the token's position index and to a dimension-specific frequency. The fundamental property:
+
+> The inner product of a rotated query at position $m$ and a rotated key at position $n$ depends only on the raw vector content and the **relative distance** $m - n$, not on $m$ or $n$ individually.
+
+### The 2-D case
+
+For a single 2-dimensional vector $\mathbf{q} = [q_1,\, q_2]^\top$ at position $m$, define the rotated version as
+
+$$
+f(\mathbf{q}, m) = \mathbf{R}(m\theta)\,\mathbf{q},
+\qquad
+\mathbf{R}(\phi) = \begin{bmatrix} \cos\phi & -\sin\phi \\ \sin\phi & \cos\phi \end{bmatrix}.
+$$
+
+Then for a key $\mathbf{k}$ at position $n$:
+
+$$
+\bigl\langle f(\mathbf{q}, m),\; f(\mathbf{k}, n) \bigr\rangle
+= \mathbf{q}^\top \mathbf{R}(m\theta)^\top \mathbf{R}(n\theta)\, \mathbf{k}
+= \mathbf{q}^\top \mathbf{R}\bigl((n - m)\theta\bigr)\, \mathbf{k}.
+$$
+
+The last step uses the identity $\mathbf{R}(\alpha)^\top \mathbf{R}(\beta) = \mathbf{R}(\beta - \alpha)$. The result depends on $(n - m)$ only — the relative offset.
+
+### The general $d$-dimensional case
+
+For a $d$-dimensional head dimension ($d$ must be even), form $d/2$ independent 2-D pairs by grouping consecutive dimensions. Apply a separate 2-D rotation to each pair with a different frequency $\theta_i$:
+
+$$
+\theta_i = b^{-2(i-1)/d}, \qquad i = 1, \ldots, \tfrac{d}{2},
+$$
+
+where $b = 10\,000$ is the base frequency (Su et al.'s default). The full rotation operator $\mathbf{R}^d_{\Theta, m}$ is block-diagonal:
+
+$$
+\mathbf{R}^d_{\Theta, m} = \mathrm{diag}\!\left(\mathbf{R}(m\theta_1),\; \mathbf{R}(m\theta_2),\; \ldots,\; \mathbf{R}(m\theta_{d/2})\right).
+$$
+
+Applied to query and key:
+
+$$
+\hat{\mathbf{q}}_m = \mathbf{R}^d_{\Theta, m}\, \mathbf{q}_m, \qquad
+\hat{\mathbf{k}}_n = \mathbf{R}^d_{\Theta, n}\, \mathbf{k}_n,
+$$
+
+$$
+\langle \hat{\mathbf{q}}_m,\; \hat{\mathbf{k}}_n \rangle = \mathbf{q}_m^\top\, \mathbf{R}^d_{\Theta,\, n-m}\, \mathbf{k}_n.
+$$
+
+### Efficient implementation
+
+The block-diagonal matrix multiplication is not implemented by constructing the full $d \times d$ matrix. The standard approach<Sidenote>The EleutherAI blog post "Rotary Embeddings: A Relative Revolution" provides an accessible derivation and the canonical `rotate_half` implementation. The complex-number representation (treating each pair as a complex number and multiplying by $e^{im\theta_i}$) is equivalent and is used in several frameworks including GPT-NeoX and Falcon.</Sidenote> is the **`rotate_half` trick**:
+
+1. Split $\mathbf{q}$ into even-indexed elements $\mathbf{q}_{1} = \mathbf{q}[\ldots, ::2]$ and odd-indexed elements $\mathbf{q}_{2} = \mathbf{q}[\ldots, 1::2]$.
+2. Form $\operatorname{rotate\_half}(\mathbf{q}) = [-\mathbf{q}_2;\; \mathbf{q}_1]$ (concatenate negated odd elements, then even elements).
+3. Compute the rotated query:
+
+$$
+\hat{\mathbf{q}}_m = \mathbf{q} \odot \cos(m\,\boldsymbol{\Theta}) + \operatorname{rotate\_half}(\mathbf{q}) \odot \sin(m\,\boldsymbol{\Theta}),
+$$
+
+where $\boldsymbol{\Theta} = [\theta_1, \theta_1, \theta_2, \theta_2, \ldots, \theta_{d/2}, \theta_{d/2}]$ broadcasts each frequency over both elements of its pair. The key receives the same treatment at its position $n$.
+
+This reduces the rotation to two element-wise multiplications and one addition — the same FLOP profile as an absolute positional encoding addition, but applied inside each attention head rather than at the input layer.
+
+### Decay property
+
+Su et al. (2021) note that $\langle \hat{\mathbf{q}}_m, \hat{\mathbf{k}}_n \rangle = \mathbf{q}^\top \mathbf{R}^d_{\Theta,\, n-m}\, \mathbf{k}$ tends to decrease in magnitude as $|n - m|$ increases. The intuition: the $d/2$ rotation blocks contribute $\cos((n-m)\theta_i)$ terms to the sum; as the offset grows, these cosines at different frequencies add with increasingly mixed signs and partially cancel. Men et al. (arXiv:2405.14591, 2024) provide a more formal treatment.
+
+<Callout variant="note" title="Decay is a tendency, not a guarantee">
+The decay is statistical: the expected magnitude of the inner product decreases with offset across the distribution of typical weight matrices, but for specific query–key pairs the inner product may not be monotonically decreasing. Present this as "decaying inter-token dependency on average" (Su et al.'s phrasing), not as a strict bound.
+</Callout>
+
+### Compatibility with GQA and MQA
+
+RoPE is applied to query and key projections only; the value projection is left unrotated. This is why RoPE is fully compatible with multi-query attention (MQA) and grouped-query attention (GQA), discussed in [attention variants](/textbook/00b-attention-variants): shared key–value heads still receive the correct rotations at each head's query positions, because the rotation depends on position, not on the head index.
+
+---
+
+## Base frequency and context length {#rope-base-frequency}
+
+The base $b = 10\,000$ controls how the frequencies $\theta_i = b^{-2(i-1)/d}$ are spaced. Small-$i$ dimensions (high frequency) complete many full rotations per position step; large-$i$ dimensions (low frequency) barely rotate. The lowest-frequency dimension pair, $\theta_{d/2} = b^{-1}$, completes one full rotation over $2\pi b$ position steps.
+
+For a model to distinguish positions $m$ and $n$, the rotation $\mathbf{R}^d_{\Theta,\, m-n}$ must be non-negligible in at least one dimension pair. Once $|m - n|$ exceeds $2\pi b$ for the lowest-frequency pair, that pair has wrapped around and is ambiguous — the model cannot distinguish the two positions using that pair. Men et al. (arXiv:2405.14591, 2024) formalise this, deriving lower bounds on the base required to support a given context length:
+
+<ComparisonTable
+  caption="Minimum RoPE base required to uniquely encode positions up to the given context length. Source: Men et al., 'Base of RoPE Bounds Context Length', arXiv:2405.14591, 2024."
+  columns={["Target context length", "Required minimum base"]}
+  rows={[
+    ["4 096", "≈ 27 000"],
+    ["32 768", "≈ 640 000"],
+    ["1 000 000", "≈ 510 000 000"],
+  ]}
+/>
+
+**Practical consequence.** The default base $b = 10\,000$ (used in Llama 2 and early RoPE models) is inadequate even for 4 K context in the strict theoretical sense — meaning the model must lean on higher-frequency dimensions to compensate. In practice, models trained at 4 K with $b = 10\,000$ work acceptably, but extending to 32 K or beyond while keeping $b = 10\,000$ produces significant quality degradation.
+
+**How frontier labs responded.** Meta raised the base to $b = 500\,000$ in Llama 3 (April 2024) to support 8 192-token pre-training and YaRN-based extension to 128 K. Alibaba went further: Qwen2.5 (September 2024) and Qwen3 (May 2025) use $b = 1\,000\,000$, which they call Adjusted Base Frequency (ABF).<Sidenote>The "ABF" label appears in the Qwen technical reports. The technique — simply raising the RoPE base before pre-training — was explored in several 2023–2024 papers and community posts. The name is Alibaba's branding for their specific choice of $b = 10^6$.</Sidenote>
+
+---
+
+## Worked example: 4-D RoPE end-to-end {#rope-worked-example}
+
+This example traces the full RoPE computation for a pair of 4-dimensional query and key vectors. All values can be verified with a pocket calculator.
+
+**Setup.**
+- Head dimension: $d = 4$ (2 pairs)
+- Base: $b = 10\,000$
+- Query token at position $m = 2$; key token at position $n = 5$
+- Raw query: $\mathbf{q} = [1.0,\; 0.0,\; 1.0,\; 0.0]^\top$
+- Raw key: $\mathbf{k} = [0.0,\; 1.0,\; 0.0,\; 1.0]^\top$
+
+**Step 1 — compute frequencies.**
+
+With $d = 4$, there are $d/2 = 2$ pairs, indexed $i = 0$ and $i = 1$:
+
+$$
+\theta_0 = 10000^{-2 \cdot 0 / 4} = 10000^0 = 1.0000,
+\qquad
+\theta_1 = 10000^{-2 \cdot 1 / 4} = 10000^{-0.5} = \tfrac{1}{100} = 0.0100.
+$$
+
+**Step 2 — compute rotation angles.**
+
+At position $m = 2$:
+
+$$
+\phi_0(m) = 2 \times 1.0000 = 2.0000\text{ rad}, \qquad \phi_1(m) = 2 \times 0.0100 = 0.0200\text{ rad}.
+$$
+
+At position $n = 5$:
+
+$$
+\phi_0(n) = 5 \times 1.0000 = 5.0000\text{ rad}, \qquad \phi_1(n) = 5 \times 0.0100 = 0.0500\text{ rad}.
+$$
+
+**Step 3 — rotate the query at position $m = 2$.**
+
+Pair 0: $(q_0, q_1) = (1.0,\; 0.0)$, angle $2.0$ rad.
+
+$$
+\hat{q}_0 = 1.0 \cdot \cos(2.0) - 0.0 \cdot \sin(2.0) = \cos(2.0) \approx -0.4161,
+$$
+$$
+\hat{q}_1 = 1.0 \cdot \sin(2.0) + 0.0 \cdot \cos(2.0) = \sin(2.0) \approx \phantom{-}0.9093.
+$$
+
+Pair 1: $(q_2, q_3) = (1.0,\; 0.0)$, angle $0.02$ rad.
+
+$$
+\hat{q}_2 = 1.0 \cdot \cos(0.02) - 0.0 \cdot \sin(0.02) = \cos(0.02) \approx \phantom{-}0.9998,
+$$
+$$
+\hat{q}_3 = 1.0 \cdot \sin(0.02) + 0.0 \cdot \cos(0.02) = \sin(0.02) \approx \phantom{-}0.0200.
+$$
+
+Rotated query: $\hat{\mathbf{q}} \approx [-0.4161,\; 0.9093,\; 0.9998,\; 0.0200]^\top$.
+
+**Step 4 — rotate the key at position $n = 5$.**
+
+Pair 0: $(k_0, k_1) = (0.0,\; 1.0)$, angle $5.0$ rad.
+
+$$
+\hat{k}_0 = 0.0 \cdot \cos(5.0) - 1.0 \cdot \sin(5.0) = -\sin(5.0) \approx \phantom{-}0.9589,
+$$
+$$
+\hat{k}_1 = 0.0 \cdot \sin(5.0) + 1.0 \cdot \cos(5.0) = \phantom{-}\cos(5.0) \approx \phantom{-}0.2837.
+$$
+
+Pair 1: $(k_2, k_3) = (0.0,\; 1.0)$, angle $0.05$ rad.
+
+$$
+\hat{k}_2 = 0.0 \cdot \cos(0.05) - 1.0 \cdot \sin(0.05) = -\sin(0.05) \approx -0.0500,
+$$
+$$
+\hat{k}_3 = 0.0 \cdot \sin(0.05) + 1.0 \cdot \cos(0.05) = \phantom{-}\cos(0.05) \approx \phantom{-}0.9988.
+$$
+
+Rotated key: $\hat{\mathbf{k}} \approx [0.9589,\; 0.2837,\; -0.0500,\; 0.9988]^\top$.
+
+**Step 5 — compute the dot product.**
+
+$$
+\langle \hat{\mathbf{q}},\; \hat{\mathbf{k}} \rangle
+= (-0.4161)(0.9589) + (0.9093)(0.2837) + (0.9998)(-0.0500) + (0.0200)(0.9988).
+$$
+
+$$
+= -0.3991 + 0.2580 - 0.0500 + 0.0200 \approx -0.1711.
+$$
+
+**Step 6 — verify the relative-position property.**
+
+According to the relative-position theorem, the same result should follow from rotating by the **relative offset** $n - m = 3$ only — without knowing absolute positions. Compute $\mathbf{q}^\top \mathbf{R}^4_{\Theta,\, 3}\, \mathbf{k}$ pair-by-pair.
+
+Pair 0: relative angle $= 3 \times 1.0 = 3.0$ rad.
+
+$$
+\mathbf{q}^\top_\mathrm{pair0}\, \mathbf{R}(3.0)\, \mathbf{k}_\mathrm{pair0}
+= [1,\, 0]\, \begin{bmatrix}\cos 3 & -\sin 3 \\ \sin 3 & \cos 3\end{bmatrix}\, \begin{bmatrix}0 \\ 1\end{bmatrix}
+= [1,\, 0]\, \begin{bmatrix}-\sin 3 \\ \cos 3\end{bmatrix} = -\sin(3.0) \approx -0.1411.
+$$
+
+Pair 1: relative angle $= 3 \times 0.01 = 0.03$ rad.
+
+$$
+\mathbf{q}^\top_\mathrm{pair1}\, \mathbf{R}(0.03)\, \mathbf{k}_\mathrm{pair1}
+= [1,\, 0]\, \begin{bmatrix}-\sin(0.03) \\ \cos(0.03)\end{bmatrix} = -\sin(0.03) \approx -0.0300.
+$$
+
+Sum: $-0.1411 + (-0.0300) = -0.1711$. This matches Step 5 exactly, confirming that $\langle \hat{\mathbf{q}}_m,\, \hat{\mathbf{k}}_n \rangle$ encodes only the relative position $n - m = 3$, regardless of whether $m = 2, n = 5$ or $m = 100, n = 103$.
+
+<Callout variant="exercise">
+Redo Steps 3–5 with $m = 100$ and $n = 103$ (same relative offset, different absolute positions). The dot product should again be $\approx -0.1711$. This confirms the relative-position property numerically. Use the same $\mathbf{q}$ and $\mathbf{k}$ vectors.
+</Callout>
+
+**What the two frequencies illustrate.** Pair 0 ($\theta_0 = 1.0$) completes nearly a full rotation per position step, giving it strong discriminative power for adjacent tokens but aliasing positions that differ by $2\pi \approx 6.28$ positions. Pair 1 ($\theta_1 = 0.01$) requires 628 position steps for a full rotation, providing a slow "clock" that distinguishes distant positions. The interplay of fast and slow frequencies is what enables RoPE to encode both fine-grained local order and coarse global position within the same vector.
+
+---
+
+## Context extension methods {#context-extension}
+
+RoPE pre-trained at a given context length $L$ will degrade when asked to process sequences of length $L' > L$. The attention mechanism encounters rotation angles $m\theta_i$ for $m > L$ that it has never seen during training; the learned query–key inner products at these angles are out-of-distribution. Four methods have become standard for extending a RoPE model post-hoc.
+
+### Position Interpolation (PI)
+
+Chen, Wong, Chen, Tian (Meta AI, June 2023, arXiv:2306.15595) proposed the simplest fix: linearly rescale all position indices to fit within the training range $[0, L)$:
+
+$$
+f'(\mathbf{x}, m) = f\!\left(\mathbf{x},\; m \cdot \frac{L}{L'}\right).
+$$
+
+Every position index is multiplied by $L/L'$ before computing the rotation angles, so no angle ever exceeds the training maximum. Equivalently, all frequencies are scaled by $L/L'$: $\theta'_i = \theta_i \cdot (L/L')$.
+
+**Quality cost.** Nearby positions that were previously easy to distinguish (large angle difference per step) now receive smaller angle differences. Chen et al. show that the theoretical upper bound on interpolation error is roughly 600× smaller than extrapolation error. However, even with interpolation, perplexity degrades meaningfully without fine-tuning. With approximately 1 000 fine-tuning gradient steps on long-context data, the model recovers to near-baseline quality. Chen et al. extended Llama 2 7B from 4 K to 32 K context in under 1 000 steps.
+
+### NTK-aware scaling
+
+Proposed by community researcher `bloc97` (Reddit r/LocalLLaMA; HuggingFace TGI issue \#512, June 30, 2023).<Sidenote>NTK-aware scaling does not have a peer-reviewed paper. The method originates entirely from the `bloc97` community post. YaRN (Peng et al., arXiv:2309.00071) provides the first rigorous academic formalisation of the related NTK-by-parts variant. The writing convention in this chapter is to cite the community post as the origin and acknowledge the lack of peer review.</Sidenote>
+
+`bloc97` observed that PI uniformly scales every frequency dimension, which harms high-frequency dimensions most: pairs that were needed to distinguish adjacent tokens (small wavelength) lose their resolution at every step size. Drawing on Neural Tangent Kernel theory, the proposal is to rescale the **base** $b$ rather than the position indices:
+
+$$
+b' = b \cdot \alpha^{d/(d-2)},
+$$
+
+where $\alpha = L'/L$ is the extension factor. Raising the base lowers every $\theta_i = b^{-2(i-1)/d}$, but the effect is non-uniform: high-frequency dimensions (small $i$, large $\theta_i$) are barely changed because $b^{-2(i-1)/d}$ is already close to 1; low-frequency dimensions (large $i$, small $\theta_i$) absorb most of the compression. Adjacent-token distinction is preserved; long-range encoding is compressed.
+
+NTK-aware scaling can extend context 2–4× without any fine-tuning at modest perplexity cost. Beyond roughly 4× extension, quality degrades meaningfully and fine-tuning becomes necessary. `emozilla` (same community thread, 2023) extended this to **Dynamic NTK**, which sets $\alpha$ equal to the actual input length divided by $L$ at inference time, applying no rescaling for sequences within training length and scaling proportionally as length increases. Dynamic NTK is supported in several inference frameworks as a drop-in context extension without model modification.
+
+### YaRN — Yet another RoPE extensioN {#yarn}
+
+YaRN (Peng, Quesnelle, Fan, Shippole — Nous Research, August 2023, arXiv:2309.00071; ICLR 2024) combines two contributions: NTK-by-parts interpolation and attention temperature correction.
+
+**Contribution 1 — NTK-by-parts interpolation.** Rather than applying uniform base rescaling (NTK-aware) or uniform frequency scaling (PI), YaRN uses a smooth ramp function $\gamma(r)$ to blend three regimes by dimension:
+
+- **High-frequency dimensions** (wavelength $\ll L$): no rescaling. These dimensions complete many cycles within the training context and can be extrapolated safely.
+- **Low-frequency dimensions** (wavelength $\gg L$): interpolate by factor $s = L'/L$. These dimensions barely rotate within the training window and need the compression most.
+- **Mid-frequency dimensions**: smooth blend.
+
+Concretely, let $r(i) = L \bigl/ \bigl(2\pi \cdot b^{2i/|D|}\bigr)$ be the ratio of training length to the wavelength of dimension $i$, and let
+
+$$
+\gamma(r) = \operatorname{clamp}\!\left(\frac{r - \alpha}{\beta - \alpha},\; 0,\; 1\right).
+$$
+
+The per-dimension rescaled frequency is:
+
+$$
+\tilde{\theta}_i = \bigl[1 - \gamma(r(i))\bigr] \cdot \frac{\theta_i}{s} + \gamma(r(i)) \cdot \theta_i.
+$$
+
+For LLaMA and Llama 2 models, the recommended hyperparameters are $\alpha = 1$ and $\beta = 32$. Dimensions whose wavelength is shorter than the training context ($r > \beta$) are left unchanged; those whose wavelength is longer than the training context ($r < \alpha$) are fully interpolated; those in between are smoothly blended.
+
+**Contribution 2 — attention temperature correction.** Rescaling frequencies changes the distribution of attention logit magnitudes (rotation compresses the angular spread, making attention softer). YaRN compensates by adjusting the temperature $t$ in the softmax:
+
+$$
+\operatorname{softmax}\!\left(\frac{\hat{\mathbf{q}}_m^\top \hat{\mathbf{k}}_n}{\sqrt{t \cdot d_k}}\right),
+$$
+
+where $\sqrt{1/t} = 0.1 \ln(s) + 1$. For a 32× extension ($s = 32$), this gives $\sqrt{1/t} \approx 1.35$, sharpening the attention distribution back toward its pre-extension character.
+
+**Results.** Peng et al. (2023) extended Llama 2 7B with YaRN at $s = 32$ and evaluated sliding-window perplexity on the Proof-pile dataset:
+
+| Evaluation context | Perplexity |
+|---|---|
+| 8 K | 3.56 |
+| 32 K | 2.70 |
+| 131 K | 2.37 |
+
+This was achieved with 400 fine-tuning steps at 64 K context, using approximately 10× fewer tokens and 2.5× fewer training steps than the equivalent PI-based method to reach comparable perplexity.
+
+**Adoption (as of May 2026).** DeepSeek-V3 (December 2024, arXiv:2412.19437) uses YaRN for its 128 K context extension with parameters $s = 40$, $\alpha = 1$, $\beta = 32$. Qwen3 (Alibaba, May 2025, arXiv:2505.09388) uses YaRN combined with Dual Chunk Attention (DCA) for 128 K. Mistral's 128 K variant of Mistral-7B shipped with YaRN parameters $a = 0.07$, $b = 1.0$. YaRN or a close derivative is the standard context-extension method for open-weight models that extend beyond their pre-training context as of 2026.
+
+### LongRoPE and LongRoPE2 {#longrope}
+
+YaRN's key insight is that uniform frequency rescaling is suboptimal — different dimensions need different treatment. LongRoPE (Ding et al., Microsoft Research, February 2024, arXiv:2402.13753) extends this to its logical conclusion: **learn the per-dimension rescaling factors** rather than computing them from a fixed formula.
+
+**LongRoPE.** An efficient evolutionary search algorithm finds per-dimension rescaling factors that minimise long-context perplexity on a held-out set, exploiting two kinds of non-uniformity: (1) different dimensions need different scaling, and (2) the first few positional indices behave differently from positions in the middle of the sequence. The search runs on the base model without fine-tuning and can achieve an 8× context extension using search alone. A progressive extension strategy then:
+
+1. Fine-tunes at 256 K context using the non-uniform factors from search (approximately 1 000 gradient steps).
+2. Applies a second interpolation step to reach 2 048 K.
+3. Re-adjusts at the original short-context window (8 K for the base model used in the paper) to restore short-context performance.
+
+Ding et al. (2024) demonstrated 2 048 K effective context on Llama 2 7B and Phi-2 2.7 B using roughly 1 000 fine-tuning steps.
+
+**LongRoPE2.** Shang et al. (Microsoft Research, February 2025, arXiv:2502.20082) diagnose a remaining failure mode in LongRoPE and earlier methods: **high-index RoPE dimensions** (those with low frequency $\theta_i$) are systematically under-trained during standard pre-training because their rotation angles barely change across positions within the training context. The model never learns meaningful representations for the slow angular variation in these dimensions, so no amount of frequency rescaling fully recovers them at long context.
+
+LongRoPE2's fix:
+
+1. An evolutionary search algorithm guided by **needle-driven perplexity** — a perplexity measure weighted toward needle-in-a-haystack retrieval positions rather than uniform sequence perplexity — finds rescaling factors that specifically address the under-trained high-index dimensions.
+2. **Mixed-context-window training**: fine-tune with rescaled RoPE for long sequences and original RoPE for short sequences, in the same batch. This preserves short-context quality by construction, without requiring the post-hoc re-adjustment step of LongRoPE.
+
+Shang et al. (2025) extended LLaMA 3 8B to 128 K effective context while retaining more than 98.5% of short-context performance on standard benchmarks, using approximately 10 B training tokens — claimed to be 80× fewer than Meta's own Llama 3.1 extension recipe.
+
+---
+
+## Frontier positional encodings in 2026 {#frontier-positional-encodings}
+
+The table below summarises the positional encoding choices across major public model families. Rows where the architecture is not publicly disclosed are marked accordingly.
+
+<ComparisonTable
+  caption="Positional encoding choices at frontier labs, May 2026. Rows marked '(inferred)' are based on community analysis or public API behaviour rather than a primary technical report. Gemini 2.5 Pro is marked uncertain — no primary source confirming the PE scheme was found."
+  columns={["Model family", "PE scheme", "Base / variant", "Context window", "Source"]}
+  rows={[
+    [
+      "Original Transformer (2017)",
+      "Sinusoidal absolute",
+      "b = 10 000",
+      "512",
+      "Vaswani et al., arXiv:1706.03762, NeurIPS 2017"
+    ],
+    [
+      "BERT (2018)",
+      "Learned absolute",
+      "T_max = 512",
+      "512",
+      "Devlin et al., arXiv:1810.04805"
+    ],
+    [
+      "GPT-2 (2019)",
+      "Learned absolute",
+      "T_max = 1 024",
+      "1 024",
+      "Radford et al., OpenAI tech report 2019"
+    ],
+    [
+      "T5 (2020)",
+      "Relative bias buckets (32 learned scalars)",
+      "n/a",
+      "512 (trained)",
+      "Raffel et al., arXiv:1910.10683, JMLR 2020"
+    ],
+    [
+      "BLOOM (2022)",
+      "ALiBi",
+      "Geometric slopes",
+      "2 048",
+      "BigScience, arXiv:2211.05100"
+    ],
+    [
+      "MPT-7B (2023)",
+      "ALiBi",
+      "Geometric slopes",
+      "2 048",
+      "MosaicML blog, May 2023"
+    ],
+    [
+      "Llama 2 (2023)",
+      "RoPE",
+      "b = 10 000",
+      "4 096",
+      "Touvron et al., arXiv:2307.09288"
+    ],
+    [
+      "Mistral-7B (Sept 2023)",
+      "RoPE",
+      "b = 10 000",
+      "8 192 (with sliding-window attention)",
+      "Jiang et al., arXiv:2310.06825"
+    ],
+    [
+      "Llama 3 / 3.1 (Apr / Jul 2024)",
+      "RoPE + YaRN extension",
+      "b = 500 000",
+      "8 192 pre-train; 128 K with YaRN",
+      "Meta Llama 3 blog, Jul 2024; arXiv:2407.21783"
+    ],
+    [
+      "DeepSeek-V3 (Dec 2024)",
+      "Decoupled RoPE + YaRN",
+      "b = 10 000 (decoupled key heads); YaRN s=40, α=1, β=32",
+      "4 K pre-train → 32 K → 128 K",
+      "DeepSeek-AI, arXiv:2412.19437"
+    ],
+    [
+      "Qwen2.5 (Sept 2024)",
+      "RoPE (ABF)",
+      "b = 1 000 000",
+      "128 K (up to 1 M with DCA)",
+      "Qwen Team, arXiv:2412.15115"
+    ],
+    [
+      "Qwen3 (May 2025)",
+      "RoPE (ABF) + YaRN + DCA",
+      "b = 1 000 000",
+      "32 K pre-train; 128 K with YaRN / DCA",
+      "Qwen Team, arXiv:2505.09388"
+    ],
+    [
+      "Llama 4 Scout (Apr 2025)",
+      "iRoPE (interleaved RoPE + NoPE layers) + inference temperature scaling",
+      "Not disclosed",
+      "256 K pre-train; 10 M claimed",
+      "Meta AI blog, Apr 5 2025"
+    ],
+    [
+      "gpt-oss 20B / 120B (Aug 2025)",
+      "RoPE (inferred from gpt-oss architecture overview)",
+      "Not disclosed",
+      "Not fully disclosed",
+      "OpenAI blog, Aug 2025 (inferred from public reports)"
+    ],
+    [
+      "Gemini 2.5 Pro (2025)",
+      "Not publicly disclosed — PE details absent from available reports",
+      "n/a",
+      "1 M",
+      "Gemini 2.5 announcement, Mar 2025 (architecture uncertain)"
+    ],
+  ]}
+/>
+
+**Notes on specific rows.**
+
+*DeepSeek-V3 decoupled RoPE.* DeepSeek-V3 uses Multi-head Latent Attention (MLA), which compresses the KV cache via low-rank projections. To preserve the relative-position property while using MLA, the model maintains separate low-dimensional "RoPE heads" ($d_h^R = 64$) for query and key that carry only positional information; content is handled by the compressed latent vectors. The [attention variants chapter](/textbook/00b-attention-variants) covers MLA in full; the positional encoding consequence is that only the RoPE head dimensions are rotated.
+
+*Llama 4 iRoPE.* Meta's April 2025 blog post describes an interleaved architecture where some attention layers use standard RoPE and others use no positional encoding (NoPE — positional-free layers). The intent is that RoPE layers handle local ordering while NoPE layers aggregate global context without positional bias. The blog does not disclose the ratio of RoPE to NoPE layers; third-party analysis (Singh, Medium, April 2025) reports a 3:1 pattern, but this is not confirmed by Meta.
+
+*Gemini 2.5 Pro.* No primary technical report with positional encoding details was available at the time of writing. Community sources conflict. This row should be revisited when Google DeepMind publishes a Gemini 2.5 technical report.
+
+---
+
+## Comparison of schemes {#scheme-comparison}
+
+<ComparisonTable
+  caption="Positional encoding scheme properties. 'Extrapolates' means the model can process sequences longer than its training length without fine-tuning at useful quality. Sources listed in the Sources block."
+  columns={["Scheme", "Where signal added", "Encodes relative position natively", "Extrapolates without fine-tuning", "Dominant use in 2024–2026"]}
+  rows={[
+    [
+      "Sinusoidal absolute",
+      "Input embedding",
+      "No (only via learned composition)",
+      "Weak — degrades rapidly past training length",
+      "Legacy; original Transformer only"
+    ],
+    [
+      "Learned absolute",
+      "Input embedding",
+      "No",
+      "No — hard cap at T_max",
+      "Legacy; BERT, GPT-2, GPT-3"
+    ],
+    [
+      "T5 relative bias",
+      "Attention logit (additive scalar)",
+      "Yes",
+      "Partial — 'very far' treated uniformly",
+      "T5 family"
+    ],
+    [
+      "ALiBi",
+      "Attention logit (linear penalty)",
+      "Yes",
+      "Yes — graceful perplexity degradation",
+      "BLOOM, MPT; largely displaced by RoPE"
+    ],
+    [
+      "RoPE (base 10 000)",
+      "Q and K inside attention head (rotation)",
+      "Yes — by construction",
+      "No — rotation angles out-of-distribution past training length",
+      "Llama 2, Mistral-7B baseline"
+    ],
+    [
+      "RoPE + high base (500 K – 1 M)",
+      "Q and K inside attention head (rotation)",
+      "Yes",
+      "Partial — extended pre-training window, still needs YaRN for extreme lengths",
+      "Llama 3, Qwen2.5, Qwen3"
+    ],
+    [
+      "RoPE + YaRN fine-tuning",
+      "Q and K inside attention head (rotation)",
+      "Yes",
+      "Yes — after fine-tuning at extended length",
+      "Llama 3.1, DeepSeek-V3, Qwen3"
+    ],
+    [
+      "iRoPE (interleaved RoPE + NoPE)",
+      "Q and K in RoPE layers; none in NoPE layers",
+      "Yes (RoPE layers) / No (NoPE layers)",
+      "Yes — with inference temperature scaling",
+      "Llama 4 Scout (Apr 2025)"
+    ],
+  ]}
+/>
+
+---
+
+<Sources items={[
+  {
+    authors: "Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., Polosukhin, I.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original transformer. Sinusoidal PE formulas, learned PE comparison, NeurIPS 2017 venue."
+  },
+  {
+    authors: "Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., Liu, Y.",
+    year: "2021 (v5 Nov 2023)",
+    title: "RoFormer: Enhanced Transformer with Rotary Position Embedding",
+    venue: "NAACL 2022",
+    url: "https://arxiv.org/abs/2104.09864",
+    note: "All RoPE math: rotation matrix, relative-position property, base-frequency formula, decay property."
+  },
+  {
+    authors: "Press, O., Smith, N. A., Lewis, M.",
+    year: 2022,
+    title: "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation",
+    venue: "ICLR 2022",
+    url: "https://arxiv.org/abs/2108.12409",
+    note: "ALiBi formulation, slope values, 1.3 B perplexity result, 11% speed/memory gains."
+  },
+  {
+    authors: "Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., Liu, P. J.",
+    year: 2020,
+    title: "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer",
+    venue: "JMLR 2020",
+    url: "https://arxiv.org/abs/1910.10683",
+    note: "T5 relative bias bucket scheme, log-binning description."
+  },
+  {
+    authors: "Devlin, J., Chang, M.-W., Lee, K., Toutanova, K.",
+    year: 2018,
+    title: "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+    venue: "NAACL 2019",
+    url: "https://arxiv.org/abs/1810.04805",
+    note: "Learned absolute PE, T_max = 512, confirmed learned ≈ sinusoidal quality."
+  },
+  {
+    authors: "Chen, S., Wong, S., Chen, L., Tian, Y.",
+    year: 2023,
+    title: "Extending Context Window of Large Language Models via Positional Interpolation",
+    venue: "Meta AI, June 2023",
+    url: "https://arxiv.org/abs/2306.15595",
+    note: "PI formulation f'(x,m) = f(x, m·L/L'), ~600× smaller interpolation vs extrapolation error, Llama 2 7B → 32 K in <1 000 steps."
+  },
+  {
+    authors: "bloc97",
+    year: 2023,
+    title: "NTK-Aware Scaled RoPE allows LLaMA models to have extended (8k+) context size without any fine-tuning",
+    venue: "Reddit r/LocalLLaMA; HuggingFace TGI Issue #512, June 30 2023",
+    url: "https://github.com/huggingface/text-generation-inference/issues/512",
+    note: "NTK-aware base rescaling formula b' = b·α^(d/(d−2)), community origin. No peer-reviewed paper."
+  },
+  {
+    authors: "Peng, B., Quesnelle, J., Fan, H., Shippole, E.",
+    year: 2023,
+    title: "YaRN: Efficient Context Window Extension of Large Language Models",
+    venue: "Nous Research; ICLR 2024",
+    url: "https://arxiv.org/abs/2309.00071",
+    note: "YaRN = NTK-by-parts + temperature scaling, ramp function γ, temperature formula, α=1 β=32 for LLaMA, perplexity table at 8K/32K/131K."
+  },
+  {
+    authors: "Ding, Y., Zhang, L., Zhang, Z., Xu, S., Shang, Y., Xu, J., Yang, F., Yang, M.",
+    year: 2024,
+    title: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens",
+    venue: "Microsoft Research, February 2024",
+    url: "https://arxiv.org/abs/2402.13753",
+    note: "Non-uniform per-dimension interpolation via evolutionary search, progressive extension, 2 048 K context, ~1 000 fine-tuning steps."
+  },
+  {
+    authors: "Shang, N., Zhang, L., Wang, Z., Zhang, Z., Lopez, H., Yang, F., Chen, W., Yang, M.",
+    year: 2025,
+    title: "LongRoPE2: Near-Lossless LLM Context Window Scaling",
+    venue: "Microsoft Research, February 2025",
+    url: "https://arxiv.org/abs/2502.20082",
+    note: "Under-trained high-index RoPE dimensions hypothesis, evolutionary search guided by needle-driven perplexity, mixed-context-window training, 98.5% short-context retention, claimed 80× fewer training tokens than Meta's Llama 3.1 extension."
+  },
+  {
+    authors: "Men, X., Xu, M., Zhang, Q., Wang, X., Lin, Y., Lu, Z., Han, S., Chen, W.",
+    year: 2024,
+    title: "Base of RoPE Bounds Context Length",
+    venue: "Baichuan / ISCAS, 2024",
+    url: "https://arxiv.org/abs/2405.14591",
+    note: "Formal bounds on minimum RoPE base for given context lengths; Llama 3 base = 500 000 context."
+  },
+  {
+    authors: "Liu, X., Yan, H., Zhang, S., Liu, A., Huang, H., Long, D.",
+    year: 2023,
+    title: "Scaling Laws of RoPE-based Extrapolation",
+    venue: "arXiv 2023",
+    url: "https://arxiv.org/abs/2310.05209",
+    note: "Critical dimension concept; theorem that both smaller and larger bases can improve extrapolation; 1 M context via fine-tuning at 16 K with base 500."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2022,
+    title: "Rotary Embeddings: A Relative Revolution",
+    venue: "EleutherAI Blog",
+    url: "https://blog.eleuther.ai/rotary-embeddings/",
+    note: "rotate_half implementation, complex-number RoPE representation, inv_freq formula — best public exposition of RoPE implementation details."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2023,
+    title: "Extending the RoPE",
+    venue: "EleutherAI Blog",
+    url: "https://blog.eleuther.ai/yarn/",
+    note: "Independent corroboration of YaRN ramp-function formula, α=1/β=32 for LLaMA, temperature scaling implementation."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI Blog, April 5 2025",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "iRoPE architecture (interleaved RoPE + NoPE), inference-time temperature scaling, 10 M claimed context, 256 K pre-training context for Scout."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv May 2025",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "ABF base = 1 000 000, YaRN + Dual Chunk Attention for 128 K context, 32 K standard context window."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv December 2024",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "Decoupled RoPE for MLA (separate Q_R / K_R with d_h^R = 64), YaRN params s=40 / α=1 / β=32, context extension stages 4 K → 32 K → 128 K."
+  },
+  {
+    authors: "Weng, L.",
+    year: 2023,
+    title: "The Transformer Family Version 2.0",
+    venue: "Lilian Weng's Blog, January 27 2023",
+    url: "https://lilianweng.github.io/posts/2023-01-27-the-transformer-family-v2/",
+    note: "Survey of sinusoidal, learned, relative (Shaw 2018, Transformer-XL), RoPE, ALiBi in one accessible reference."
+  },
+  {
+    authors: "amaarora",
+    year: 2025,
+    title: "How LLMs Scaled from 512 to 2M Context: A Technical Deep Dive",
+    venue: "amaarora.github.io, September 2025",
+    url: "https://amaarora.github.io/posts/2025-09-21-rope-context-extension.html",
+    note: "Complete technical timeline for RoPE context extension; independent verification of NTK-aware and YaRN formulas."
+  }
+]} />

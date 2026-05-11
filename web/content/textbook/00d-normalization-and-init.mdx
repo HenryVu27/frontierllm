@@ -1,0 +1,728 @@
+---
+slug: 00d-normalization-and-init
+title: Normalisation and initialisation
+description: LayerNorm vs RMSNorm, pre-norm vs post-norm, QK-norm, initialisation schemes, and μP — the choices that keep frontier-scale training stable.
+order: 4
+chapter: 4
+reading_minutes: 28
+depends_on: [00a-transformer, 00b-attention-variants]
+provides: [rmsnorm, qk-norm, pre-norm, mup]
+last_reviewed: 2026-05-11
+---
+
+<Callout variant="note" title="Currency">
+Calibrated to frontier-model practice as of May 2026. The mathematical definitions are durable; the SOTA-choice table and the µP caveats section age fastest. Recheck every 6–12 months.
+</Callout>
+
+## Overview \{#overview\}
+
+A transformer trained without normalization and careful initialisation will, at sufficient depth or width, either fail to train or exhibit runaway activation growth that causes numerical overflow in mixed precision. This chapter explains the specific mechanisms behind both failure modes and the design choices that frontier labs make to avoid them.
+
+The material falls into five clusters:
+
+1. **LayerNorm vs RMSNorm** — the two normalization operations, what each computes, and why RMSNorm has become the universal choice in new architectures since 2022.
+2. **Norm placement** — pre-norm, post-norm, and the hybrid strategies (Peri-LN, HybridNorm, Mix-LN) that emerged in 2024–2025.
+3. **QK-norm** — the attention-logit blowup problem and how normalizing queries and keys inside the attention head addresses it.
+4. **Initialisation** — the small-variance baseline, depth-scaled output-projection init, fan-in/out conventions, and embedding initialization.
+5. **µP** — the Maximal Update Parametrization, how it makes optimal hyperparameters transferable across model widths, and the 2025 evidence that its large-scale claims need qualification.
+
+**Notation.** Throughout this chapter: $d$ is the model dimension ($d_\text{model}$ in some notations), $L$ is the number of transformer layers, $d_h$ is the per-head dimension, $\mathbf{x} \in \mathbb{R}^d$ is a hidden vector, and $\boldsymbol{\gamma}, \boldsymbol{\beta} \in \mathbb{R}^d$ are learned scale and shift parameters. Subscripts index elements: $x_i$ is the $i$-th component of $\mathbf{x}$.
+
+---
+
+## LayerNorm \{#layernorm\}
+
+### Mechanism
+
+**Layer normalization** (Ba, Kiros, and Hinton, 2016) normalizes each position vector independently across its feature dimension. Given a $d$-dimensional hidden vector $\mathbf{x}$, the operation computes:
+
+$$
+\mu = \frac{1}{d} \sum_{i=1}^{d} x_i, \qquad \sigma^2 = \frac{1}{d} \sum_{i=1}^{d} (x_i - \mu)^2
+$$
+
+and then applies an affine transform:
+
+$$
+\text{LayerNorm}(\mathbf{x}) = \frac{\mathbf{x} - \mu}{\sqrt{\sigma^2 + \epsilon}} \odot \boldsymbol{\gamma} + \boldsymbol{\beta}
+$$
+
+Here $\epsilon$ is a small constant (typically $10^{-6}$ in FP32 or $10^{-5}$ in FP16) added for numerical stability, $\boldsymbol{\gamma}$ is a learned element-wise scale (initialized to $\mathbf{1}$), and $\boldsymbol{\beta}$ is a learned element-wise shift (initialized to $\mathbf{0}$). The total learnable parameter count per LayerNorm is $2d$.
+
+LayerNorm differs from batch normalization in that it normalizes over the feature axis rather than the batch axis. This makes it independent of batch size and position within a sequence, both useful properties for autoregressive language models where each token position is processed at inference with a batch size of one.
+
+### Worked example
+
+Consider $\mathbf{x} = [1.0, 3.0, -1.0, 5.0]$ (so $d = 4$) with $\boldsymbol{\gamma} = \mathbf{1}$, $\boldsymbol{\beta} = \mathbf{0}$, and $\epsilon = 0$.
+
+$$
+\mu = \frac{1+3+(-1)+5}{4} = 2.0
+$$
+
+$$
+\sigma^2 = \frac{(1-2)^2 + (3-2)^2 + (-1-2)^2 + (5-2)^2}{4} = \frac{1+1+9+9}{4} = 5.0, \quad \sigma = \sqrt{5} \approx 2.236
+$$
+
+$$
+\text{LayerNorm}(\mathbf{x}) = \left[\frac{1-2}{2.236},\ \frac{3-2}{2.236},\ \frac{-1-2}{2.236},\ \frac{5-2}{2.236}\right] \approx [-0.447,\ 0.447,\ -1.342,\ 1.342]
+$$
+
+The output has mean zero and variance one (up to $\epsilon$). With non-trivial $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$, the network can recover any mean and variance it finds useful.
+
+---
+
+## RMSNorm \{#rmsnorm\}
+
+### Mechanism
+
+**RMSNorm** (Zhang and Sennrich, NeurIPS 2019) removes the mean-centering step from LayerNorm and retains only the RMS scaling:
+
+$$
+\text{RMS}(\mathbf{x}) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}
+$$
+
+$$
+\text{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\text{RMS}(\mathbf{x})} \odot \boldsymbol{\gamma}
+$$
+
+The shift parameter $\boldsymbol{\beta}$ is also dropped, leaving $d$ learnable parameters per RMSNorm (the scale vector $\boldsymbol{\gamma}$, initialized to $\mathbf{1}$).
+
+RMSNorm retains **re-scaling invariance**: if $\mathbf{x}$ is multiplied by a scalar $\alpha$, the output is unchanged (since $\text{RMS}(\alpha \mathbf{x}) = |\alpha| \cdot \text{RMS}(\mathbf{x})$ and the $|\alpha|$ cancels). It does *not* retain re-centering invariance: shifting all components by a constant $c$ changes the RMS and thus changes the output.
+
+### Worked example
+
+Using the same $\mathbf{x} = [1.0, 3.0, -1.0, 5.0]$:
+
+$$
+\text{RMS}(\mathbf{x}) = \sqrt{\frac{1^2 + 3^2 + (-1)^2 + 5^2}{4}} = \sqrt{\frac{1 + 9 + 1 + 25}{4}} = \sqrt{9} = 3.0
+$$
+
+$$
+\text{RMSNorm}(\mathbf{x}) = \left[\frac{1.0}{3.0},\ \frac{3.0}{3.0},\ \frac{-1.0}{3.0},\ \frac{5.0}{3.0}\right] = [0.333,\ 1.000,\ -0.333,\ 1.667]
+$$
+
+Compare with the LayerNorm output: $[-0.447, 0.447, -1.342, 1.342]$. The two operations give different outputs even with identical $\boldsymbol{\gamma}$ and $\boldsymbol{\beta} = \mathbf{0}$: LayerNorm forces zero mean, RMSNorm does not.
+
+### Why mean-centering turns out to be redundant
+
+Zhang and Sennrich (2019) originally proposed the mean-centering removal as an efficiency hypothesis. The mechanistic justification arrived in 2024. Gupta, Ozdemir, and Anumanchipalli (arXiv:2409.12951) analyzed LayerNorm geometrically and showed that it decomposes into three steps: (i) removing the component of $\mathbf{x}$ along the uniform direction $\mathbf{1}/\sqrt{d}$, (ii) normalizing the residual, (iii) rescaling by $\sqrt{d}$. They then measured the angle between hidden vectors and $\mathbf{1}/\sqrt{d}$ in GPT-J, Pythia, and Llama 3 and found that the angle is approximately 90° across all layers and all tested models — even *before* normalization is applied. The projection onto $\mathbf{1}$ is already negligibly small in these models; subtracting it makes virtually no difference to the normalized output.
+
+This is not a guarantee that mean-centering is redundant in all architectures, but it is the first model-level mechanistic evidence that the RMSNorm simplification is not merely cheaper but also functionally equivalent in practice.
+
+<Callout variant="info" title="Speedup claims in context">
+Zhang and Sennrich (2019) reported 7–64% wall-clock speedup for RMSNorm over LayerNorm depending on model size and hardware. With modern fused CUDA/Triton kernels, Gupta et al. (2024) noted the gap narrows to near parity. The practical advantage of RMSNorm in 2026 is primarily code simplicity and the absence of the shift parameter — not raw throughput.
+</Callout>
+
+### Failure modes
+
+- Setting $\epsilon$ too large (above $10^{-5}$ in FP16 contexts) can cause under-normalization for vectors with small norms, making the operation unreliable.
+- When running RMSNorm in FP16 with large $d$ ($\geq 4096$), the sum of squares can overflow FP16 range ($\approx 65504$). Most implementations upcast to FP32 for the accumulation step, then downcast the result.
+- RMSNorm cannot represent a non-zero mean output. This is benign in normal residual-stream usage but is a subtle issue in embedding-tied models where the final projection of small activation vectors may need a non-zero mean offset.
+
+<Callout variant="warning" title="Implementation detail">
+Always verify that your RMSNorm implementation upcasts the accumulation to FP32 when operating under BF16 or FP16 training. Fused kernel libraries (Apex, Triton, Flash-Attention) generally do this; manually written loops often do not.
+</Callout>
+
+---
+
+## Pre-norm vs post-norm \{#pre-norm-vs-post-norm\}
+
+The placement of normalization within a transformer block has substantial training dynamics consequences. Refer to the [residual stream framing](/textbook/00a-transformer#residual-stream) in chapter 1 for the block-level context.
+
+### Placement variants
+
+**Post-norm** (Vaswani et al., 2017) places the normalization after the residual addition:
+
+$$
+y = \text{Norm}(\mathbf{x} + F(\mathbf{x}))
+$$
+
+**Pre-norm** (GPT-2; Radford et al., 2019) normalizes the sub-layer input and leaves the residual path unmodified:
+
+$$
+y = \mathbf{x} + F(\text{Norm}(\mathbf{x}))
+$$
+
+**Peri-LN** normalizes both the sub-layer input and output:
+
+$$
+y_l = x_l + \text{Norm}\!\left(F\!\left(\text{Norm}(x_l)\right)\right)
+$$
+
+### Training dynamics
+
+Xiong et al. (ICML 2020, arXiv:2002.04745) provided a theoretical analysis using mean-field theory. At initialization, Post-LN produces large gradient norms near the output layer (where the scale of the combined $x + F(x)$ is similar to $F(x)$ alone at initialization, amplifying the normalized gradient). This large initial gradient near the output requires careful learning-rate warmup for Post-LN models to train stably.
+
+Pre-LN creates an *identity gradient highway*: the gradient of the loss with respect to layer $l$'s input receives an unmodified copy through the residual branch, independent of the normalization of the sub-layer branch. Gradients are therefore well-behaved at initialization. Xiong et al. showed that Pre-LN models can be trained without learning-rate warmup, while Post-LN models require it.
+
+**The pre-norm tradeoff.** The identity residual path in Pre-LN is also a liability. Each block adds a contribution $F(\text{Norm}(\mathbf{x}))$ to the stream without any normalization at the output. If each block's contribution has standard deviation $\sigma$, the residual stream variance after $L$ layers grows approximately as:
+
+$$
+\text{Var}(\mathbf{x}_L) \approx \text{Var}(\mathbf{x}_0) + 2L\sigma^2
+$$
+
+because there are $2L$ sub-layers (attention and FFN per block), each contributing independently. This is linear growth in depth. At large $L$ and mixed precision, this manifests as "massive activations" — hidden states with anomalously large magnitudes that can cause numerical overflow or saturate downstream layers.
+
+Post-LN normalizes after the residual addition, keeping activation variance roughly constant across depth. The better-conditioned representations at depth can yield lower perplexity at convergence, though at the cost of the more fragile training dynamics.
+
+### Peri-LN (2024–2025)
+
+Kim et al. (arXiv:2502.02732, February 2025) formalized **Peri-LN** and derived its variance dynamics. With both input and output normalization:
+
+$$
+y_l = x_l + \text{Norm}\!\left(\text{Module}\!\left(\text{Norm}(x_l)\right)\right)
+$$
+
+the variance growth is approximately **sub-linear** in depth — growing like $\sqrt{L}$ rather than linearly (Pre-LN) or staying constant (Post-LN). This avoids both the massive-activation problem of Pre-LN and the gradient-instability problem of Post-LN.
+
+Kim et al. tested Peri-LN at 3.2B parameters and found that Pre-LN diverged in 3 out of several seeds while Peri-LN completed all training runs stably, with a mean accuracy gain of +4.8 percentage points on downstream benchmarks.
+
+Critically, **Gemma 2** (Google DeepMind, Jun 2024, arXiv:2408.00118) and **OLMo 2** (AI2, Jan 2025, arXiv:2501.00656) had already quietly adopted output-side normalization within their residual blocks before the Peri-LN paper gave it a systematic analysis. Kim et al. identify both as prior practitioners of the strategy.
+
+<Sidenote>Peri-LN adds approximately twice the number of normalization operations per block relative to Pre-LN, and doubles the number of learnable $\boldsymbol{\gamma}$ vectors. At $d = 8192$ and $L = 80$ layers, this adds $2 \times 80 \times 2 \times 8192 \approx 2.6\text{M}$ parameters — negligible against billions of attention and FFN parameters, but worth counting in parameter budgets.</Sidenote>
+
+### HybridNorm and Mix-LN (2025)
+
+**HybridNorm** (Zhuo et al., arXiv:2503.04598, accepted NeurIPS 2025) applies normalization within the attention mechanism on Q, K, and V projections, while using Post-Norm in the FFN. This mixes the two strategies at sub-block granularity. The authors reported a 1.4$\times$ pre-training convergence speedup over standard Pre-Norm.
+
+**Mix-LN** applies Post-Norm to early layers and Pre-Norm to deeper layers. Early layers benefit from Post-Norm's expressivity and well-bounded outputs; deep layers benefit from Pre-Norm's gradient stability. The crossover layer is an implementation hyperparameter. Li et al. (2025) reported enhanced stability and performance with this scheme.
+
+**SiameseNorm** (Li et al., arXiv:2602.08064, February 2026) proposes a two-stream architecture coupling Pre-Norm and Post-Norm streams with shared parameters. Testing on 1.3B models showed strong optimization robustness. No frontier-lab adoption is confirmed at the time of writing (May 2026).
+
+<Callout variant="note" title="Practical default">
+Pre-norm with RMSNorm remains the default for new architectures in 2026. Peri-LN is the best-supported alternative when deep-model stability is a concern, with two open-weight frontier models (Gemma 2/3 and OLMo 2) as empirical backing. Post-norm in isolation requires careful learning-rate warmup and is not recommended for new training runs without architectural justification.
+</Callout>
+
+---
+
+## QK-norm \{#qk-norm\}
+
+### The attention-logit blowup problem
+
+The scaled-dot-product attention logit between query $\mathbf{q}_i \in \mathbb{R}^{d_h}$ and key $\mathbf{k}_j \in \mathbb{R}^{d_h}$ is:
+
+$$
+a_{ij} = \frac{\mathbf{q}_i^\top \mathbf{k}_j}{\sqrt{d_h}} = \frac{\|\mathbf{q}_i\| \cdot \|\mathbf{k}_j\| \cdot \cos\theta_{ij}}{\sqrt{d_h}}
+$$
+
+The $1/\sqrt{d_h}$ scaling is designed to keep logit magnitudes in a useful range at *initialization*, when $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ are of order $\sqrt{d_h}$ (see [attention math](/textbook/00b-attention-variants#scaled-dot-product)). But during training, the norms $\|\mathbf{q}\|$ and $\|\mathbf{k}\|$ can grow unchecked.
+
+Because softmax is translation-invariant — adding a constant to all logits in a row does not change the output — the model cannot adjust relative attention weights via additive shifts. It uses multiplicative norm growth instead. This creates a feedback loop: growing norms $\to$ more peaked (lower-entropy) softmax $\to$ near-one-hot attention $\to$ vanishing gradients through the attention operator $\to$ model learns to compensate by growing norms further. The softmax operator saturates and provides no useful gradient signal.
+
+Dehghani et al. (arXiv:2302.05442, 2023) observed this at 22B ViT scale: attention logits grew to magnitudes above 50,000 and caused training divergence after roughly 2,000 steps. Wortsman et al. (arXiv:2309.14322, 2023) showed using small-scale proxy training that the instability is not confined to vision; it appears reliably in language transformers at sufficient learning rate or batch size.
+
+### The QK-norm operation
+
+QK-norm applies a per-head RMSNorm to the query and key vectors *before* the dot product:
+
+```python
+# Pseudocode: QK-norm inside one attention head
+q = q_norm(q)   # per-head RMSNorm, separate learned γ
+k = k_norm(k)   # per-head RMSNorm, separate learned γ
+# Apply RoPE after QK-norm (see below)
+attn_logits = (q @ k.T) / math.sqrt(d_h)
+```
+
+After QK-norm, $\|\mathbf{q}\|$ is bounded: the RMSNorm output has RMS equal to the mean of $|\boldsymbol{\gamma}|$ entries. The norms can still grow if $\boldsymbol{\gamma}$ grows, but the norm growth is now mediated through a learned scalar per dimension — much slower and more stable than the uncontrolled pre-norm growth. The softmax entropy is preserved because logit magnitudes can no longer blow up geometrically.
+
+Henry et al. (EMNLP 2020 Findings, arXiv:2010.04245) first proposed QK-norm for NLP. Large-scale evidence came in 2023 with Dehghani et al.'s 22B ViT and the Wortsman et al. proxy experiments. Rybakov et al. (arXiv:2410.16682, 2024) showed at 830M parameters that combining QK-norm with V-norm (and removing pre-norm) enabled 1.5$\times$ higher stable learning rates compared to QK-norm alone.
+
+### Interaction with RoPE
+
+QK-norm must be applied **before** RoPE positional encoding (see [RoPE](/textbook/00c-positional-encodings#rope)). RoPE works by applying a position-dependent rotation matrix $R_m$ to $\mathbf{q}$ and $\mathbf{k}$:
+
+$$
+\tilde{\mathbf{q}}_m = R_m \mathbf{q}, \quad \tilde{\mathbf{k}}_n = R_n \mathbf{k}
+$$
+
+If RMSNorm is applied *after* RoPE, it removes the magnitude variation that the rotation introduces — destroying the position information encoded in the phases of the complex representation. The correct order is: linear projection $\to$ QK-norm $\to$ RoPE $\to$ dot product.
+
+### What QK-norm does not fix
+
+**Output logit divergence** is a distinct instability in the unembedding matrix (the final linear layer), not in attention. QK-norm addresses attention-logit blowup but does not prevent the unembedding logits from diverging. Stollenwerk et al. (arXiv:2601.02031, January 2026) analyzed this separately and proposed output-embedding centering (OEC) and $\mu$-loss as alternatives to z-loss for that purpose. See [tokenisation and objectives](/textbook/00g-tokenization-and-objectives#embedding-norm-growth) for the full treatment.
+
+**MLA incompatibility.** DeepSeek-V3's Multi-Head Latent Attention uses low-rank factored Q and K matrices (with joint absorption of the up-projection and down-projection into the weight). Applying per-head RMSNorm before the low-rank projection breaks the structural invariant of MLA. This is why DeepSeek-V3 does not use QK-norm despite its stability benefits. See [MoE plumbing](/textbook/00h-moe-plumbing#router-normalization) for MLA's architectural constraints.
+
+<Callout variant="exercise">
+Compute the attention logit magnitude for $\mathbf{q} = [10, 0, 0, 0]$, $\mathbf{k} = [0, 10, 0, 0]$ with $d_h = 4$, both before and after QK-norm with $\boldsymbol{\gamma} = \mathbf{1}$. Then compute it for $\mathbf{q} = [100, 0, 0, 0]$, $\mathbf{k} = [0, 100, 0, 0]$ — the same direction, 10$\times$ larger. Observe how QK-norm makes the logit magnitude invariant to the original vector scale (though not to the angle between $\mathbf{q}$ and $\mathbf{k}$).
+</Callout>
+
+---
+
+## Initialisation \{#initialisation\}
+
+### Standard small-variance baseline
+
+GPT-2 (Radford et al., 2019) initialized all weight matrices from $\mathcal{N}(0, 0.02^2)$. The value $0.02$ was chosen empirically to produce activations of order 1 at initialization when combined with LayerNorm. This is the starting baseline that most subsequent work inherits.
+
+For fan-in/out-aware initialization:
+
+- **Glorot (Xavier)** (Glorot and Bengio, 2010): $\text{std} = \sqrt{2 / (n_\text{in} + n_\text{out})}$. Appropriate for layers whose inputs have approximately zero mean after normalization (as in transformer residual paths).
+- **Kaiming (He)** (He et al., 2015): $\text{std} = \sqrt{2 / n_\text{in}}$. Appropriate for ReLU-type activations where only half the neurons are active at initialization. Often used for FFN projections in models with SwiGLU activations.
+
+In practice, many frontier implementations use a single value ($\sigma = 0.02$ or $\sigma = 1/\sqrt{d}$) across all projection matrices, relying on normalization layers to absorb scale differences.
+
+### The residual accumulation problem
+
+Consider a $L$-layer Pre-LN transformer. Each block adds a sub-layer output $F(\text{Norm}(\mathbf{x}))$ to the residual stream. If each sub-layer output has element-wise standard deviation $\sigma$ (independent of others at initialization), the variance at the stream after $2L$ sub-layers accumulates:
+
+$$
+\text{Var}(\mathbf{x}_L) \approx \text{Var}(\mathbf{x}_0) + 2L \cdot \sigma^2
+$$
+
+With the GPT-2 baseline of $\sigma = 0.02$ for all weights and no correction, a 96-layer model ($L = 96$, as in GPT-3) contributes variance $2 \times 96 \times (0.02)^2 \approx 0.077$ from the accumulated sub-layers alone, on top of the initial embedding variance. At much larger $L$, this scaling makes activations arbitrarily large.
+
+### Depth-scaled output projection init
+
+GPT-2 applied a depth-scaling correction to the **output projections** of both the attention block (the $W_O$ matrix projecting the concatenated heads back to $d$) and the FFN (the second linear layer). These are the two sub-layer components that directly write into the residual stream. The corrected standard deviation is:
+
+$$
+\sigma_\text{out-proj} = \frac{0.02}{\sqrt{2L}}
+$$
+
+With this correction, each sub-layer contributes variance $(0.02 / \sqrt{2L})^2 = 0.02^2 / (2L)$ to the stream. Summing over $2L$ sub-layers:
+
+$$
+\sum_{l=1}^{2L} \frac{0.02^2}{2L} = 0.02^2 = 0.0004
+$$
+
+The total accumulated variance is now constant in $L$. Zhang, Titov, and Sennrich (EMNLP 2019, arXiv:1908.11365) independently derived the same result as DS-Init (Depth-Scaled Initialization) and showed +1.1 BLEU on average for 12-layer machine translation models — consistent with the intuition that better-scaled initialization leads to better gradient flow throughout training.
+
+### Worked example
+
+Consider a transformer with $L = 32$ layers and GPT-2 baseline standard deviation 0.02.
+
+**Without depth scaling:** The output projection $W_O$ is initialized with $\text{std} = 0.02$. A sub-layer output $F(\mathbf{x})$ has typical element magnitude $\sim 0.02 \cdot \sqrt{d}$ (from the matrix-vector product). Summing $64$ sub-layers gives a stream variance contribution of $64 \times 0.02^2 = 0.026$.
+
+**With depth scaling:** The output projection $W_O$ is initialized with:
+$$
+\sigma = \frac{0.02}{\sqrt{2 \times 32}} = \frac{0.02}{8} = 0.0025
+$$
+
+Now each sub-layer contributes variance $0.0025^2$ per weight step and the sum over $64$ sub-layers stays at $64 \times 0.0025^2 \approx 0.0004$ — constant in $L$.
+
+<Callout variant="warning" title="Depth-scaling applies to both output projections">
+A common implementation error is to scale only the attention output projection $W_O$ and forget the second FFN linear layer (also called the "down-projection"). Both projections write directly to the residual stream; both must be scaled. Check your initialization code explicitly.
+</Callout>
+
+### Embedding initialization
+
+Token embeddings are typically initialized from $\mathcal{N}(0, 1)$ or $\mathcal{N}(0, 1/\sqrt{d})$ when a downstream LayerNorm or RMSNorm will rescale them. Under µP (next section), embedding initialization uses a separate tunable multiplier $\alpha_\text{input}$. DeepSeek-V3 initialized all learnable parameters including embeddings with a uniform $\text{std} = 0.006$ (arXiv:2412.19437).
+
+<Sidenote>T-FixUp (Huang et al., ICML 2020) showed that with careful depth-scaled initialization one can train a 200-layer transformer encoder-decoder without any layer normalization and without learning-rate warmup. This is pedagogically important: it demonstrates that normalization and warmup are compensating for poor initialization rather than being fundamental requirements. In practice, frontier-scale training in mixed precision relies on normalization for numerical stability, so T-FixUp is not used operationally but calibrates the understanding of why these components exist.</Sidenote>
+
+### Interaction with normalization placement
+
+The depth-scaling recipe was derived for Pre-LN. Under Post-LN, the normalization after the residual addition already bounds the output scale, so the accumulation problem is less severe. Under Peri-LN, the output-side normalization within the residual block similarly limits per-block output variance, reducing the urgency of depth scaling. The depth-scaling correction is most important for Pre-LN models, which form the majority of frontier architectures in 2026.
+
+---
+
+## µP and hyperparameter transfer \{#mup\}
+
+### The width-scaling problem
+
+In standard parametrization (SP), the optimal hyperparameters — particularly the learning rate $\eta$ and initialization variance $\sigma^2$ — shift when the model width $d$ changes. A practitioner who sweeps learning rates at $d = 256$ (small, cheap) and transfers the result to $d = 4096$ (production scale) will find the optimum has moved. The shift is not small: learning rate optimums can change by an order of magnitude across a 4$\times$ width multiplier in SP.
+
+### The µP mechanism
+
+Yang et al. (2022, "Tensor Programs V", arXiv:2203.03466) derived the **Maximal Update Parametrization** (µP), which guarantees that optimal hyperparameters are width-invariant. Define the width multiplier $m = d / d_\text{base}$ for some reference width $d_\text{base}$. µP makes three changes relative to SP:
+
+- **Hidden layer init variance:** scaled by $1/m$: $\quad \sigma^2 \leftarrow \sigma^2_\text{base} / m$
+- **Hidden layer learning rate (Adam):** scaled by $1/m$: $\quad \eta \leftarrow \eta_\text{base} / m$
+- **Output logit scaling:** multiplied by $\alpha_\text{out}/m$ where $\alpha_\text{out}$ is tunable
+- **Attention logit scaling:** changed from $1/\sqrt{d_h}$ to $1/d_h$
+- **Input/embedding layers:** standard init with separate multiplier $\alpha_\text{input}$
+
+The core invariant is that the **RMS of parameter updates** should be $O(1)$ regardless of width. Under Adam in SP, gradient variance grows with width (more parameters, more pathways for gradient accumulation), causing update magnitude to grow. µP corrects both initialization scale and learning rate to keep update magnitude constant.
+
+Changing the attention logit scaling from $1/\sqrt{d_h}$ to $1/d_h$ is the µP change most specific to transformers. Under SP with $1/\sqrt{d_h}$ scaling, widening the heads (increasing $d_h$) changes the effective temperature of the softmax. µP corrects this by making attention logits $O(1)$ rather than $O(\sqrt{d_h})$.
+
+### Practical workflow
+
+The standard µP workflow from EleutherAI's practitioner's guide (blog.eleuther.ai/mutransfer, 2024):
+
+1. **Coordinate check.** Train small models at widths $d \in \{64, 128, 256\}$ for 10 steps. Verify that layer output norms are invariant to width under µP — if they drift with width, there is an implementation error.
+2. **HP sweep on proxy model.** Use $d_\text{proxy} \approx 256$ with depth matching the target. Run a random search over $\sigma_\text{base}$, $\eta_\text{base}$, $\alpha_\text{input}$, and $\alpha_\text{out}$ for roughly 20 tokens per parameter.
+3. **Transfer to production.** Apply identical HP values to the target-width model. Re-sweep only when architectural hyperparameters change (depth, attention variant, activation function).
+
+### Unit-Scaled µP (u-µP)
+
+Blake et al. (arXiv:2407.17465, ICLR 2025) combined µP with Unit Scaling, ensuring that activations, weights, and gradients all begin training with scale 1. The combined scheme (u-µP) enables FP8 training out-of-the-box by removing the need for loss scaling, reduces HP interdependencies to allow nearly one-dimensional sweeps, and was accepted at ICLR 2025.
+
+### GQA-µP
+
+Standard µP's derivation assumes that attention uses multi-head attention with independent heads of size $d_h = d / n_\text{heads}$. Grouped-query attention (see [attention variants](/textbook/00b-attention-variants)) violates the rank assumptions underlying the derivation because keys and values are shared across query groups. Work published on OpenReview (October 2025) derived the first µP scalings for GQA, showing learning-rate transfer across the GQA repetition hyperparameter $g$ (number of query heads per KV head). This matters because virtually all frontier models use GQA.
+
+### The 2025 revision: weight decay at large scale
+
+Kosson et al. (arXiv:2510.19093, October 2025) re-examined µP's theoretical assumptions in practical LLM training. The µP invariant — that layer inputs are geometrically aligned with weights and gradients — holds approximately at the very start of training but breaks down within the first few hundred steps as the model learns. During most of training, it is weight decay rather than the µP initialization and learning-rate scaling that governs update dynamics across widths. Kosson et al. interpret µP scaling as functioning primarily as an implicit learning-rate warmup effect rather than as a persistent parametrization invariant.
+
+This finding limits µP's scope. Learning-rate transfer at proxy scale remains a practical benefit, particularly when budget constraints make large-scale HP sweeps infeasible. But practitioners should not expect near-perfect HP transfer without also explicitly tuning weight decay at target scale. The interaction with [optimiser configuration](/textbook/00f-optimizers#mup) (AdamW $\lambda$ tuning) is therefore important.
+
+### Frontier-lab practice
+
+µP-like schemes are mentioned in several lab reports but rarely disclosed in full. Cerebras has publicly described explicit µP adoption and the proxy-sweep workflow. The µP reference implementation (github.com/microsoft/mup) has been used in research and in Microsoft's Phi model family (inferred from the research lineage). Most other open-weight frontier labs — Meta (Llama), DeepSeek, Alibaba (Qwen), and AI2 (OLMo) — use standard parametrization with manual HP sweeps at or near target scale; µP adoption is not confirmed in their published technical reports.
+
+<Callout variant="warning" title="µP implementation error rate">
+The most common µP implementation error is forgetting to change the attention logit scaling from $1/\sqrt{d_h}$ to $1/d_h$. This error is silent: training proceeds without crash, but the HP transfer guarantee is broken above width multipliers of roughly 4. Always run the coordinate check (step 1 of the workflow) before assuming the implementation is correct.
+</Callout>
+
+---
+
+## Frontier norm and init choices \{#frontier-norm-init-table\}
+
+The following table summarizes normalization and initialization choices across publicly documented frontier models as of May 2026. Rows marked with "(inferred)" reflect the absence of a public architecture report; treat those entries as uncertain.
+
+<ComparisonTable
+  caption="Frontier-model normalization and initialisation choices, May 2026. Rows marked (inferred) lack a public architecture report."
+  columns={["Model", "Lab", "Norm type", "Placement", "QK-norm", "Init notes", "Source"]}
+  rows={[
+    [
+      "Llama 3 (8B–405B)",
+      "Meta",
+      "RMSNorm",
+      "Pre-norm",
+      "No",
+      "GPT-2 depth-scaled output proj; std not stated in paper",
+      "arXiv:2407.21783, Jul 2024"
+    ],
+    [
+      "Llama 4 Scout/Maverick",
+      "Meta",
+      "RMSNorm",
+      "Pre-norm",
+      "L2 on Q/K (unlearned, no γ)",
+      "—",
+      "Code analysis, Daniel Han (X, Apr 2025)"
+    ],
+    [
+      "DeepSeek-V3",
+      "DeepSeek",
+      "RMSNorm",
+      "Pre-norm (+MLA extra norms on compressed latents)",
+      "No (MLA incompatible)",
+      "All params: std = 0.006",
+      "arXiv:2412.19437, Dec 2024"
+    ],
+    [
+      "Qwen2.5",
+      "Alibaba",
+      "RMSNorm",
+      "Pre-norm",
+      "No (QKV bias present, not QK-norm)",
+      "—",
+      "arXiv:2412.15115, Jan 2025"
+    ],
+    [
+      "Qwen3",
+      "Alibaba",
+      "RMSNorm",
+      "Pre-norm",
+      "Yes (added in Qwen3; removed QKV bias)",
+      "—",
+      "arXiv:2505.09388, May 2025"
+    ],
+    [
+      "Gemma 2",
+      "Google DeepMind",
+      "RMSNorm",
+      "Peri-LN (pre + output norm)",
+      "No (uses logit soft-capping instead)",
+      "—",
+      "arXiv:2408.00118, Jun 2024"
+    ],
+    [
+      "Gemma 3",
+      "Google DeepMind",
+      "RMSNorm",
+      "Peri-LN",
+      "Yes (replaced soft-capping with QK-norm)",
+      "—",
+      "arXiv:2503.19786, Mar 2025"
+    ],
+    [
+      "OLMo 2 (7B–32B)",
+      "AI2",
+      "RMSNorm",
+      "Post-norm (inside-residual)",
+      "Yes",
+      "Switched from non-parametric LN; uses z-loss",
+      "arXiv:2501.00656, Jan 2025"
+    ],
+    [
+      "Mistral 7B / Mixtral",
+      "Mistral",
+      "RMSNorm",
+      "Pre-norm",
+      "No",
+      "—",
+      "Mistral blog / Mixtral paper, 2023"
+    ],
+    [
+      "Gemini 1.5 / 2.0",
+      "Google DeepMind",
+      "RMSNorm (via Gemma architecture lineage)",
+      "Pre-norm",
+      "Yes (Jan 2025 confirmed)",
+      "—",
+      "Gemma 3 report confirms Gemini architecture heritage; arXiv:2503.19786"
+    ],
+    [
+      "GPT-4 / GPT-4o (inferred)",
+      "OpenAI",
+      "RMSNorm (inferred from efficiency motivation)",
+      "Pre-norm (inferred from GPT-2 lineage)",
+      "Unknown",
+      "—",
+      "No public arch report; inferred from GPT-2 lineage"
+    ],
+    [
+      "Claude 3 / 3.5 / 3.7 (inferred)",
+      "Anthropic",
+      "RMSNorm (inferred from interpretability work)",
+      "Pre-norm (inferred)",
+      "Unknown",
+      "—",
+      "No public arch report; inferred from transformer-circuits research (Scaling Monosemanticity, 2024)"
+    ],
+  ]}
+/>
+
+Several observations from the table:
+
+- **RMSNorm has fully displaced LayerNorm** across all models with published architecture details. No model introduced after 2022 uses standard LayerNorm.
+- **Pre-norm is the dominant placement**, but not universal. OLMo 2 uses post-norm (inside-residual), Gemma 2/3 use Peri-LN. The two alternatives each have a specific motivation: OLMo 2 chose post-norm for better final representations; Gemma 2/3 chose Peri-LN to control massive activations.
+- **QK-norm adoption has grown since 2023**. Gemma 3, Qwen3, OLMo 2, and Gemini 2.0 all use it. The Qwen2 → Qwen3 transition (adding QK-norm, removing QKV bias) is a clear signal that logit-blowup problems appeared at Qwen3's training scale.
+- **The two unknowns** (GPT-4, Claude) are the most influential models in deployment. Architecture details remain undisclosed; the inferences are based on public interpretability research and historical lineage.
+
+---
+
+## Summary of design choices
+
+The five topics in this chapter interact:
+
+- **RMSNorm** is the right choice for any new transformer architecture: computationally equivalent to LayerNorm (with fused kernels), half the learnable parameters per norm, and mechanistically justified.
+- **Pre-norm** is the safe default for training stability. For deep models (100+ layers) or mixed-precision training, the Peri-LN variant adds output-side normalization to control activation variance growth.
+- **QK-norm** is worth enabling at any scale where logit blowup is a risk — roughly above 1B parameters or at high learning rates. It must be applied before RoPE and is incompatible with MLA.
+- **Depth-scaled output projection init** ($\sigma = 0.02/\sqrt{2L}$) is a low-cost correction that prevents variance explosion in Pre-LN models and should be the default.
+- **µP** provides a theoretically grounded workflow for learning-rate transfer from small proxy to large target. The Kosson et al. (2025) finding means weight decay should be treated as an equally important hyperparameter to transfer or re-tune at target scale.
+
+<Callout variant="exercise">
+Implement a minimal Pre-LN transformer block in PyTorch (no external libraries, just `torch.nn.Linear` and manual RMSNorm). Initialize the output projection of both the attention and FFN sub-layers using the depth-scaled formula above. Then add QK-norm before the dot-product attention. Verify numerically that: (1) the RMSNorm of the output projection is applied only to that specific weight matrix, not all weights; (2) the attention logits before softmax do not grow when query/key norms are increased 10$\times$.
+</Callout>
+
+---
+
+<Sources items={[
+  {
+    authors: "Ba, J.L., Kiros, J.R., and Hinton, G.E.",
+    year: 2016,
+    title: "Layer Normalization",
+    url: "https://arxiv.org/abs/1607.06450",
+    note: "Original LayerNorm paper; defines the mean-centering + affine-transform formulation."
+  },
+  {
+    authors: "Zhang, B. and Sennrich, R.",
+    year: 2019,
+    title: "Root Mean Square Layer Normalization",
+    venue: "NeurIPS 2019",
+    url: "https://arxiv.org/abs/1910.07467",
+    note: "Introduces RMSNorm; reports 7–64% wall-clock speedup over LayerNorm."
+  },
+  {
+    authors: "Gupta, A., Ozdemir, A., and Anumanchipalli, G.",
+    year: 2024,
+    title: "Re-Introducing LayerNorm: Geometric Meaning, Irreversibility and a Comparative Study with RMSNorm",
+    url: "https://arxiv.org/abs/2409.12951",
+    note: "First mechanistic evidence that mean-centering is redundant; tests GPT-J, Pythia, Llama 3."
+  },
+  {
+    authors: "Vaswani, A. et al.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original Post-LN transformer."
+  },
+  {
+    authors: "Radford, A. et al.",
+    year: 2019,
+    title: "Language Models are Unsupervised Multitask Learners (GPT-2)",
+    url: "https://openai.com/research/language-unsupervised",
+    note: "Introduces Pre-LN and the 1/√(2L) depth-scaled output-projection initialization."
+  },
+  {
+    authors: "Xiong, R. et al.",
+    year: 2020,
+    title: "On Layer Normalization in the Transformer Architecture",
+    venue: "ICML 2020",
+    url: "https://arxiv.org/abs/2002.04745",
+    note: "Mean-field analysis of Pre-LN vs Post-LN; shows Pre-LN trains without warmup."
+  },
+  {
+    authors: "Kim, J. et al.",
+    year: 2025,
+    title: "Peri-LN: Revisiting Layer Normalization in the Transformer Architecture",
+    url: "https://arxiv.org/abs/2502.02732",
+    note: "Formalizes Peri-LN; variance growth analysis; identifies Gemma 2 and OLMo 2 as prior users."
+  },
+  {
+    authors: "Zhuo, Z. et al.",
+    year: 2025,
+    title: "HybridNorm: Towards Stable and Efficient Transformer Training via Hybrid Normalization",
+    venue: "NeurIPS 2025",
+    url: "https://arxiv.org/abs/2503.04598",
+    note: "Mixes QKV-norm (attention) with Post-Norm (FFN); reports 1.4× convergence speedup over Pre-Norm."
+  },
+  {
+    authors: "Henry, A. et al.",
+    year: 2020,
+    title: "Query-Key Normalization for Transformers",
+    venue: "EMNLP 2020 Findings",
+    url: "https://arxiv.org/abs/2010.04245",
+    note: "Original NLP QK-norm paper."
+  },
+  {
+    authors: "Dehghani, M. et al.",
+    year: 2023,
+    title: "Scaling Vision Transformers to 22 Billion Parameters",
+    url: "https://arxiv.org/abs/2302.05442",
+    note: "First large-scale demonstration of attention-logit blowup; introduces QK-norm for ViT at 22B scale."
+  },
+  {
+    authors: "Wortsman, M. et al.",
+    year: 2023,
+    title: "Small-scale proxies for large-scale Transformer training instabilities",
+    url: "https://arxiv.org/abs/2309.14322",
+    note: "QK-norm enables stable training across three orders of magnitude of learning rate variation."
+  },
+  {
+    authors: "Rybakov, O. et al.",
+    year: 2024,
+    title: "Methods of improving LLM training stability",
+    url: "https://arxiv.org/abs/2410.16682",
+    note: "Systematic comparison of QK-norm, QKV-norm, softmax capping, z-loss at 830M scale."
+  },
+  {
+    authors: "Zhang, B., Titov, I., and Sennrich, R.",
+    year: 2019,
+    title: "Improving Deep Transformer with Depth-Scaled Initialization and Merged Attention",
+    venue: "EMNLP 2019",
+    url: "https://arxiv.org/abs/1908.11365",
+    note: "DS-Init; independent derivation of depth-scaled output-projection initialization."
+  },
+  {
+    authors: "Huang, X. et al.",
+    year: 2020,
+    title: "Improving Transformer Optimization Through Better Initialization (T-FixUp)",
+    venue: "ICML 2020",
+    url: "https://proceedings.mlr.press/v119/huang20f.html",
+    note: "200-layer transformer without warmup or LayerNorm via careful depth-scaled init."
+  },
+  {
+    authors: "Wang, H. et al.",
+    year: 2022,
+    title: "Foundation Transformers (MAGNETO)",
+    url: "https://arxiv.org/abs/2210.06423",
+    note: "Sub-LayerNorm + theory-grounded initialization for cross-modal stability."
+  },
+  {
+    authors: "Yang, G. et al.",
+    year: 2022,
+    title: "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer (µP)",
+    url: "https://arxiv.org/abs/2203.03466",
+    note: "Core µP paper; derives width-invariant hyperparameter transfer."
+  },
+  {
+    authors: "Blake, C. et al.",
+    year: 2025,
+    title: "u-µP: The Unit-Scaled Maximal Update Parametrization",
+    venue: "ICLR 2025",
+    url: "https://arxiv.org/abs/2407.17465",
+    note: "Combines µP with Unit Scaling; enables FP8 training; nearly 1D HP sweeps."
+  },
+  {
+    authors: "Kosson, A. et al.",
+    year: 2025,
+    title: "Weight Decay may matter more than µP for Learning Rate Transfer in Practice",
+    url: "https://arxiv.org/abs/2510.19093",
+    note: "µP invariants hold only briefly at training start; weight decay dominates update dynamics."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2024,
+    title: "The Practitioner's Guide to the Maximal Update Parameterization",
+    url: "https://blog.eleuther.ai/mutransfer/",
+    note: "Practical µP implementation guide with coordinate-check code and decision tree."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "Pre-norm RMSNorm; std = 0.006 init; no QK-norm due to MLA incompatibility; extra norms after MLA compressed latents."
+  },
+  {
+    authors: "Llama Team, Meta",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Pre-norm RMSNorm; no QK-norm."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Adds QK-norm and removes QKV bias compared to Qwen2/Qwen2.5."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2025,
+    title: "Qwen2.5 Technical Report",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "Pre-norm RMSNorm; QKV bias present; no QK-norm."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "Peri-LN placement; logit soft-capping instead of QK-norm."
+  },
+  {
+    authors: "Gemma Team, Google DeepMind",
+    year: 2025,
+    title: "Gemma 3 Technical Report",
+    url: "https://arxiv.org/abs/2503.19786",
+    note: "Peri-LN + QK-norm, replacing soft-capping; confirms Gemini architecture heritage."
+  },
+  {
+    authors: "OLMo Team, AI2",
+    year: 2025,
+    title: "OLMo 2 Furious",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "Post-norm RMSNorm + QK-norm + z-loss; switched from non-parametric LayerNorm."
+  },
+  {
+    authors: "Stollenwerk, F. et al.",
+    year: 2026,
+    title: "Output Embedding Centering for Stable LLM Pretraining",
+    url: "https://arxiv.org/abs/2601.02031",
+    note: "Output logit divergence; output-embedding centering (OEC) and µ-loss outperform z-loss."
+  },
+  {
+    authors: "Loshchilov, I. et al.",
+    year: 2024,
+    title: "nGPT: Normalized Transformer with Representation Learning on the Hypersphere",
+    url: "https://arxiv.org/abs/2410.01131",
+    note: "All vectors on unit hypersphere; reports 4–20× faster convergence to target loss at specific sequence lengths. Not yet adopted at frontier scale as of May 2026."
+  },
+  {
+    authors: "Raschka, S.",
+    year: 2025,
+    title: "The Big LLM Architecture Comparison",
+    venue: "Ahead of AI newsletter",
+    url: "https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison",
+    note: "Architecture comparison across 11 models; updated through mid-2025."
+  },
+]} />
