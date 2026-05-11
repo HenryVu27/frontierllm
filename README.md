@@ -16,21 +16,23 @@ Together those three repos cover the full pipeline. **`frontierllm` does not re-
 ## Layout
 
 ```
-notes/        # conceptual layer — markdown synthesis + reading lists per topic
-projects/     # hands-on layer — three milestone code projects (no code yet)
-papers/       # local-only PDFs (gitignored)
-scratch/      # half-baked experiments (gitignored)
-docs/         # design specs and plans
-ROADMAP.md    # thin index across all topics: what's been touched, what's next
+notes/                  # reading lists per topic (curated bibliography)
+web/content/textbook/   # taught chapters rendered at /textbook (MDX)
+projects/               # hands-on layer — three milestone code projects (no code yet)
+papers/                 # local-only PDFs (gitignored)
+scratch/                # half-baked experiments + research briefs (gitignored)
+docs/                   # design specs and plans
+ROADMAP.md              # thin index across all topics: what's been touched, what's next
 ```
 
 ## Where to start
 
 If you're new to this repo (or returning after a break):
 
-1. Read [`docs/superpowers/specs/2026-04-25-frontierllm-design.md`](docs/superpowers/specs/2026-04-25-frontierllm-design.md) for the design.
+1. Read [`docs/superpowers/specs/2026-04-25-frontierllm-design.md`](docs/superpowers/specs/2026-04-25-frontierllm-design.md) for the original design.
 2. Open [`ROADMAP.md`](ROADMAP.md) to see current status.
-3. **First active activity:** [`notes/07-frontier-labs/00-orientation.md`](notes/07-frontier-labs/00-orientation.md) — read 6 recent frontier-model technical reports and produce a comparative writeup. The output is a personal map of "what I know / don't know" that drives the next deep dive.
+3. **Prereqs textbook:** start at [`web/content/textbook/00-prerequisites.mdx`](web/content/textbook/00-prerequisites.mdx) or visit `/textbook` in the web reader for the eight-chapter module on transformers, attention variants, positional encodings, normalisation, activations, optimisers, tokenisation, and MoE plumbing. Synthesised from primary sources as of May 2026.
+4. **First active activity:** [`notes/07-frontier-labs/00-orientation.md`](notes/07-frontier-labs/00-orientation.md) — read 6 recent frontier-model technical reports and produce a comparative writeup. The output is a personal map of "what I know / don't know" that drives the next deep dive.
 
 ## How to use
 

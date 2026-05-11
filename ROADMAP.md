@@ -6,7 +6,7 @@ Thin index across all topics. Update the status line as you progress.
 
 ## Notes
 
-- `00-foundations/` — refresher on what's assumed (transformer math, optimization basics) — *0/6 done*
+- `00-foundations/` — reading list, with synthesis now in textbook module at `/textbook` — *bibliography only*
 - `01-pretraining/` — scaling laws, data, modern arch, optimization stability, mid-training, long context — *0/17 done*
 - `02-post-training/` — SFT, distillation, instruction tuning, synthetic data — *0/11 done*
 - `03-rlhf-and-rl/` — RM training, PPO, DPO family, RLAIF, RLVR, online vs offline — *0/16 done*
@@ -14,6 +14,21 @@ Thin index across all topics. Update the status line as you progress.
 - `05-eval-and-benchmarks/` — benchmark families, contamination, eval design — *0/13 done*
 - `06-alignment-and-interp/` — mech interp, SAEs, scalable oversight, red-teaming — *0/12 done*
 - `07-frontier-labs/` — frontier model reports, comparative analysis — *orientation pass: not started*
+
+## Textbook
+
+Polished MDX chapters rendered at `/textbook`, synthesised from primary sources.
+
+- `00-prerequisites` — landing/orientation page — *shipped 2026-05-11*
+- `00a-transformer` — residual stream, attention math, MLP, pre-norm, FLOPs — *shipped 2026-05-11*
+- `00b-attention-variants` — MHA/MQA/GQA/MLA, sliding-window, FlashAttention, SSM hybrids — *shipped 2026-05-11*
+- `00c-positional-encodings` — sinusoidal, ALiBi, RoPE, YaRN/LongRoPE — *shipped 2026-05-11*
+- `00d-normalization-and-init` — RMSNorm, QK-norm, Peri-LN/HybridNorm, μP — *shipped 2026-05-11*
+- `00e-activations-and-gating` — ReLU/GELU/SiLU, GLU family, SwiGLU, 2/3 width — *shipped 2026-05-11*
+- `00f-optimizers` — Adam/AdamW/Lion/Muon/Shampoo, WSD schedules — *shipped 2026-05-11*
+- `00g-tokenization-and-objectives` — BPE/SentencePiece, embeddings, CLM/FIM/MTP — *shipped 2026-05-11*
+- `00h-moe-plumbing` — routing, aux losses, capacity, frontier MoE landscape — *shipped 2026-05-11*
+- *(future)* pretraining / post-training / RLHF / distributed / eval / alignment textbook modules — *not started*
 
 ## Projects
 
@@ -29,7 +44,7 @@ Thin index across all topics. Update the status line as you progress.
 
 Reading lists are curated to ~5-10+ items per topic but get stale every 3-6 months. Refresh dates per topic:
 
-- `00-foundations`: 2026-04-25 (initial)
+- `00-foundations`: 2026-04-25 (initial); superseded by textbook module 2026-05-11
 - `01-pretraining`: 2026-04-25 (initial)
 - `02-post-training`: 2026-04-25 (initial)
 - `03-rlhf-and-rl`: 2026-04-25 (initial)

@@ -1,5 +1,13 @@
 # 00 — Foundations
 
+> **Looking for the taught material?** The prerequisites textbook lives at
+> [`/textbook`](/textbook) (or `web/content/textbook/` on disk). Eight chapters
+> covering the transformer block, attention variants, positional encodings,
+> normalisation and initialisation, activations and gating, optimisers,
+> tokenisation and objectives, and MoE plumbing — synthesised from primary
+> sources as of May 2026. The reading list below is the curated bibliography
+> behind those chapters.
+
 ## What this is
 
 A thin layer of refreshers for things assumed by every other topic. Skim if confident; come back when stuck.
