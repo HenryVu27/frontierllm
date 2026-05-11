@@ -22,6 +22,8 @@ import { ReadingListPage } from "@/pages/ReadingListPage";
 import { SearchPage } from "@/pages/SearchPage";
 import { AboutPage } from "@/pages/AboutPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { TextbookIndexPage } from "@/pages/TextbookIndexPage";
+import { TextbookChapterPage } from "@/pages/TextbookChapterPage";
 
 export const router = createBrowserRouter([
   {
@@ -41,6 +43,8 @@ export const router = createBrowserRouter([
       { path: "reading", element: <ReadingListPage /> },
       { path: "search", element: <SearchPage /> },
       { path: "about", element: <AboutPage /> },
+      { path: "textbook", element: <TextbookIndexPage /> },
+      { path: "textbook/:slug", element: <TextbookChapterPage /> },
       { path: "*", element: <NotFoundPage /> },
     ],
   },
