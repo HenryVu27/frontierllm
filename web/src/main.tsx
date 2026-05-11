@@ -5,6 +5,7 @@ import "@fontsource/cormorant-garamond/600.css";
 
 // Global styles + design tokens
 import "./styles/globals.css";
+import "katex/dist/katex.min.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
