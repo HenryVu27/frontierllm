@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getTopics, getProjects, getAllEntries } from "@/lib/manifest";
+import { getAllChapters } from "@/lib/textbook";
 import { useUiPrefs } from "@/hooks/useUiPrefs";
 import { useReadingProgress } from "@/hooks/useReadingProgress";
 import { topicCompletenessPct } from "@/lib/progress";
@@ -68,54 +69,60 @@ function NavItem({
   const showDot = dotPct !== undefined && dotPct !== null;
   const dotFilled = dotPct === 100;
   const dotPartial = dotPct !== null && dotPct !== undefined && dotPct > 0 && dotPct < 100;
+
+  const link = (
+    <NavLink
+      to={to}
+      {...(end !== undefined ? { end } : {})}
+      className={({ isActive }) =>
+        cn(
+          "flex items-center gap-2.5 rounded-lg",
+          "font-sans text-sm transition-colors duration-150",
+          "focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-1",
+          collapsed ? "w-9 h-9 justify-center px-0" : "px-2.5 py-1.5",
+          isActive
+            ? "bg-accent text-primary font-medium"
+            : "text-muted-foreground hover:text-primary hover:bg-accent"
+        )
+      }
+    >
+      {icon && (
+        <span className="shrink-0 w-4 h-4 flex items-center justify-center">
+          {icon}
+        </span>
+      )}
+      {!collapsed && (
+        <span className="truncate flex-1">{label}</span>
+      )}
+      {/* Three-state progress dot */}
+      {!collapsed && showDot && (
+        <Circle
+          className={cn(
+            "w-2 h-2 shrink-0 transition-all duration-150",
+            dotFilled
+              ? "fill-ring text-ring"
+              : dotPartial
+              ? "fill-ring/40 text-ring/40"
+              : "fill-border/30 text-border"
+          )}
+          aria-hidden="true"
+        />
+      )}
+    </NavLink>
+  );
+
+  // Tooltip only renders when the sidebar is icon-only — wrapping NavLink in
+  // Radix's Slot (via TooltipTrigger asChild) breaks NavLink's function-form
+  // className when expanded, so we skip the wrapper entirely in that case.
+  if (!collapsed) return link;
+
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
-        <TooltipTrigger asChild>
-          <NavLink
-            to={to}
-            {...(end !== undefined ? { end } : {})}
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg",
-                "font-sans text-sm transition-colors duration-150",
-                "focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-1",
-                collapsed ? "w-9 h-9 justify-center px-0" : "px-2.5 py-1.5",
-                isActive
-                  ? "bg-accent text-primary font-medium"
-                  : "text-muted-foreground hover:text-primary hover:bg-accent"
-              )
-            }
-          >
-            {icon && (
-              <span className="shrink-0 w-4 h-4 flex items-center justify-center">
-                {icon}
-              </span>
-            )}
-            {!collapsed && (
-              <span className="truncate flex-1">{label}</span>
-            )}
-            {/* Three-state progress dot */}
-            {!collapsed && showDot && (
-              <Circle
-                className={cn(
-                  "w-2 h-2 shrink-0 transition-all duration-150",
-                  dotFilled
-                    ? "fill-ring text-ring"
-                    : dotPartial
-                    ? "fill-ring/40 text-ring/40"
-                    : "fill-border/30 text-border"
-                )}
-                aria-hidden="true"
-              />
-            )}
-          </NavLink>
-        </TooltipTrigger>
-        {collapsed && (
-          <TooltipContent side="right" className="font-sans text-xs">
-            {label}
-          </TooltipContent>
-        )}
+        <TooltipTrigger asChild>{link}</TooltipTrigger>
+        <TooltipContent side="right" className="font-sans text-xs">
+          {label}
+        </TooltipContent>
       </Tooltip>
     </TooltipProvider>
   );
@@ -209,6 +216,7 @@ export function Sidebar() {
   // Load manifest data (safe after initManifest() in App.tsx)
   const topics = getTopics();
   const projects = getProjects();
+  const chapters = useMemo(() => getAllChapters(), []);
 
   // Build a minimal manifest shape for progress derivation
   const manifest = useMemo(() => ({ generatedAt: "", entries: getAllEntries() }), []);
@@ -219,9 +227,11 @@ export function Sidebar() {
 
   const toggleCollapse = () => setPref("sidebarCollapsed", !collapsed);
 
-  // Determine if any notes or project routes are active (for group defaultOpen)
+  // Determine if any notes/project/textbook/reading routes are active (for group defaultOpen)
   const notesActive = location.pathname.startsWith("/notes");
   const projectsActive = location.pathname.startsWith("/projects");
+  const textbookActive = location.pathname.startsWith("/textbook");
+  const readingActive = location.pathname.startsWith("/reading");
 
   return (
     <nav
@@ -265,14 +275,29 @@ export function Sidebar() {
           end={true}
         />
 
-        {/* Textbook */}
+        {/* Textbook group */}
         <div className="mt-2">
-          <NavItem
-            to="/textbook"
+          <NavGroup
             label="Textbook"
             icon={<GraduationCap className="w-4 h-4" />}
             collapsed={collapsed}
-          />
+            defaultOpen={textbookActive}
+          >
+            <NavItem
+              to="/textbook"
+              label="All Chapters"
+              collapsed={collapsed}
+            />
+
+            {chapters.map((chapter) => (
+              <NavItem
+                key={chapter.slug}
+                to={`/textbook/${chapter.slug}`}
+                label={chapter.title}
+                collapsed={collapsed}
+              />
+            ))}
+          </NavGroup>
         </div>
 
         {/* Notes group */}
@@ -281,7 +306,7 @@ export function Sidebar() {
             label="Notes"
             icon={<BookOpen className="w-4 h-4" />}
             collapsed={collapsed}
-            defaultOpen={notesActive || !collapsed}
+            defaultOpen={notesActive}
           >
             {/* Notes index */}
             <NavItem
@@ -319,7 +344,7 @@ export function Sidebar() {
             label="Projects"
             icon={<FolderKanban className="w-4 h-4" />}
             collapsed={collapsed}
-            defaultOpen={projectsActive || !collapsed}
+            defaultOpen={projectsActive}
           >
             {/* Projects index */}
             <NavItem
@@ -339,14 +364,30 @@ export function Sidebar() {
           </NavGroup>
         </div>
 
-        {/* Reading List */}
+        {/* Reading List group */}
         <div className="mt-2">
-          <NavItem
-            to="/reading"
+          <NavGroup
             label="Reading List"
             icon={<List className="w-4 h-4" />}
             collapsed={collapsed}
-          />
+            defaultOpen={readingActive || !collapsed}
+          >
+            <NavItem
+              to="/reading"
+              label="All Items"
+              collapsed={collapsed}
+            />
+            <NavItem
+              to="/reading?status=unread"
+              label="Unread"
+              collapsed={collapsed}
+            />
+            <NavItem
+              to="/reading?status=read"
+              label="Read"
+              collapsed={collapsed}
+            />
+          </NavGroup>
         </div>
 
         {/* About */}
