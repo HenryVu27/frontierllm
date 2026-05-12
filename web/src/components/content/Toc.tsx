@@ -4,7 +4,7 @@
  * Reads h2/h3 headings from the manifest entry (or from a prop directly).
  * Renders a flat anchor list with scroll-spy highlighting.
  *
- * Highlighted item uses manuscript-blue to match the spec accent.
+ * Highlighted item uses the primary foreground tint to match active state.
  */
 
 import { useMemo } from "react";
@@ -40,7 +40,7 @@ export function Toc({ headings }: Props) {
                   "focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-1 rounded",
                   heading.level === 3 && "pl-3",
                   isActive
-                    ? "text-manuscript-blue font-medium"
+                    ? "text-foreground font-medium"
                     : "text-muted-foreground hover:text-foreground"
                 )}
                 aria-current={isActive ? "location" : undefined}

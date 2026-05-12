@@ -211,7 +211,7 @@ export function RenderedMarkdown({ slug, className }: Props) {
           {/* Render the h2 heading visually */}
           <h2
             id="reading-list"
-            className="font-serif text-[1.75rem] font-medium leading-snug text-foreground mt-12 mb-0"
+            className="text-2xl font-semibold tracking-tight leading-snug text-foreground mt-12 mb-0"
           >
             Reading list
           </h2>

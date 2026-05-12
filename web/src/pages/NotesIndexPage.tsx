@@ -39,7 +39,7 @@ export function NotesIndexPage() {
       {/* Header */}
       <div className="flex items-start justify-between gap-4 mb-8">
         <div>
-          <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-1">
+          <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-1">
             Notes
           </h1>
           <p className="font-sans text-sm text-muted-foreground leading-relaxed">

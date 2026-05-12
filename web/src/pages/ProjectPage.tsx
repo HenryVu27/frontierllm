@@ -33,7 +33,7 @@ export function ProjectPage() {
   if (!entry) {
     return (
       <PageContainer>
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-4">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-4">
           Project not found
         </h1>
         <p className="font-sans text-sm text-muted-foreground mb-4">
@@ -56,7 +56,7 @@ export function ProjectPage() {
               Scoped — not started
             </span>
           </div>
-          <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-1">
+          <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-1">
             {entry.title}
           </h1>
           <p className="font-sans text-xs text-muted-foreground">

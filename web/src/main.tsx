@@ -1,7 +1,6 @@
-// Cormorant Garamond — the editorial serif used throughout (spec §7)
-import "@fontsource/cormorant-garamond/400.css";
-import "@fontsource/cormorant-garamond/400-italic.css";
-import "@fontsource/cormorant-garamond/600.css";
+// Geist Sans + Geist Mono — minimalist documentation typography.
+import "@fontsource-variable/geist/index.css";
+import "@fontsource-variable/geist-mono/index.css";
 
 // Global styles + design tokens
 import "./styles/globals.css";

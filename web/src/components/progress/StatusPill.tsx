@@ -1,6 +1,6 @@
 /**
  * StatusPill — small reusable pill for synthesis / project status.
- * Variants: "empty" (muted), "started" (vermillion), "scoped" (muted blue).
+ * Variants: "empty" (muted), "started" (primary), "scoped" (info blue).
  */
 
 import { cn } from "@/lib/utils";
@@ -23,7 +23,7 @@ const CONFIG: Record<StatusVariant, { label: string; className: string }> = {
   },
   scoped: {
     label: "Scoped",
-    className: "bg-[var(--manuscript-blue)]/10 text-[var(--manuscript-blue)] border-[var(--manuscript-blue)]/30",
+    className: "bg-info/10 text-info border-info/30",
   },
 };
 

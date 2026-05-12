@@ -91,7 +91,7 @@ export function ReadingListItem({ item }: Props) {
                 rel="noopener noreferrer"
                 className={cn(
                   "inline-flex items-center gap-1",
-                  "font-serif text-[17px] leading-snug",
+                  "text-[15px] leading-snug",
                   "text-foreground underline decoration-border underline-offset-2",
                   "transition-colors duration-150",
                   "hover:text-primary hover:decoration-primary",
@@ -109,7 +109,7 @@ export function ReadingListItem({ item }: Props) {
             ) : (
               <span
                 className={cn(
-                  "font-serif text-[17px] leading-snug text-foreground",
+                  "text-[15px] leading-snug text-foreground",
                   isRead && "line-through decoration-muted-foreground"
                 )}
               >

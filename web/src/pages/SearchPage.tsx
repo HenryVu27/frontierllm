@@ -35,7 +35,7 @@ export function SearchPage() {
   return (
     <PageContainer>
       <div className="mb-8">
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-1">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-1">
           Search
         </h1>
         {query && (

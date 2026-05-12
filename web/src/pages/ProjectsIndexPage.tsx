@@ -15,7 +15,7 @@ export function ProjectsIndexPage() {
   return (
     <PageContainer>
       <div className="mb-8">
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-1">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-1">
           Projects
         </h1>
         <p className="font-sans text-sm text-muted-foreground leading-relaxed">

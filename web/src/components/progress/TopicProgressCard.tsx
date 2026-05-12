@@ -71,7 +71,7 @@ export function TopicProgressCard({ topic, variant = "grid" }: Props) {
             <span className="font-mono text-[10px] text-muted-foreground bg-muted border border-border rounded px-1.5 py-0.5 shrink-0">
               {topic.slug.split("-")[0]}
             </span>
-            <h3 className="font-serif text-base font-medium text-foreground leading-snug truncate">
+            <h3 className="text-base font-semibold tracking-tight text-foreground leading-snug truncate">
               {topic.title}
             </h3>
           </div>

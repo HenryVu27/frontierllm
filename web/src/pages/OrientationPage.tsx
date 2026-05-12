@@ -47,7 +47,7 @@ export function OrientationPage() {
         <p className="font-sans text-xs font-semibold uppercase tracking-widest text-primary mb-2">
           First active activity
         </p>
-        <p className="font-serif text-base text-foreground leading-relaxed">
+        <p className="text-base text-foreground leading-relaxed">
           Read 6 recent frontier-model technical reports and produce a comparative writeup.
         </p>
         <p className="font-sans text-xs text-muted-foreground mt-2">
@@ -64,7 +64,7 @@ export function OrientationPage() {
       {/* Page header */}
       <div className="flex items-start justify-between gap-4 mb-6">
         <div>
-          <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-1">
+          <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-1">
             {entry?.title ?? "Orientation Pass"}
           </h1>
           {entry && (

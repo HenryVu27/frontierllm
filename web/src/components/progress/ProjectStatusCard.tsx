@@ -62,7 +62,7 @@ export function ProjectStatusCard({ project }: Props) {
           <p className="font-mono text-[10px] text-muted-foreground uppercase tracking-widest mb-1">
             Project
           </p>
-          <h3 className="font-serif text-base font-medium text-foreground leading-snug">
+          <h3 className="text-base font-semibold tracking-tight text-foreground leading-snug">
             {project.title}
           </h3>
         </div>

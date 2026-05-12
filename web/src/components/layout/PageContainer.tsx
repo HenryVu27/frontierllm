@@ -6,7 +6,7 @@
  * Respects prefers-reduced-motion: when reduced motion is preferred, animations
  * are disabled and the content renders instantly (spec §7, §17).
  *
- * Width target: max-w-[660px] (spec §7 — prose column for Cormorant at 19px).
+ * Width target: max-w-[660px] — reading-column constraint, ~58ch in Geist Sans.
  */
 
 import { motion, type Transition, useReducedMotion } from "framer-motion";

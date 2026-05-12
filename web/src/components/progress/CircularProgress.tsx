@@ -48,12 +48,12 @@ export function CircularProgress({
           stroke="var(--border)"
           strokeWidth={strokeWidth}
         />
-        {/* Progress ring — manuscript blue, starts from top */}
+        {/* Progress ring — primary accent, starts from top */}
         <circle
           cx={center}
           cy={center}
           r={radius}
-          stroke="var(--manuscript-blue)"
+          stroke="var(--ring)"
           strokeWidth={strokeWidth}
           strokeLinecap="round"
           strokeDasharray={circumference}
@@ -65,7 +65,7 @@ export function CircularProgress({
 
       {/* Center label */}
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="font-serif text-2xl font-medium text-foreground leading-none">
+        <span className="text-2xl font-semibold tracking-tight text-foreground leading-none">
           {pct}%
         </span>
       </div>

@@ -22,8 +22,8 @@ interface ResultRowProps {
 function KindBadge({ kind }: { kind: SearchDoc["kind"] }) {
   const config = {
     page: { label: "Page", icon: FileText, className: "text-primary border-primary/30 bg-primary/10" },
-    heading: { label: "Heading", icon: Hash, className: "text-manuscript-blue border-manuscript-blue/30 bg-manuscript-blue/10" },
-    "reading-item": { label: "Reading", icon: BookOpen, className: "text-gold border-gold/30 bg-gold/10" },
+    heading: { label: "Heading", icon: Hash, className: "text-info border-info/30 bg-info/10" },
+    "reading-item": { label: "Reading", icon: BookOpen, className: "text-warning border-warning/30 bg-warning/10" },
   } as const;
 
   const { label, icon: Icon, className } = config[kind];
@@ -133,7 +133,7 @@ function ResultGroup({ title, docs, icon }: ResultGroupProps) {
 function EmptyState({ query }: { query: string }) {
   return (
     <div className="py-12 text-center">
-      <p className="font-serif text-xl font-light text-muted-foreground mb-2">
+      <p className="text-xl font-medium tracking-tight text-foreground mb-2">
         No matches for &ldquo;{query}&rdquo;
       </p>
       <p className="font-sans text-sm text-muted-foreground/70 leading-relaxed mb-6">

@@ -101,9 +101,9 @@ function NavItem({
                 className={cn(
                   "w-2 h-2 shrink-0 transition-all duration-150",
                   dotFilled
-                    ? "fill-manuscript-blue text-manuscript-blue"
+                    ? "fill-ring text-ring"
                     : dotPartial
-                    ? "fill-manuscript-blue/40 text-manuscript-blue/40"
+                    ? "fill-ring/40 text-ring/40"
                     : "fill-border/30 text-border"
                 )}
                 aria-hidden="true"
@@ -242,13 +242,13 @@ export function Sidebar() {
       >
         {collapsed ? (
           <span
-            className="font-serif text-lg font-semibold text-primary"
+            className="text-lg font-semibold tracking-tight text-foreground"
             aria-label="frontierllm"
           >
             F
           </span>
         ) : (
-          <span className="font-serif text-base font-semibold text-foreground tracking-tight">
+          <span className="text-base font-semibold text-foreground tracking-tight">
             frontierllm
           </span>
         )}
@@ -264,6 +264,16 @@ export function Sidebar() {
           collapsed={collapsed}
           end={true}
         />
+
+        {/* Textbook */}
+        <div className="mt-2">
+          <NavItem
+            to="/textbook"
+            label="Textbook"
+            icon={<GraduationCap className="w-4 h-4" />}
+            collapsed={collapsed}
+          />
+        </div>
 
         {/* Notes group */}
         <div className="mt-2">
@@ -327,16 +337,6 @@ export function Sidebar() {
               />
             ))}
           </NavGroup>
-        </div>
-
-        {/* Textbook */}
-        <div className="mt-3">
-          <NavItem
-            to="/textbook"
-            label="Textbook"
-            icon={<GraduationCap className="w-4 h-4" />}
-            collapsed={collapsed}
-          />
         </div>
 
         {/* Reading List */}

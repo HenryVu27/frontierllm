@@ -78,16 +78,25 @@ export async function buildTextbook(): Promise<void> {
     let currentHeading = title;
     let currentAnchor = slugify(title);
     let buffer: string[] = [];
+    const seenAnchors = new Map<string, number>();
 
     const flush = () => {
       const text = stripMdx(buffer.join("\n"));
       if (text.length < 20) return;
+      // Dedupe collisions: repeated slugs get -2, -3, … suffixes in the
+      // search-record ID so MiniSearch doesn't throw. In-page navigation is
+      // unaffected because anchors used in MDX cross-refs are always explicit
+      // `{#anchor}` ids which are unique by author convention.
+      const count = (seenAnchors.get(currentAnchor) ?? 0) + 1;
+      seenAnchors.set(currentAnchor, count);
+      const dedupedAnchor =
+        count === 1 ? currentAnchor : `${currentAnchor}-${count}`;
       records.push({
-        id: `${slug}:${currentAnchor}`,
+        id: `${slug}:${dedupedAnchor}`,
         slug,
         title,
         heading: currentHeading,
-        anchor: currentAnchor,
+        anchor: dedupedAnchor,
         content: text,
       });
     };

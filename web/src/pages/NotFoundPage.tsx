@@ -27,7 +27,7 @@ export function NotFoundPage() {
         <p className="font-sans text-sm font-medium tracking-widest uppercase text-muted-foreground mb-4">
           404
         </p>
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-4">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-4">
           Page not found
         </h1>
         <p className="font-sans text-sm text-muted-foreground leading-relaxed mb-8">

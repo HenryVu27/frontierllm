@@ -50,10 +50,10 @@ export function DashboardPage() {
     <PageContainer>
       {/* ── Hero ──────────────────────────────────────────────────────────── */}
       <div className="mb-8">
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-2">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-2">
           frontierllm
         </h1>
-        <p className="font-sans text-sm text-muted-foreground leading-relaxed">
+        <p className="text-sm text-muted-foreground leading-relaxed">
           Personal frontier LLM training-side study — notes, reading lists, and projects.
         </p>
       </div>
@@ -63,7 +63,7 @@ export function DashboardPage() {
         <p className="font-sans text-xs font-semibold uppercase tracking-widest text-primary mb-2">
           First active activity
         </p>
-        <h2 className="font-serif text-lg font-medium text-foreground leading-snug mb-1">
+        <h2 className="text-lg font-semibold tracking-tight text-foreground leading-snug mb-1">
           Orientation pass
         </h2>
         <p className="font-sans text-sm text-muted-foreground leading-relaxed mb-3">
@@ -88,7 +88,7 @@ export function DashboardPage() {
           <div className="flex items-center gap-5">
             <CircularProgress pct={overallPct} size={100} strokeWidth={7} />
             <div>
-              <p className="font-serif text-base text-foreground leading-snug mb-1">
+              <p className="text-base text-foreground leading-snug mb-1">
                 {readItems} of {totalItems} reading items read
               </p>
               <p className="font-sans text-xs text-muted-foreground leading-relaxed">
@@ -103,7 +103,7 @@ export function DashboardPage() {
           <h2 className="font-sans text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-1">
             Synthesis status
           </h2>
-          <p className="font-serif text-sm text-foreground">
+          <p className="text-sm text-foreground">
             Started in{" "}
             <span className="font-medium">{synthCount}</span> of{" "}
             <span className="font-medium">{topics.length}</span> topics

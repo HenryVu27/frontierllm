@@ -116,7 +116,7 @@ export function TopicPage() {
   if (!entry && !loading) {
     return (
       <PageContainer>
-        <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-4">
+        <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-4">
           Topic not found
         </h1>
         <p className="font-sans text-sm text-muted-foreground mb-4">
@@ -134,7 +134,7 @@ export function TopicPage() {
       {/* Page header */}
       <div className="flex items-start justify-between gap-4 mb-6">
         <div className="min-w-0">
-          <h1 className="font-serif text-4xl font-light leading-tight tracking-tight text-foreground mb-2">
+          <h1 className="text-4xl font-semibold leading-tight tracking-tight text-foreground mb-2">
             {entry?.title ?? slug}
           </h1>
           {entry && (
@@ -184,7 +184,7 @@ export function TopicPage() {
 
         {/* Reading list — interactive component */}
         <TabsContent value="reading">
-          <h2 className="font-serif text-[1.75rem] font-medium leading-snug text-foreground mb-0">
+          <h2 className="text-2xl font-semibold tracking-tight leading-snug text-foreground mb-0">
             Reading list
           </h2>
           <ReadingList slug={slug} />
