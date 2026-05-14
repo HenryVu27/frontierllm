@@ -21,7 +21,9 @@
       "Bash(npm uninstall *)",
       "Bash(git -C \"C:/Personal/frontierllm\" status --short)",
       "Bash(git -C \"C:/Personal/frontierllm\" diff --cached --stat)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "PowerShell(New-Item *)",
+      "PowerShell(Start-Process \"C:\\\\Users\\\\Vuduc\\\\Desktop\\\\networking-guide.html\")"
     ]
   }
 }

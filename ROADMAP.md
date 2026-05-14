@@ -28,7 +28,25 @@ Polished MDX chapters rendered at `/textbook`, synthesised from primary sources.
 - `00f-optimizers` — Adam/AdamW/Lion/Muon/Shampoo, WSD schedules — *shipped 2026-05-11*
 - `00g-tokenization-and-objectives` — BPE/SentencePiece, embeddings, CLM/FIM/MTP — *shipped 2026-05-11*
 - `00h-moe-plumbing` — routing, aux losses, capacity, frontier MoE landscape — *shipped 2026-05-11*
-- *(future)* pretraining / post-training / RLHF / distributed / eval / alignment textbook modules — *not started*
+- `01-pretraining` — landing/orientation page — *shipped 2026-05-12*
+- `01a-data-pipeline` — sources, extraction, filtering, dedup, multilingual — *shipped 2026-05-11*
+- `01b-tokenizer-training` — vocab-size scaling laws, fertility, glitch-token prevention — *shipped 2026-05-11*
+- `01c-scaling-laws` — Kaplan → Chinchilla → Besiroglu/Porian → inference-aware overtraining — *shipped 2026-05-11*
+- `01d-mup-and-transfer` — μP, hyperparameter transfer, Kosson 2025 challenge — *shipped 2026-05-11*
+- `01e-schedules-and-batch` — warmup-cosine, WSD, critical batch size, batch ramp — *shipped 2026-05-11*
+- `01f-data-curriculum` — DoReMi, RegMix, Data Mixing Laws, multilingual temperature — *shipped 2026-05-11*
+- `01g-long-context` — ABF / YaRN / LongRoPE / iRoPE staged extension — *shipped 2026-05-11*
+- `01h-annealing-and-stability` — midtraining, FP8 (DeepSeek-V3, MXFP8, NVFP4), spike control — *shipped 2026-05-11*
+- `02-distributed` — landing/orientation page — *shipped 2026-05-14*
+- `02a-data-parallel` — DDP, gradient bucketing, AllReduce bandwidth — *shipped 2026-05-14*
+- `02b-tensor-parallel` — Megatron split, sequence parallel, context parallel — *shipped 2026-05-14*
+- `02c-pipeline-parallel` — GPipe, 1F1B, interleaved, DualPipe, zero-bubble — *shipped 2026-05-14*
+- `02d-expert-parallel` — AlltoAll dispatch/combine, node-limited routing — *shipped 2026-05-14*
+- `02e-fsdp-and-zero` — ZeRO-1/2/3, FSDP-1/2, hybrid sharding — *shipped 2026-05-14*
+- `02f-collectives-and-overlap` — NCCL primitives, SHARP, intensity floor — *shipped 2026-05-14*
+- `02g-mixed-precision-and-recompute` — BF16/FP16/FP8, selective recompute — *shipped 2026-05-14*
+- `02h-3d-4d-composition` — DP × TP × PP × EP × CP frontier configs — *shipped 2026-05-14*
+- *(future)* post-training / inference / eval / alignment / frontier-labs textbook modules — *not started*
 
 ## Projects
 

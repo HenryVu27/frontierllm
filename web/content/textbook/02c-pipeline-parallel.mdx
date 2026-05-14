@@ -1,0 +1,539 @@
+---
+slug: 02c-pipeline-parallel
+title: Pipeline parallelism
+description: Split layers across ranks — GPipe bubble math, 1F1B steady state, interleaved 1F1B, DeepSeek-V3's DualPipe, and the activation-memory vs bubble tradeoff at frontier scale.
+order: 22
+chapter: 21
+module: 2
+module_title: Distributed training
+reading_minutes: 38
+depends_on: [00a-transformer, 02a-data-parallel]
+provides: [pipeline-parallel, gpipe, 1f1b, interleaved-1f1b, dualpipe, zero-bubble, bubble-time]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Pipeline parallelism is the third axis of three-dimensional distributed training. Where [data parallelism](/textbook/02a-data-parallel) replicates the model across replicas that each see a different shard of the global batch, and tensor parallelism splits a single matmul across devices within a layer, pipeline parallelism splits the layer *stack* across devices. Rank 0 holds the first slice of layers, rank 1 the next, and so on; activations flow forward through the partition and gradients flow backward.
+
+The chief virtue of this decomposition is that the inter-stage messages are small. Each cross-rank hop transmits exactly one activation tensor on the forward pass and one gradient tensor on the backward, both of shape (micro-batch, sequence, hidden). By contrast, tensor parallelism executes an all-reduce of size $\mathcal{O}(d^2)$ inside every transformer block, where $d$ is the model dimension. For a 70B model with $d = 8192$, pipeline-parallel hops carry hundreds of megabytes per micro-batch while tensor-parallel collectives move gigabytes per layer. Pipeline parallelism is therefore the standard tool for crossing slow-fabric boundaries — between racks, between NVLink islands, between InfiniBand zones — where tensor parallelism would saturate the wire.
+
+The cost of this virtue is the *pipeline bubble*. Filling a deep pipe with a single batch leaves most devices idle for most of the time. Recovering throughput requires careful scheduling — micro-batching, overlapping, sub-stage decomposition — and the history of pipeline parallelism between 2018 and 2026 is essentially the history of progressively better schedules: GPipe, 1F1B, interleaved 1F1B, zero-bubble, DualPipe. Each schedule trades activation memory against bubble fraction against communication volume in a different way, and the choice depends on what the surrounding system is bottlenecked on.
+
+The chapter proceeds from the simplest schedule to the most aggressive. Section [The pipeline-parallel idea](#pp-idea) establishes the layer-partition picture and derives the bubble. The next four sections cover [GPipe](#gpipe), [1F1B](#one-f-one-b), [interleaved 1F1B](#interleaved), and [DualPipe](#dualpipe), each with its own schedule diagram and memory accounting. The [zero-bubble](#zero-bubble) section presents the B/W split. [Bubble-time math](#bubble-math) consolidates the formulas. [Activation memory vs recompute](#activation-tradeoff) ties the scheduling discussion to the per-stage memory budget. A [worked example](#worked-example) at $p = 8, m = 16$ for a 70B model gives concrete numbers, and a closing [frontier-lab configurations](#frontier-configs) section reports what Llama-3 405B and DeepSeek-V3 actually deployed.
+
+The activation-memory formulas in this chapter assume a particular recomputation regime; see [Mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute) for the recompute taxonomy that fills in those constants. The composition with data and tensor parallelism is the subject of [3D/4D composition](/textbook/02h-3d-4d-composition).
+
+---
+
+## The pipeline-parallel idea {#pp-idea}
+
+### Layer partitioning
+
+Consider a transformer with $L$ layers numbered $1, \dots, L$, deployed across $p$ pipeline stages. The canonical assignment is contiguous: stage $i$ owns layers
+$$\Big[\lfloor (i-1) L / p \rfloor + 1,\; \lfloor i L / p \rfloor \Big].$$
+A forward pass on a single example produces, at stage $i$, an activation tensor that is the input to stage $i+1$. A backward pass produces, at stage $i+1$, the gradient with respect to that same activation, which is shipped back to stage $i$. No other tensors cross stage boundaries during a step.
+
+For a single mini-batch of size $B$, the naive schedule is disastrous. Stage 1 computes its layers and sends the activation forward; stages $2, \dots, p$ are idle until they receive their input; stage 1 then waits the round-trip $\approx (2p - 2)\, t$, where $t$ is per-stage compute time, before its gradient comes back. Each device is busy a fraction $1/p$ of the wall-clock. For $p = 8$ this is 87.5% idle time, which throws away the entire premise of using $p$ devices.
+
+### The micro-batch trick
+
+The remedy is to split the mini-batch into $m$ smaller *micro-batches* of size $B/m$ and stream them through the pipe one after another. As soon as micro-batch $k$ leaves stage $i$, stage $i$ is free to begin micro-batch $k+1$. After a fill phase, every stage is processing some micro-batch.
+
+Counting wall-clock for the simplest schedule — all $m$ forward micro-batches first, then all $m$ backward — with equal per-stage forward and backward time $t_f = t_b = t$:
+
+- *Fill phase.* The first micro-batch must traverse $p-1$ stages before reaching stage $p$. Time: $(p-1)\, t$.
+- *Forward steady state.* Once the pipe is full, $m$ forward micro-batches stream through in $m \, t$.
+- *Backward steady state.* By symmetry, $m \, t$.
+- *Drain phase.* The last micro-batch's gradient takes $(p-1)\, t$ to walk back from stage 1 to stage $p$ in reverse.
+
+The total wall clock is
+$$T_{\text{total}} = 2 m t + 2(p-1)\, t,$$
+of which $2 m t$ is the useful work per device. The wasted fraction — the *bubble* — is
+$$b \;=\; \frac{T_{\text{idle}}}{T_{\text{total}}} \;=\; \frac{p - 1}{m + p - 1}.$$
+This is the GPipe bubble formula; it also governs the synchronous 1F1B schedule below. The asymmetric case $t_f \neq t_b$ gives the same fraction, since $T_{\text{total}} = (m + p - 1)(t_f + t_b)$.
+
+### Communication volume
+
+Per inter-stage hop, per micro-batch, exactly two messages cross: one activation tensor on the forward pass and one gradient tensor of the same shape on the backward. For a 70B-scale model with $d = 8192$, sequence $s = 8192$, micro-batch size 1, in bfloat16, each tensor is $s \cdot d \cdot 2 = 128 \text{ MB}$. With $m = 16$ micro-batches and $p = 8$ stages, roughly 32 GB of activations cross every hop per mini-batch. At a 400 Gbps RoCE link, the wire takes 0.64 s per hop, which is meaningful but small compared to the multi-second compute time of a 70B model at this batch size.
+
+The comparison to [tensor parallelism](/textbook/02b-tensor-parallel) is decisive. A Megatron-style TP block fires four all-reduces per transformer layer, each carrying a tensor of size proportional to $d^2$. For 80 layers and $d = 8192$, the per-step TP collective volume is in the high gigabytes. Pipeline parallelism's per-step volume is two activation tensors per hop — orders of magnitude lighter, which is exactly why TP is reserved for fast intra-node fabric while PP rides the slow inter-node link.
+
+<Sidenote>Communication is not free even when small. The per-hop activation must be serialised, sent, and received before the downstream stage can begin its compute, which adds a serial latency term to the pipeline. In practice both Megatron-LM and the DualPipe reference implementation overlap point-to-point sends with adjacent compute, so the wire latency is largely hidden when fabric bandwidth exceeds the per-micro-batch demand.</Sidenote>
+
+---
+
+## GPipe {#gpipe}
+
+### The schedule
+
+GPipe (Huang et al., 2018) was the first published pipeline-parallel training system aimed at deep networks beyond the size of a single accelerator. Its schedule is the simplest synchronous one:
+
+1. Push all $m$ forward micro-batches into the pipeline in order. Each stage saves every activation it computes, since it will need them on the corresponding backward.
+2. Once the last forward completes on stage $p$, fire all $m$ backward micro-batches in reverse order.
+3. Average per-micro-batch gradients on each stage and execute one optimiser step.
+
+Because every forward completes before any backward starts, GPipe is *bulk-synchronous*: the optimiser step uses the same weights that produced every forward pass. There is no weight staleness. This is GPipe's principal advantage over the earliest PipeDream variant, which used weight stashing to keep multiple weight versions in flight.
+
+### Bubble math
+
+With the all-forward-all-backward schedule, the bubble fraction follows directly from the wall-clock decomposition of [the previous section](#pp-idea):
+$$b_{\text{GPipe}} = \frac{p - 1}{m + p - 1}.$$
+The brief's verbatim statement of the bubble — quoted from Huang et al. (2018) — gives the same expression rearranged as $(p-1)/(p-1+m)$. At $p = 8$ and $m = 16$, this is $7/23 \approx 0.304$, the canonical *30% bubble figure* that motivates the entire downstream literature. To get below 10% at $p = 8$ requires $m \geq 63$; below 5%, $m \geq 133$.
+
+Set $m \gg p$ and the bubble vanishes. In practice the limiting factor is not the supply of micro-batches — a global batch of a few million tokens at sequence 8192 yields hundreds of sequences, more than enough to amortise the pipe — but the memory cost of holding $m$ micro-batches of activations on the first stage at the same time.
+
+### Activation memory cost
+
+Stage 1's micro-batch number 1 must keep its activations alive until micro-batch number $m$ finishes its backward, which is a wait of $\approx 2 m t$. Peak activation memory on stage $i$ in GPipe is
+$$M_{\text{act}}^{\text{GPipe}}(i) \;=\; m \cdot a_{\text{stage}},$$
+where $a_{\text{stage}}$ is the per-micro-batch activation footprint on a stage (assumed equal across stages for the symmetric case). Stage 1 is the bottleneck because its activations live longest. The formula scales linearly in $m$, which is precisely the variable a practitioner wants to push up to shrink the bubble.
+
+Huang et al. (2018) mitigated this with *re-materialisation*: each stage keeps only the input to its slice and recomputes the intermediate activations during backward. The cost is roughly 30% extra FLOPs in the backward; the benefit is a near-fivefold drop in activation memory. Re-materialisation is the conceptual ancestor of modern activation checkpointing strategies; see [Mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute) for the present-day taxonomy.
+
+Even with re-materialisation, GPipe's $m \cdot a_{\text{stage}}$ scaling sets a hard ceiling on how large $m$ can grow before stage-1 memory fills. The 1F1B schedule below attacks this ceiling directly while preserving the same bubble fraction.
+
+<Callout variant="note" title="GPipe's training-equivalence claim">
+GPipe produces gradients that are bitwise-equivalent to a single-device run with the same global batch — provided summation order on a stage is deterministic. The 1F1B-sync variant ([next section](#one-f-one-b)) shares this property. The original PipeDream with weight stashing does not, because different micro-batches see different weight versions; the textbook restricts attention to schedules that preserve synchronous-SGD semantics.
+</Callout>
+
+---
+
+## 1F1B (PipeDream) {#one-f-one-b}
+
+### Two variants of PipeDream
+
+The PipeDream literature is unfortunately tangled and the textbook must be careful about which paper introduced what. The original PipeDream (Harlap, Narayanan, Phanishayee, Seshadri, Devanur, Ganger, Gibbons, 2018; SOSP 2019) introduced the one-forward-one-backward schedule together with *weight stashing*: each stage retains multiple weight versions so that the backward for micro-batch $k$ uses the same weights that produced its forward. This trades a small amount of memory for relaxed semantics — different micro-batches in flight see different optimiser steps' weights — and achieves statistical efficiency comparable to data-parallel SGD.
+
+The variant that became the LLM standard is **1F1B-sync**, also called PipeDream-Flush, introduced by Narayanan, Phanishayee, Shi, Chen, and Zaharia (2021) in the PipeDream-2BW paper. It drops weight stashing and inserts a pipeline flush before each optimiser step, restoring strict bulk-synchronous semantics at the cost of a small amount of bubble. Megatron-LM adopts this variant as its default and most subsequent frontier runs follow Megatron. The remainder of this chapter writes "1F1B" to mean 1F1B-sync.
+
+<Sidenote>The 2021 PipeDream-2BW paper also introduces an alternative — *double-buffered weights* — that keeps two weight versions per stage and reaches data-parallel statistical efficiency with bounded staleness. Most published frontier runs choose the flush variant rather than 2BW; the discussion here defers to that choice. The 2BW analysis is drawn from the paper's algorithm description and search summaries, since the textbook author has not independently verified every assertion in the PipeDream-2BW paper.</Sidenote>
+
+### The schedule
+
+After the same fill phase as GPipe (the first $p$ micro-batches traverse the pipe forward), each stage enters a steady state in which it alternates: do one forward of the next micro-batch, then do one backward of the earliest-still-in-flight micro-batch. Backward pressure pushes the oldest micro-batches toward completion while new ones enter the head. The pipe is drained symmetrically before the optimiser step.
+
+Two consequences follow immediately.
+
+First, the bubble fraction is unchanged from GPipe. The fill and drain phases are identical, so
+$$b_{\text{1F1B}} = \frac{p-1}{m + p - 1}.$$
+
+Second, the peak activation memory drops dramatically. In the 1F1B steady state, the number of micro-batches whose activations are live on stage $i$ at any moment is $p - i + 1$. Stage 1 — the worst — carries activations for the $p$ micro-batches currently in flight, not for all $m$:
+$$M_{\text{act}}^{\text{1F1B}}(i) \;=\; (p - i + 1) \cdot a_{\text{stage}}.$$
+This is roughly a factor of $m/p$ improvement over GPipe at the bottleneck stage. For $p = 8$ and $m = 64$, GPipe stores $64 \cdot a_{\text{stage}}$ on stage 1 while 1F1B stores only $8 \cdot a_{\text{stage}}$ — an eight-fold reduction at zero bubble cost.
+
+### Why this matters at scale
+
+The activation-memory win is the single most important practical improvement in pipeline parallelism between 2018 and 2021, and the reason Megatron-LM adopted 1F1B as the default scheduler. In LLM training, weight memory per stage is small — the model is sharded across $p$ stages, so stage 1 holds $L/p$ layers' worth of weights — but activation memory dominates because each micro-batch's full forward state must persist until its backward. Shaving the activation budget from $m \cdot a$ down to $p \cdot a$ liberates roughly $(m - p) \cdot a$ bytes per stage, which can be redirected to longer sequences, larger micro-batches, or fewer recomputation steps.
+
+For the 70B example in the [worked-example section](#worked-example), this difference is the gap between 35 GB and 18 GB on stage 1, which determines whether the configuration fits comfortably on an 80 GB H100 alongside weights, optimiser-state shards, and gradients.
+
+---
+
+## Interleaved 1F1B {#interleaved}
+
+### Virtual pipeline stages
+
+Narayanan et al. (2021, "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM," SC'21) observed that the 1F1B bubble fraction $(p-1)/(m + p - 1)$ can be reduced *without* changing $p$ or $m$ by fragmenting each device's slice into smaller chunks and interleaving them through the stack.
+
+The trick: instead of giving device $i$ a single contiguous block of $L/p$ layers, give it $v$ thin "model chunks" of $L/(p v)$ layers each, scattered through the stack with stride $p$. Device 0 owns chunks $\{0, p, 2p, \dots, (v-1)p\}$; device 1 owns chunks $\{1, p+1, 2p+1, \dots\}$; and so on. A micro-batch now visits every device $v$ times during its forward pass, looping through the inter-stage ring $v$ times instead of once.
+
+The parameter $v$ is called the *virtual pipeline stage count* or *number of model chunks per device*. Megatron-LM uses values in $\{2, 4\}$ for production large-model training.
+
+### Bubble reduction
+
+The per-chunk forward and backward times shrink to $t_f / v$ and $t_b / v$, since each chunk is $v\times$ smaller. The pipeline-fill time is no longer $(p-1)\, t$ but $(p-1)\, (t/v)$, since the first micro-batch reaches the last chunk on the last device after only $p-1$ chunk-times. The bubble formula generalises accordingly:
+$$b_{\text{interleaved}} \;=\; \frac{1}{v} \cdot \frac{p - 1}{m + p - 1}.$$
+Interleaving with $v = 2$ halves the bubble; $v = 4$ quarters it. Returning to the $p = 8, m = 16$ case where 1F1B is at 30% bubble, $v = 2$ brings it to 15% and $v = 4$ to 7.6% — production-quality.
+
+### Costs
+
+Two costs trade against the bubble win.
+
+*Communication grows by a factor of $v$.* Each micro-batch now crosses each inter-stage boundary $v$ times instead of once. For the 70B example with 32 GB of inter-stage volume per mini-batch under 1F1B, $v = 4$ raises this to 128 GB per mini-batch. On NVLink-NVSwitch within a single server this is irrelevant; on a slow inter-rack fabric it is a real cost. Interleaved 1F1B is therefore preferred when PP groups sit within a fast-fabric island, and disfavoured when PP groups span slow links.
+
+*Peak activation memory is roughly the same as 1F1B.* Interleaving preserves the in-flight count on a stage — there are still $\mathcal{O}(p)$ micro-batches' activations resident at any moment — although the per-chunk bookkeeping is more complex. In practice the Megatron implementation reports a small constant-factor overhead in activation memory under interleaved 1F1B; the asymptotic scaling is the same.
+
+### Scheduling complexity
+
+The interleaved schedule is awkward to draw. Each device sees a sequence of activations belonging to different chunks of different micro-batches, and the dependency graph is harder to read than the flat 1F1B picture. The Megatron-LM scheduler precomputes the exact ordering of forward/backward operations per device per chunk, so at runtime each device just walks its assigned schedule. This is the de facto reference implementation; most downstream open-source codebases reuse it.
+
+<Callout variant="note" title="Interleaving and tensor parallelism">
+Interleaved 1F1B composes cleanly with tensor parallelism inside each chunk. The $v$ chunks per device share the same TP group, and TP collectives execute on a fast fabric while PP point-to-point messages cross the slow fabric. The composition is the subject of [3D/4D composition](/textbook/02h-3d-4d-composition); for now the relevant point is that interleaving does not break TP and does not change TP communication volume.
+</Callout>
+
+---
+
+## DualPipe (DeepSeek-V3) {#dualpipe}
+
+### The problem DualPipe solves
+
+DeepSeek-V3 (DeepSeek-AI, 2024) is a 671B-parameter mixture-of-experts model with 256 experts and expert-parallelism that spans cluster nodes. Each transformer block contains two cross-node all-to-all collectives: one to *dispatch* tokens to the experts that route to them, and one to *combine* expert outputs back into the residual stream. These all-to-alls cross slow inter-node fabric (InfiniBand in DeepSeek's cluster) and dominate per-block wall-clock time.
+
+A naive composition of pipeline parallelism with this MoE structure is disastrous. The pipeline bubble and the cross-node all-to-all stack sequentially: every micro-batch on every stage pays the all-to-all latency, *and* the pipeline pays its own fill/drain bubble. DualPipe is the schedule DeepSeek-AI designed to overlap these.
+
+### The schedule
+
+The DeepSeek-V3 technical report (arXiv:2412.19437, §3.2) describes two key ingredients.
+
+First, *bidirectional scheduling*. DualPipe runs two pipelines simultaneously in opposite directions: one feeds micro-batches from rank 0 toward rank $p-1$, the other feeds micro-batches from rank $p-1$ toward rank 0. Each rank participates in both pipelines. The "forward fill" of one direction overlaps with the "backward drain" of the other, halving the effective pipeline bubble relative to a unidirectional 1F1B with the same $m$.
+
+Second, *fine-grained four-way chunk decomposition*. Each forward chunk is decomposed into four sub-phases:
+
+1. **Attention** — the standard transformer attention computation.
+2. **Dispatch all-to-all** — sends each token's hidden state to the experts that will process it (cross-node, slow).
+3. **MLP / expert compute** — the per-expert linear layers, executed on whichever rank owns that expert.
+4. **Combine all-to-all** — gathers the expert outputs back to the originating rank (cross-node, slow).
+
+Each backward chunk decomposes similarly, and additionally splits the MLP and attention backward into a "backward-with-respect-to-input" component (B) and a "backward-with-respect-to-weights" component (W) — the same split used by [zero-bubble pipeline parallelism](#zero-bubble) below. The DualPipe scheduler then weaves these eight or so sub-phases per chunk across the two pipeline directions so that the dispatch and combine all-to-alls of one chunk are running in parallel with the attention or MLP compute of another chunk on the same rank.
+
+The result is that nearly all cross-node expert-parallel communication is hidden behind compute, and the effective pipeline bubble is shorter than 1F1B's because the bidirectional structure halves the fill/drain phases. DeepSeek-AI reports that the DualPipe steady state has approximately zero pipeline bubble during MoE training.
+
+### Cost
+
+DualPipe approximately doubles activation memory relative to 1F1B at the same $m$, because two pipelines are in flight simultaneously and each carries its own set of live micro-batches. DeepSeek-V3 absorbs this cost through two compensating mechanisms: FP8 storage of activations (halving the per-activation byte count relative to bf16) and selective recomputation of MLP-block activations. The combination keeps stage-1 memory inside an H800's 80 GB envelope.
+
+The reference implementation is available at `github.com/deepseek-ai/DualPipe` (DeepSeek-AI, 2025) and matches the scheduling logic described in the technical report; the open-source release made the schedule directly reproducible. Several other 2025 MoE training runs at frontier labs have adopted DualPipe-like bidirectional decomposition.
+
+<Callout variant="info" title="When DualPipe is overkill">
+DualPipe was designed for the specific pattern of cross-node MoE all-to-all dominance. For dense models — Llama-3, dense LLaMA derivatives, OLMo-2 — the all-to-all is absent and the additional memory and scheduling complexity of DualPipe purchase little benefit relative to a tuned interleaved 1F1B. The Llama-3 405B paper explicitly chose interleaved 1F1B over a bidirectional schedule for this reason; see the [frontier configurations](#frontier-configs) section.
+</Callout>
+
+---
+
+## Zero-bubble pipeline {#zero-bubble}
+
+### Splitting backward into B and W
+
+Qi, Wan, Huang, Lin, Lin, and You (2024, "Zero Bubble Pipeline Parallelism," ICLR 2024) made a clean observation about the structure of the backward pass that standard autograd implementations conflate. The backward of a transformer block consists of two computations:
+
+- **B = backward with respect to input** — computes $\partial \mathcal{L} / \partial \mathbf{x}_{\text{in}}$, the gradient that the *previous* stage needs in order to start its own backward. This computation blocks the pipeline.
+- **W = backward with respect to weights** — computes $\partial \mathcal{L} / \partial \theta$, the gradient that accumulates into the local weight-gradient buffer. This computation *does not* block the pipeline; no other stage waits for it.
+
+B and W carry roughly equal FLOPs (about half of the total backward each). The crucial point is that W can be deferred to any later moment without changing the schedule of any other stage, as long as it completes before the optimiser step. The W computations are precisely the work that can be slipped into bubble slots.
+
+### ZB-H1 and ZB-H2
+
+Qi et al. present two hand-crafted schedules.
+
+**ZB-H1** schedules W computations into the bubble slots of an otherwise-standard 1F1B-style schedule. Activation memory matches 1F1B. The bubble shrinks substantially but does not reach zero exactly, because the count of available W slots near the fill and drain phases does not match the count of bubble cells. Asymptotically, with $t_f = t_b = t$ and $t_W \approx t_b / 2 \approx t/2$, the bubble fraction is approximately
+$$b_{\text{ZB-H1}} \;\approx\; \frac{(p - 1) \cdot t_W}{m \cdot (t_f + t_b)},$$
+which is about half the 1F1B bubble for large $m$.
+
+**ZB-H2** schedules forwards, B's, and W's independently to achieve exactly zero bubble. The cost is roughly twice the activation memory of 1F1B, because more micro-batches must be kept resident to feed the W slots that fill what would otherwise be bubble cells.
+
+The paper additionally provides an automated scheduler, **ZB-2p** (and a memory-budgeted variant **ZB-1p**), which solves an integer program to produce a schedule that achieves under 1% bubble subject to a user-specified memory budget. ZB-2p is the variant most cited in subsequent work.
+
+### Status as of May 2026
+
+Zero-bubble pipeline is implemented in Megatron-LM and in several research forks, but no published frontier training run reports using ZB-H1, ZB-H2, or ZB-2p as its primary schedule. The Llama-3 405B paper uses interleaved 1F1B; the DeepSeek-V3 paper uses DualPipe. The reason for the slow adoption appears to be that interleaved 1F1B is already at roughly 5% bubble for properly configured large runs, and the additional gain from ZB does not justify the scheduler complexity for dense models. For MoE models where cross-node all-to-all is the dominant cost rather than the bubble itself, DualPipe is preferred because it hides communication rather than merely eliminating idle time.
+
+Zero-bubble is therefore best understood as a clean academic result whose adoption depends on the bottleneck: use ZB when pipeline bubble is the binding constraint and the model is dense; use DualPipe when cross-node communication dominates.
+
+<Callout variant="note" title="Gradient equivalence under ZB">
+ZB-H1, ZB-H2, and ZB-2p preserve bitwise-equivalent gradients to a single-device run, because deferring W's does not change what is computed — only when. The schedules are pure rearrangements of the same operations. This is in contrast to weight-stashed PipeDream, which changes the gradient values themselves. Synchronous semantics are preserved.
+</Callout>
+
+---
+
+## Bubble-time math {#bubble-math}
+
+This section consolidates the bubble formulas for reference. All formulas assume equal per-stage forward time $t_f$ and backward time $t_b$ unless noted otherwise.
+
+### GPipe and 1F1B-sync
+
+The all-forward-all-backward GPipe schedule and the 1F1B-sync schedule share the same fill and drain phases, hence the same bubble:
+$$b_{\text{GPipe}} = b_{\text{1F1B}} = \frac{p - 1}{m + p - 1}.$$
+The asymmetric case $t_f \neq t_b$ gives $T_{\text{total}} = (m + p - 1)(t_f + t_b)$, with the same fraction.
+
+The practical scaling: at fixed $p$, the bubble decays as $1/m$ for large $m$. Doubling $m$ approximately halves the bubble. At $p = 8$, $m = 16$ yields $b \approx 0.30$ (the canonical 30%); $m = 64$ yields $b \approx 0.10$; $m = 256$ yields $b \approx 0.03$.
+
+### Interleaved 1F1B
+
+With $v$ virtual stages per device, the per-chunk fill is $(p - 1)(t/v)$ and the bubble shrinks by a factor of $v$:
+$$b_{\text{interleaved}} \;=\; \frac{1}{v} \cdot \frac{p - 1}{m + p - 1}.$$
+At $p = 16$, $m = 64$, $v = 2$, this gives $b \approx 0.09$. At $v = 4$, $b \approx 0.045$.
+
+### Zero-bubble (ZB-H1, asymptotic)
+
+With $t_b$ split as $t_b = t_B + t_W$ and $t_B \approx t_W \approx t_b / 2$,
+$$b_{\text{ZB-H1}} \;\approx\; \frac{(p - 1) \cdot t_W}{m \cdot (t_f + t_b)}.$$
+This is roughly half the 1F1B bubble for matched $p, m, t_f, t_b$. ZB-H2 achieves $b \to 0$ exactly at the cost of doubled activation memory; ZB-2p with a generous memory budget typically reaches under 1%.
+
+### Practical guideline
+
+Published large-model runs target $b < 10\%$. At $p = 16$, the 1F1B baseline requires $m \geq 135$ to meet this. Interleaved $v = 2$ brings the requirement to $m \geq 65$; $v = 4$ to $m \geq 30$. DualPipe achieves approximately zero bubble *and* hides cross-node all-to-all, but only at the cost of doubled activation memory. The choice among 1F1B, interleaved 1F1B, ZB, and DualPipe is essentially a four-way trade among bubble fraction, activation memory, communication volume, and scheduler complexity, and depends on whether the surrounding system is compute-bound, memory-bound, or communication-bound.
+
+### What if $m < p$?
+
+The bubble formula degrades sharply for small $m$. At $m = 1$, $b = (p - 1)/p$ — the naive single-batch case where each device is idle a fraction $1 - 1/p$ of the wall-clock. At $m = p$, $b = (p - 1)/(2p - 1) \approx 1/2$. Real systems require $m \geq p$ as a hard minimum and $m \geq 4p$ as a practical floor. The empirical Megatron-LM target is $m \geq 8p$ for dense models with $v = 1$, relaxed to $m \geq 4p$ with $v = 2$ and $m \geq 2p$ with $v = 4$.
+
+---
+
+## Activation memory vs recompute {#activation-tradeoff}
+
+### What lives on each stage
+
+For a transformer block of hidden dimension $d$, sequence length $s$, and head count $h$, with bf16 activations and *no* activation checkpointing, the per-micro-batch per-layer activation footprint is approximately
+$$a_{\text{block}} \;\approx\; s \cdot d \cdot (10 + s/d) \cdot 2 \text{ bytes}$$
+under the Korthikanti et al. (2022) accounting. The $s/d$ term is the attention softmax matrix, which scales as $s^2$ in absolute size. The constant 10 covers the rest of the block's intermediate tensors — attention projections, MLP hidden activations, layer-norm caches.
+
+For the 70B configuration with $s = 8192, d = 8192$, this gives $a_{\text{block}} \approx 220$ MB per layer per micro-batch. A pipeline stage holding 10 layers therefore has $a_{\text{stage}} \approx 2.2$ GB per micro-batch.
+
+### Schedule comparison at the bottleneck
+
+The following table reports peak activation memory on the worst-case stage (stage 1) for the 70B configuration with $p = 8, m = 16$, no recomputation.
+
+<ComparisonTable
+  caption="Peak activation memory on stage 1 for the 70B PP=8 configuration with m=16 micro-batches, no recomputation, bf16. Source URLs cited per row."
+  columns={["Schedule", "Formula", "Peak (GB)", "Source"]}
+  rows={[
+    ["GPipe", "m · a_stage", "35", "Huang et al. 2018, https://arxiv.org/abs/1811.06965"],
+    ["1F1B (PipeDream-Flush)", "p · a_stage", "18", "Narayanan et al. 2021, https://arxiv.org/abs/2006.09503"],
+    ["Interleaved 1F1B (v=2)", "≈ p · a_stage", "18", "Narayanan et al. 2021, https://arxiv.org/abs/2104.04473"],
+    ["ZB-H1", "≈ p · a_stage", "18", "Qi et al. 2024, https://arxiv.org/abs/2401.10241"],
+    ["ZB-H2", "≈ 2p · a_stage", "35", "Qi et al. 2024, https://arxiv.org/abs/2401.10241"],
+    ["DualPipe", "≈ 2p · a_stage", "35", "DeepSeek-AI 2024, https://arxiv.org/abs/2412.19437"],
+    ["1F1B + selective recompute", "(p · a_attn-only)", "5–8", "Korthikanti et al. 2022, https://arxiv.org/abs/2205.05198"],
+    ["1F1B + full recompute", "p · a_stage-input", "~2", "Korthikanti et al. 2022, https://arxiv.org/abs/2205.05198"],
+  ]}
+/>
+
+GPipe's $m \cdot a_{\text{stage}} = 16 \cdot 2.2 = 35$ GB exceeds half the H100 80 GB envelope before weights, gradients, or optimiser state are accounted for. 1F1B's $p \cdot a_{\text{stage}} = 18$ GB is comfortably within budget. ZB-H2 and DualPipe at $\approx 2p \cdot a_{\text{stage}}$ require recomputation or FP8 storage to fit; both papers' reference deployments use one of these mitigations.
+
+### Recompute interaction
+
+Activation recomputation is the standard companion to pipeline parallelism and is treated in full in [Mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute). Two regimes are worth noting here.
+
+*Selective recomputation* (Korthikanti et al., 2022) keeps the attention activations — which are the most expensive to recompute, since their backward involves another softmax — and recomputes the MLP hidden state. This captures roughly 80% of the memory savings of full recomputation at the cost of about 10% extra FLOPs. Llama-3 405B (Grattafiori et al., 2024) uses selective recomputation as its production setting.
+
+*Full recomputation* keeps only the stage's input activation and recomputes everything else during backward. The memory saving is roughly a factor of 5 over no recompute; the FLOPs cost is about 30%. DeepSeek-V3 uses full recomputation only for the MLP block (which dominates expert compute), preserving attention activations to avoid the softmax recomputation.
+
+A useful rule: under 1F1B with selective recomputation, stage-1 activations drop from $p \cdot a_{\text{stage}}$ to roughly $p \cdot a_{\text{stage}}/3$. For the 70B case this is 5–8 GB instead of 18 GB, freeing about 10 GB of stage-1 memory for longer sequences, larger micro-batches, or running closer to the H100's memory bandwidth limit.
+
+---
+
+## Worked example: 70B with PP=8 {#worked-example}
+
+### Setup
+
+Consider a 70B-parameter dense transformer with $L = 80$ layers, hidden dimension $d = 8192$, sequence length $s = 8192$, and $h = 64$ attention heads. The training configuration is:
+
+- Pipeline degree $p = 8$, with 10 layers per stage (contiguous, 1F1B-sync schedule).
+- Global batch size 4 million tokens, equivalent to 512 sequences of length 8192.
+- Micro-batch size $b_\mu = 32$, giving $m = 512 / 32 = 16$ micro-batches per data-parallel rank.
+- Per-layer per-micro-batch activation in bf16 with no recomputation: roughly 220 MB.
+- Per-stage per-micro-batch activation: $10 \times 220 = 2200$ MB $= 2.2$ GB.
+
+### Bubble
+
+The straight 1F1B bubble fraction is
+$$b \;=\; \frac{p - 1}{m + p - 1} \;=\; \frac{7}{16 + 7} \;=\; \frac{7}{23} \;\approx\; 0.304.$$
+This is the canonical *30% bubble at $p = 8$, $m = 16$* figure quoted in the GPipe paper. Three mitigations are available, individually or stacked.
+
+- *Increase $m$.* Drop micro-batch size from 32 to 8, yielding $m = 64$: $b = 7/71 \approx 9.9\%$. Acceptable, but micro-batch 8 may underutilise the intra-stage TP matmuls on H100, where memory-bandwidth-bound regimes prefer larger micro-batches.
+- *Interleave $v = 2$.* The bubble becomes $\tfrac{1}{2} \cdot 7/23 \approx 15\%$. Better, but still borderline for production.
+- *Interleave $v = 4$.* The bubble becomes $\tfrac{1}{4} \cdot 7/23 \approx 7.6\%$. Production-quality, and the standard Megatron-LM choice for this configuration.
+
+### Activation memory
+
+Under 1F1B with no recomputation, peak activation memory on stage 1 is
+$$M_{\text{act}}^{\text{stage 1}} \;=\; p \cdot a_{\text{stage}} \;=\; 8 \cdot 2.2 \;=\; 17.6 \text{ GB}.$$
+Stage 1 additionally holds the weights for its 10 layers — roughly $10/80 \times 70 \text{B} \times 2 \text{ bytes} = 17.5 \text{ GB}$ — and a shard of the optimiser state. Under FSDP composed with PP, the optimiser-state shard for a stage might be 10 GB after sharding across the DP axis. Total stage-1 footprint is approximately $17.6 + 17.5 + 10 = 45$ GB, leaving roughly 35 GB on an 80 GB H100 for gradients, framework overhead, and KV-cache-style intermediate buffers. Feasible but tight.
+
+Adding selective recomputation drops the activation footprint from 17.6 GB to roughly 5 GB, returning about 12 GB of headroom. This is usually how runs at this scale are actually deployed.
+
+### The schedule comparison for this configuration
+
+<ComparisonTable
+  caption="Pipeline-parallel schedule options for 70B with PP=8, m=16, bf16 activations. Activation memory is stage-1 peak. Bubble assumes equal per-stage compute. Source URLs cited per row."
+  columns={["Schedule", "Bubble", "Peak act. mem (stage 1)", "Notes", "Source"]}
+  rows={[
+    ["GPipe", "30%", "35 GB", "Disqualifying memory at m=16", "Huang et al. 2018, https://arxiv.org/abs/1811.06965"],
+    ["1F1B (PipeDream-Flush)", "30%", "18 GB", "Bubble disqualifying without v", "Narayanan et al. 2021, https://arxiv.org/abs/2006.09503"],
+    ["1F1B, v=2", "15%", "18 GB", "Borderline; OK with selective recompute", "Narayanan et al. 2021, https://arxiv.org/abs/2104.04473"],
+    ["1F1B, v=4", "7.6%", "18 GB", "Standard production choice", "Narayanan et al. 2021, https://arxiv.org/abs/2104.04473"],
+    ["1F1B + selective recompute, v=4", "7.6%", "~5 GB", "Headroom for longer sequences", "Korthikanti et al. 2022, https://arxiv.org/abs/2205.05198"],
+    ["ZB-H1", "~15%", "18 GB", "Comparable to interleaved v=2; no frontier adoption", "Qi et al. 2024, https://arxiv.org/abs/2401.10241"],
+    ["ZB-H2", "~0%", "35 GB", "Needs recompute or FP8 to fit", "Qi et al. 2024, https://arxiv.org/abs/2401.10241"],
+    ["DualPipe", "~0% + hides comm", "35 GB", "Overkill for dense; designed for MoE", "DeepSeek-AI 2024, https://arxiv.org/abs/2412.19437"],
+  ]}
+/>
+
+The empirically chosen configuration for a 70B-scale dense run on H100 hardware is interleaved 1F1B with $v = 4$ and selective recomputation, which yields a 7.6% bubble at a stage-1 footprint of about 5 GB in activations.
+
+### Where this sits in 3D parallelism
+
+A typical 256-H100 deployment of a 70B model with the above configuration partitions the cluster as
+$$256 \;=\; \underbrace{8}_{\text{TP}} \;\times\; \underbrace{8}_{\text{PP}} \;\times\; \underbrace{4}_{\text{DP}}.$$
+Tensor parallelism runs across the 8 H100s inside a single NVLink-connected server, where the multi-gigabyte per-block all-reduces find sufficient bandwidth. Pipeline parallelism runs across servers within a single NVL island, where the per-hop activation traffic is manageable on InfiniBand. Data parallelism (FSDP variant) replicates across the remaining four-way axis. The principle — fast collectives on fast fabric, light point-to-point messages on slow fabric — is general; its formal treatment is the subject of [3D/4D composition](/textbook/02h-3d-4d-composition).
+
+---
+
+## Frontier-lab pipeline configs {#frontier-configs}
+
+### Llama-3 405B (Meta, Grattafiori et al., 2024)
+
+The Llama-3 405B configuration uses PP = 16, TP = 8, CP = 2 (context parallelism), and DP filling the remaining axes. Production training ran on up to 16 384 H100 GPUs at a peak.
+
+The pipeline parallelism design has a specific quirk worth flagging: the model has 126 layers, not 128. The Llama-3 paper and the follow-up engineering paper (Meta AI Systems, 2025, "Scaling Llama 3 Training with Efficient Parallelism Strategies," ISCA 2025) describe a co-designed model-and-schedule choice. The schedule removes one layer from rank 0 (which holds the embedding and the longest-lived activations under 1F1B) and one layer from rank $p-1$ (which holds the output head and the loss computation, both of which add asymmetric compute). The result is 126 transformer layers split across $p = 16$ stages such that ranks 0 and $p-1$ each hold 7 layers while the interior ranks hold 8, balancing memory at rank 0 against compute at rank $p-1$.
+
+The schedule itself is interleaved 1F1B drawn from the Megatron-LM reference implementation. The reported motivation for choosing PP = 16 rather than relying on a deeper FSDP is that an FSDP-only configuration at this scale would incur excessive inter-server gradient and parameter traffic, while PP = 16 keeps per-hop activation traffic small and pushes the heavy intra-block matmul traffic onto the fast intra-server NVLink fabric via TP.
+
+The 126-layer trick is the canonical published example of stage-asymmetry-aware model design. Few labs document this kind of fine-grained co-design publicly; the Llama-3 paper is unusual in its level of detail.
+
+### DeepSeek-V3 671B (DeepSeek-AI, 2024)
+
+DeepSeek-V3's configuration is PP = 16, EP = 64 (expert parallelism, since DeepSeek-V3 has 256 experts), TP = 1 (no tensor parallelism), and DP filling the remainder. The lack of TP is striking and stems from the choice of MLA attention, whose KV projections are small enough that intra-layer tensor splitting yields little benefit; DeepSeek-V3 relies entirely on expert parallelism and pipeline parallelism to span its 671B-parameter MoE state across the cluster.
+
+The pipeline schedule is DualPipe, chosen specifically for its overlap of cross-node MoE all-to-all with pipeline compute. The four-way decomposition — attention, dispatch, MLP, combine — fits the structure of a DeepSeek-V3 transformer block exactly, and the B/W split slips weight-gradient computations into bubble cells in the same spirit as zero-bubble. DeepSeek-AI reports near-zero pipeline bubble in steady state.
+
+The activation-memory cost of DualPipe is mitigated by FP8 storage of activations (DeepSeek-V3's "FP8 cookbook," covered in [Mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute)) and selective recomputation of MLP-block activations. Together these reduce stage memory enough to fit DualPipe's doubled in-flight count within an H800's 80 GB envelope alongside expert-parallel weight shards.
+
+### OLMo-2 32B (Groeneveld et al., 2024–2025)
+
+OLMo-2 32B (AI2) is a dense transformer that, as of May 2026, trains in production without pipeline parallelism. The published configuration uses FSDP-only (data parallelism with sharded optimiser state) on H100 nodes, relying on selective recomputation to keep activations within the per-node budget. AI2's reported reasoning is that for a 32B dense model, FSDP fits comfortably and avoiding pipeline parallelism simplifies the training stack — no bubble accounting, no per-stage memory tuning, no asymmetric layer assignment.
+
+The olmo-core framework (the training codebase behind OLMo-2) does support pipeline parallelism experimentally, through a `TransformerPipelineTrainModule` that wraps Megatron-style 1F1B scheduling. As of May 2026 this is documented as experimental in the olmo-core readthedocs, and AI2 has not reported using it for any production run. The textbook treats OLMo-2 PP support as evidence of an emerging open-source baseline rather than a deployed configuration; no published OLMo-2 systems paper exists.
+
+### Megatron-LM as reference baseline
+
+Megatron-LM (NVIDIA, `github.com/NVIDIA/Megatron-LM`) is the reference implementation that the entire field draws on. It supports GPipe, 1F1B-sync, interleaved 1F1B, and zero-bubble schedules. The canonical scaling study is the 2021 Narayanan et al. paper that trained a 1-trillion-parameter dense transformer on 3072 A100 GPUs at 52% model FLOPs utilisation using interleaved 1F1B with TP = 8 and PP varying from 8 to 64. Most subsequent frontier runs derive their schedule from this codebase, either directly or by reimplementation.
+
+### What is not yet mainstream
+
+A few notable schedules have been published but are not yet in deployed frontier runs as of May 2026.
+
+*Zero-bubble (ZB-H1, ZB-H2, ZB-2p)* is implemented in Megatron-LM and discussed in several research papers but has no published frontier-scale deployment. The 1F1B-with-interleaving baseline at $\sim 5\%$ bubble is good enough that the additional scheduler complexity of ZB does not justify itself for dense models, and DualPipe dominates for MoE.
+
+*Vocabulary parallelism* (Liu et al., 2024, arXiv:2411.05288) addresses the last-stage load imbalance caused by the large unembedding matrix, which sits entirely on rank $p - 1$ and produces asymmetric compute. The proposal shards the unembedding across the pipeline axis. It is not yet adopted in any published frontier run; Llama-3's 126-layer trick is the present-practice workaround.
+
+*Breadth-first pipeline parallelism* (Lamy-Poirier, 2023, MLSys 2023) is an alternative schedule that prioritises throughput over latency by enlarging the pipeline horizon; it has not been adopted at scale.
+
+*Sequence-level pipeline parallelism* (Seq1F1B, 2024) splits along the sequence dimension rather than the layer dimension; remains academic as of May 2026.
+
+The pace of pipeline-schedule research has slowed since 2024. The remaining live questions concern (i) co-design with FP8 and FP4 mixed precision, (ii) failure recovery in deep pipelines on 16K+ GPU clusters, and (iii) the proper composition with expert parallelism in MoE models. None of these has produced a clear frontier-default new schedule between 2024 and May 2026.
+
+---
+
+## Chapter summary {#summary}
+
+- **Pipeline parallelism partitions the layer stack across $p$ devices** and ships activation/gradient tensors over inter-stage hops. Per-hop volume is small compared to tensor parallelism, which makes PP the standard tool for crossing slow-fabric boundaries.
+- **The bubble is the cost of pipeline parallelism.** With $m$ micro-batches and the GPipe or 1F1B-sync schedule, the bubble fraction is $b = (p - 1)/(m + p - 1)$. At $p = 8$, $m = 16$, this is 30% — the canonical figure that drives the rest of the literature.
+- **1F1B preserves the GPipe bubble while cutting peak activation memory from $m \cdot a_{\text{stage}}$ to $p \cdot a_{\text{stage}}$.** For the 70B PP=8 example with $m = 16$, this is the difference between 35 GB and 18 GB on stage 1.
+- **Interleaved 1F1B with $v$ chunks per device reduces the bubble by a factor of $v$ at $v\times$ communication cost.** Megatron defaults to $v \in \{2, 4\}$; production frontier runs prefer $v = 4$ when the PP group sits inside a fast fabric.
+- **Zero-bubble pipelines split the backward pass into B (input grad, blocking) and W (weight grad, non-blocking).** ZB-H1 matches 1F1B memory; ZB-H2 doubles memory but achieves zero bubble; ZB-2p solves an integer program for under-1% bubble under a memory budget. Not yet adopted at frontier scale.
+- **DualPipe (DeepSeek-V3) runs two bidirectional pipelines and decomposes each chunk into attention / dispatch / MLP / combine, with a B/W split.** Hides cross-node MoE all-to-all behind compute; doubles activation memory; absorbed by FP8 and selective recomputation.
+- **Llama-3 405B trains with PP = 16, TP = 8, 126 layers** — one fewer at rank 0 for memory, one fewer at rank $p - 1$ for compute balance — using Megatron's interleaved 1F1B.
+- **DeepSeek-V3 671B trains with PP = 16, EP = 64, TP = 1, DualPipe**, FP8 activations, and selective MLP recomputation. Reports approximately zero pipeline bubble.
+- **OLMo-2 32B trains without pipeline parallelism**, relying on FSDP and selective recomputation. The olmo-core framework supports PP experimentally; no production OLMo-2 run uses it as of May 2026 and there is no published OLMo-2 systems paper.
+- **The choice among schedules is a four-way trade** among bubble fraction, activation memory, communication volume, and scheduler complexity. The correct choice depends on whether the surrounding system is compute-bound, memory-bound, or communication-bound — which is the topic of [3D/4D composition](/textbook/02h-3d-4d-composition).
+
+---
+
+<Sources items={[
+  {
+    authors: "Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, M. X., Chen, D., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., Chen, Z.",
+    year: 2018,
+    title: "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism",
+    venue: "Google Brain; NeurIPS 2019",
+    url: "https://arxiv.org/abs/1811.06965",
+    note: "Founding pipeline-parallel paper. All-forward-all-backward schedule; bubble fraction (p-1)/(m+p-1); re-materialisation; trained a 6B 128-layer transformer and AmoebaNet on ImageNet."
+  },
+  {
+    authors: "Harlap, A., Narayanan, D., Phanishayee, A., Seshadri, V., Devanur, N., Ganger, G., Gibbons, P.",
+    year: 2018,
+    title: "PipeDream: Fast and Efficient Pipeline Parallel DNN Training",
+    venue: "Microsoft Research; SOSP 2019",
+    url: "https://arxiv.org/abs/1806.03377",
+    note: "Original 1F1B schedule with weight stashing. The textbook treats 1F1B-sync (PipeDream-Flush) as the LLM-relevant variant; cite this paper for the schedule invention."
+  },
+  {
+    authors: "Narayanan, D., Phanishayee, A., Shi, K., Chen, X., Zaharia, M.",
+    year: 2021,
+    title: "Memory-Efficient Pipeline-Parallel DNN Training",
+    venue: "Microsoft Research, Stanford; ICML 2021",
+    url: "https://arxiv.org/abs/2006.09503",
+    note: "PipeDream-2BW (double-buffered weights) and PipeDream-Flush (1F1B-sync, the LLM standard). Drops weight stashing in favour of a pipeline flush; restores synchronous-SGD semantics."
+  },
+  {
+    authors: "Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Patwary, M., Korthikanti, V., Vainbrand, D., Kashinkunti, P., Bernauer, J., Catanzaro, B., Phanishayee, A., Zaharia, M.",
+    year: 2021,
+    title: "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM",
+    venue: "NVIDIA, Microsoft Research, Stanford; SC '21",
+    url: "https://arxiv.org/abs/2104.04473",
+    note: "Introduces interleaved 1F1B (virtual pipeline stages, v chunks per device). Reports 1T parameters on 3072 A100s at 52% MFU. The canonical scaling-study reference for production pipeline parallelism."
+  },
+  {
+    authors: "Qi, P., Wan, X., Huang, G., Lin, M., Lin, M., You, Y.",
+    year: 2024,
+    title: "Zero Bubble Pipeline Parallelism",
+    venue: "Sea AI Lab, NUS; ICLR 2024",
+    url: "https://arxiv.org/abs/2401.10241",
+    note: "Splits backward into B (input grad, blocking) and W (weight grad, non-blocking). ZB-H1 matches 1F1B memory; ZB-H2 doubles memory for zero bubble; ZB-2p solves an integer programme for <1% bubble under a memory budget."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "DeepSeek-AI",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "§3.2 DualPipe — bidirectional schedule plus four-way fine-grained chunk decomposition (attention / dispatch / MLP / combine) plus B/W split. Hides cross-node MoE all-to-all behind compute; near-zero pipeline bubble in MoE training."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DualPipe reference implementation",
+    venue: "GitHub",
+    url: "https://github.com/deepseek-ai/DualPipe",
+    note: "Open-source reference implementation of the DualPipe schedule used in DeepSeek-V3."
+  },
+  {
+    authors: "Grattafiori, A., et al. (Meta)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "Meta AI",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "§3.3.2 4D Parallelism. Llama-3 405B uses PP = 16, TP = 8, CP = 2, with 126 layers (one fewer at rank 0 for memory, one fewer at rank p-1 for compute balance) under Megatron interleaved 1F1B."
+  },
+  {
+    authors: "Meta AI Systems",
+    year: 2025,
+    title: "Scaling Llama 3 Training with Efficient Parallelism Strategies",
+    venue: "ISCA 2025",
+    url: "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf",
+    note: "Engineering follow-up to the Llama 3 paper with additional detail on PP = 16 deployment and the 126-layer co-design."
+  },
+  {
+    authors: "Korthikanti, V., Casper, J., Lym, S., McAfee, L., Andersch, M., Shoeybi, M., Catanzaro, B.",
+    year: 2022,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "NVIDIA; MLSys 2023",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Selective activation recomputation. Per-block activation accounting (the s · d · (10 + s/d) · 2 bytes formula). Llama-3's production recompute recipe is drawn from this paper."
+  },
+  {
+    authors: "Liu, M., Sun, S., Bian, Z., You, Y.",
+    year: 2024,
+    title: "Balancing Pipeline Parallelism with Vocabulary Parallelism",
+    venue: "NUS",
+    url: "https://arxiv.org/abs/2411.05288",
+    note: "Shards the unembedding matrix across the pipeline axis to address last-stage load imbalance. Not yet adopted at frontier scale; Llama-3's 126-layer trick is the present-practice workaround."
+  },
+  {
+    authors: "Lamy-Poirier, J.",
+    year: 2023,
+    title: "Breadth-First Pipeline Parallelism",
+    venue: "MLSys 2023",
+    url: "https://proceedings.mlsys.org/paper_files/paper/2023/file/24e845415c1486dd2d582a9d639237f9-Paper-mlsys2023.pdf",
+    note: "Alternative schedule prioritising throughput over latency. Not adopted at frontier scale; included for completeness."
+  },
+  {
+    authors: "AI2 (OLMo team)",
+    year: 2026,
+    title: "olmo-core documentation: distributed parallelism",
+    venue: "AI2",
+    url: "https://olmo-core.readthedocs.io/en/latest/distributed/parallel.html",
+    note: "Documents the experimental TransformerPipelineTrainModule. Confirms that OLMo-2 32B production runs use FSDP-only with no pipeline parallelism as of May 2026; no published OLMo-2 systems paper."
+  },
+]} />

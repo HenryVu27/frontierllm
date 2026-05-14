@@ -1,0 +1,653 @@
+---
+slug: 02b-tensor-parallel
+title: Tensor parallelism
+description: Megatron-LM's intra-layer matrix split — column-then-row MLP, per-head Q/K/V split, sequence parallelism, context parallelism, and the 4-AllReduce-per-layer bandwidth cost.
+order: 21
+chapter: 20
+module: 2
+module_title: Distributed training
+reading_minutes: 42
+depends_on: [00a-transformer, 00b-attention-variants, 02a-data-parallel]
+provides: [tensor-parallel, megatron-mlp-split, megatron-attention-split, sequence-parallel, context-parallel, f-g-operators]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Once a transformer no longer fits on a single GPU — once the weights plus optimiser state plus activations exceed the 80 GB of an H100, the 141 GB of an H200, or the 192 GB of a B200 — the choice is either to shard *what each rank stores* or to shard *what each rank computes*. [Data parallelism](/textbook/02a-data-parallel) does neither: it replicates every parameter on every rank and parallelises only across the batch dimension. Tensor parallelism (TP) is the first non-trivial answer to "what if the model itself does not fit." It is **intra-layer model parallelism**: each individual linear projection inside a transformer block is computed in pieces across several ranks, with collectives stitching the pieces back together where the math requires it.
+
+The canonical reference is Shoeybi et al. (2019, arXiv:1909.08053), "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism." The paper introduced what is still the production scheme six years later: partition the MLP's first weight matrix along its columns and its second along its rows; partition each attention head onto its own rank; collapse all the necessary synchronisation into two conjugate operators, $f$ and $g$, that together produce **four AllReduces per transformer layer per microbatch**. The 8.3-billion-parameter GPT-2-class model that ships with the original paper trained at 76 % scaling efficiency on 512 V100s, sustaining 15.1 PetaFLOPs against a 39 TeraFLOPs single-GPU baseline (Shoeybi et al., 2019, §6).
+
+This chapter is the canonical reference for the technique in this textbook. § [Intra-layer rationale](#intra-layer) places TP next to data and pipeline parallelism. § [The MLP split](#mlp-split) and § [the attention split](#attention-split) derive the matrix partitioning and explain why the alternative orderings are worse. § [The $f / g$ operator pair](#f-g-operators) collapses the synchronisation into Megatron's standard idiom and counts the AllReduces. § [Sequence parallelism](#sequence-parallel) extends the scheme to recover the activation memory that plain TP leaves replicated; this is Korthikanti et al. (2022, arXiv:2205.05198), the second pillar of the modern recipe. § [Communication traffic per layer](#comm-traffic) does the bandwidth accounting that explains why TP must stay inside a high-bandwidth domain. § [Context parallelism](#context-parallel) sketches the third pillar — ring-style sequence sharding inside attention itself — for sequences of 128 k tokens and longer. § [Activation memory math](#activation-memory) collects Korthikanti's per-layer formulas. § [A TP=8 worked example](#worked-example) on a 70-billion-parameter dense model makes the arithmetic concrete. § [Frontier-lab TP configs](#frontier-configs) tabulates the May 2026 production state, including Llama-3.1 405B's TP=8 × PP=16 × CP=16 × DP=4 configuration on 16 384 H100s. § [The chapter summary](#summary) closes with the four operational rules.
+
+<Callout variant="note" title="Notation used throughout the chapter">
+$t$ is the tensor-parallel world size (the number of TP ranks); $H$ is the total number of attention heads; $H_{kv}$ is the number of KV heads under [GQA](/textbook/00b-attention-variants#gqa); $s$ is the sequence length; $b$ is the per-rank microbatch size; $h$ is the model's hidden dimension; $a$ is the number of attention heads where the symbol matches Korthikanti's; $L$ is the layer count. The Megatron operator names $f$ and $g$ follow Shoeybi et al. (2019). Where the chapter quotes Korthikanti's activation memory formulas, the variable names are kept verbatim.
+</Callout>
+
+---
+
+## Intra-layer rationale {#intra-layer}
+
+Three parallelism strategies cover almost all of frontier training: data parallelism, tensor parallelism, and pipeline parallelism. They are not alternatives in the political sense — every frontier run combines at least two of them, and 405-billion-parameter training combines all three plus a fourth (context parallelism) and sometimes a fifth (expert parallelism). They are alternatives in the *axis* sense: each one shards a different dimension of the computation.
+
+Data parallelism shards the **batch dimension**. Every rank holds a complete copy of the model; gradients are averaged with one AllReduce per step. The technique was already well understood for convolutional networks before transformers existed and is covered in [the previous chapter](/textbook/02a-data-parallel). Its problem at frontier scale is simple: it leaves the model itself unsharded. A 405-billion-parameter dense model with Adam optimiser state requires roughly 405 × 16 bytes ≈ 6.5 TB to store weights, gradients, and optimiser moments at training precision. No 2026 GPU comes close to holding that.
+
+Pipeline parallelism shards the **depth dimension**. Different ranks own different consecutive layers; microbatches flow through the pipeline like data through a CPU instruction pipeline. Communication is coarse-grained (only at stage boundaries) but introduces a fundamental inefficiency — the pipeline bubble — that scales with the number of stages. The technique is covered in the [next chapter](/textbook/02c-pipeline-parallel).
+
+Tensor parallelism shards each **layer's hidden dimension** *within* the layer. The matrices that implement the MLP and the attention sub-layer are partitioned across ranks, with each rank computing its slice of every layer of every step. Communication is fine-grained — every sub-layer of every microbatch fires a collective on the critical path — but the load is perfectly balanced across ranks and there is no equivalent of the pipeline bubble. This fine-grained, on-the-critical-path communication profile is what makes TP fundamentally a within-node technique: its AllReduces carry hidden-dimension-sized payloads at every layer, and their bandwidth requirement is roughly an order of magnitude higher than data parallelism's per-step gradient AllReduce because DP amortises one collective across the whole microbatch sequence.
+
+A second way to read the three schemes is by what each one is *willing to replicate*. DP replicates the entire model. PP replicates each layer's parameters only on the rank that owns the stage. TP replicates nothing — every parameter lives on exactly one rank, but every rank participates in every computation. This is also what makes TP the most communication-intensive of the three, and why the design has to be unusually careful about which synchronisations are unavoidable and which can be deferred.
+
+The remainder of the chapter derives Megatron's particular choice of partitioning and shows why it minimises the unavoidable synchronisation to one AllReduce per sub-layer per forward pass.
+
+---
+
+## The MLP split: column-then-row {#mlp-split}
+
+The transformer's [MLP block](/textbook/00a-transformer#mlp-block) maps a hidden state $X \in \mathbb{R}^{b \times s \times h}$ through two linear projections with an elementwise nonlinearity between them:
+
+$$
+Z = \operatorname{GeLU}(XA)\,B
+$$
+
+where $A \in \mathbb{R}^{h \times 4h}$ expands the hidden dimension by four and $B \in \mathbb{R}^{4h \times h}$ contracts it. (Modern [SwiGLU](/textbook/00e-activations-and-gating) blocks have three matrices and a slightly different width, but the TP argument is the same; the chapter notes the SwiGLU constants where they matter.)
+
+Megatron splits $A$ **along its columns** and $B$ **along its rows**, in that order. Concretely, with TP degree $t$:
+
+$$
+A = [A_1,\, A_2,\, \ldots,\, A_t], \qquad B = \begin{bmatrix} B_1 \\ B_2 \\ \vdots \\ B_t \end{bmatrix}
+$$
+
+where each $A_i \in \mathbb{R}^{h \times 4h/t}$ and each $B_i \in \mathbb{R}^{4h/t \times h}$. Rank $i$ stores only the pair $(A_i, B_i)$ and computes:
+
+$$
+Y_i = \operatorname{GeLU}(X\,A_i), \qquad Z_i = Y_i\,B_i
+$$
+
+The final sub-layer output is the AllReduce $Z = \sum_{i=1}^{t} Z_i$.
+
+The split works because two algebraic identities line up. The first GEMM $XA = [XA_1, XA_2, \ldots, XA_t]$ produces a column-partitioned result by definition of column partitioning. GeLU is **elementwise**, so $\operatorname{GeLU}(XA_i)$ on rank $i$ is exactly the corresponding column block of $\operatorname{GeLU}(XA)$ — the nonlinearity cannot mix the partitions. The second GEMM then exploits the row partitioning of $B$: if $Y = [Y_1, \ldots, Y_t]$ is column-partitioned and $B$ is conformably row-partitioned, then
+
+$$
+YB = \sum_{i=1}^{t} Y_i\,B_i
+$$
+
+which is exactly the per-rank local product plus a final sum. The column-major partition of $Y$ flows directly into the row-major partition of $B$ with **no synchronisation between the two GEMMs**. The single AllReduce sits at the very end of the sub-layer, just before the residual add.
+
+It is worth being explicit about why the alternative ordering — row-then-column — is worse. If $A$ were row-partitioned, rank $i$ would compute $X_i A_i$ where $X_i$ is a row block of $X$ along the hidden dimension. But each rank only holds its own row block of $X$, so the partial result $X_i A_i$ would already require gathering parts of the input that live elsewhere. Worse, GeLU is non-linear: in general $\operatorname{GeLU}(\sum_i X_i A_i) \neq \sum_i \operatorname{GeLU}(X_i A_i)$. A synchronisation would therefore be required *inside* the MLP block, before the nonlinearity could be applied. Megatron's column-then-row ordering moves the only AllReduce to a position where the operation it precedes — the residual add — is linear in the partitioned output, and the AllReduce is safe to defer.
+
+A concrete weight memory accounting fixes the scale. Take $h = 8192$ (Llama-3 70B's hidden dimension) and $4h = 32768$. The two MLP matrices together hold $8h^2 = 8 \cdot 8192^2 \approx 5.4 \times 10^8$ parameters; in bf16 that is roughly 1.07 GB per layer per full replica. With TP $= 8$, each rank holds $1.07 / 8 \approx 0.134$ GB of MLP weights per layer. Across 80 layers (the 70 B class), MLP weights on each TP rank come to about 10.7 GB — comfortably resident in an 80 GB H100 with room for attention weights, optimiser state, and activations.
+
+<Sidenote>SwiGLU MLPs (Llama, DeepSeek, Mixtral) use three matrices — `gate`, `up`, `down` — and a trimmed intermediate width of $d_{ff} = \tfrac{2}{3} \cdot 4h$. The TP split is column-column-row: `gate` and `up` are both column-partitioned (each rank holds the same column slice of both), the gating product $\operatorname{SiLU}(X\,W_{gate}) \odot (X\,W_{up})$ stays within the partition because both factors are elementwise, and `down` is row-partitioned with the closing AllReduce. The bandwidth and synchronisation count are unchanged from the GeLU case.</Sidenote>
+
+---
+
+## The attention split: per-head Q/K/V + row $W_O$ {#attention-split}
+
+[Multi-head attention](/textbook/00b-attention-variants#mha) lends itself even more cleanly to a tensor-parallel split because the computation is already embarrassingly parallel across heads. The block can be written
+
+$$
+\operatorname{MHA}(X) = \sum_{h=1}^{H} \operatorname{head}_h(X)\,W_O^{(h)}
+$$
+
+where each $\operatorname{head}_h$ depends only on its own $W_Q^{(h)}, W_K^{(h)}, W_V^{(h)}$ slice and interacts with the rest only through the final output projection. Megatron assigns disjoint groups of heads to disjoint ranks. With TP degree $t$ and total head count $H$ (and assuming $t \mid H$), each rank receives $H/t$ complete heads and stores the corresponding column slices of $W_Q, W_K, W_V$ along with the corresponding row slices of $W_O$:
+
+$$
+W_Q = [W_Q^{(1)}, \ldots, W_Q^{(t)}], \qquad W_O = \begin{bmatrix} W_O^{(1)} \\ \vdots \\ W_O^{(t)} \end{bmatrix}
+$$
+
+Rank $i$ computes:
+
+$$
+Q_i, K_i, V_i = X\,W_Q^{(i)},\; X\,W_K^{(i)},\; X\,W_V^{(i)}
+$$
+$$
+A_i = \operatorname{softmax}\!\left(\frac{Q_i K_i^\top}{\sqrt{d_{\text{head}}}}\right) V_i
+$$
+$$
+Z_i = A_i\,W_O^{(i)}
+$$
+
+with the final sub-layer output assembled as $Z = \operatorname{AllReduce}(Z_1, \ldots, Z_t) = \sum_i Z_i$.
+
+Three structural facts make the attention split clean. First, every head's softmax, causal mask, and dot-product computation is **rank-local** with no cross-rank dependencies — the partitioning along the head dimension simply moves heads onto different ranks without changing what each head computes. Second, the column partitioning of $W_Q, W_K, W_V$ is conformable with the row partitioning of $W_O$ in the same way as the MLP case, so the per-rank output projection produces a partial sum that the final AllReduce closes. Third, the dropout that Megatron and the original Transformer paper place after the output projection is elementwise on the post-AllReduce result and so does not affect the partitioning argument.
+
+**GQA introduces a divisibility constraint.** Under [grouped-query attention](/textbook/00b-attention-variants#gqa), there are $H_q$ query heads and $H_{kv} < H_q$ key-value heads, with $H_q / H_{kv}$ query heads sharing one KV head. The TP partitioning still assigns disjoint heads to disjoint ranks, but the constraint becomes
+
+$$
+t \mid H_{kv}
+$$
+
+— each KV head, together with its query group, must live entirely on one rank. For Llama-3.1 405B with $H_q = 128$ and $H_{kv} = 8$, the only practical TP degrees are $t \in \{1, 2, 4, 8\}$, and TP $= 8$ keeps exactly one KV head per rank, which is the deepest reason TP $= 8$ is the standard production choice for that model. The same constraint operates on DeepSeek-V3 (with [MLA](/textbook/00b-attention-variants), the latent KV compression effectively makes $H_{kv}$ irrelevant and the rule reverts to $t \mid H$; the practical degree is again 8).
+
+The input embedding and the output language-model head are handled separately. Both are typically **vocabulary-parallel**: rows of the embedding matrix and columns of the output projection are sharded across the TP group. The embedding gather requires an AllReduce after the lookup (each rank looks up only the rows it owns and contributes zeros elsewhere); the output projection requires an AllReduce of partial logits before the cross-entropy computation. These two extra collectives fire once per step rather than per layer and are usually accounted separately. They are nonetheless on the critical path, and for very large vocabularies — 128 k for Llama-3, 200 k for GPT-4-class models — the partial-logits AllReduce can carry tens of megabytes per token and is not negligible.
+
+---
+
+## The $f / g$ operator pair {#f-g-operators}
+
+Megatron-LM packages all of the TP synchronisation into two conjugate operators with asymmetric forward and backward semantics:
+
+- **$f$**: identity in the forward pass, AllReduce in the backward pass.
+- **$g$**: AllReduce in the forward pass, identity in the backward pass.
+
+In code these are custom autograd functions whose `forward` and `backward` methods do different work. They are placed at the entry and exit of each TP region:
+
+```
+Attention sub-layer:    x → f → [Q,K,V proj → attn → O proj] → g → +residual
+MLP sub-layer:          x → f → [W1 → GeLU → W2]              → g → +residual
+```
+
+The asymmetry is exactly the asymmetry of the matrix-partition argument. Both sub-layers begin with a column-parallel GEMM, which expects a replicated input — so the forward $f$ does nothing (each rank already has the full $X$). But on the *backward* pass, the gradient with respect to $X$ is the column-partitioned sum of per-rank gradient contributions, which must be summed across ranks before flowing into whatever produced $X$. Hence the backward $f$ is an AllReduce. The conjugate logic governs $g$: on the forward pass, each rank produces a partial sum $Z_i$ that must be summed to give the correct output $\sum_i Z_i$, so the forward $g$ is an AllReduce; on the backward pass, the gradient with respect to $Z$ is already replicated and each rank writes only its own partial gradient into its local copy of $W_O$ or $W_2$, so the backward $g$ is identity.
+
+The count is the chapter's most-quoted number. Each transformer layer contains two TP sub-layers (attention and MLP). Each sub-layer has one $f$ at entry and one $g$ at exit. The forward pass therefore fires two AllReduces per layer (one $g$ per sub-layer; the $f$s are identity in forward). The backward pass fires two more (one $f$ per sub-layer; the $g$s are identity in backward). **Four AllReduces per transformer block per microbatch**, every layer, every step.
+
+Each AllReduce carries a payload of $b \cdot s \cdot h \cdot \text{dtype\_bytes}$. For $b = 2$, $s = 8192$, $h = 8192$ in bf16, each call carries $2 \cdot 8192 \cdot 8192 \cdot 2 = 256$ MB. For an 80-layer model that is $80 \times 4 \times 256 \text{ MB} = 80$ GB of bidirectional traffic per microbatch across the 8-rank TP group. The ring-AllReduce per-rank cost is $2(t-1)/t \times \text{payload}$ bytes sent and received, so at $t = 8$ each rank moves about $448$ MB per AllReduce — comfortably inside the 900 GB/s NVLink budget of an HGX H100 node, but visible enough at higher TP degrees that the design's bandwidth headroom matters.
+
+The reason TP's AllReduces are uniquely hard to hide is that each one is on the **critical path**: the AllReduce output is the input to the residual add and then to the next sub-layer. Unlike the gradient AllReduce of data parallelism, which can run in the background of the next microbatch's forward pass, the TP AllReduce of sub-layer $k$ blocks the start of sub-layer $k+1$. Production implementations either (a) overlap the AllReduce of one sub-layer with the GEMM of the *next* sub-layer — Megatron-Core's `--overlap-grad-reduce` and related flags do this — or (b) accept the latency. Even with aggressive overlap, the AllReduce traffic shows up as the second-largest line item in TP-stage profilers after the GEMMs themselves. [Collective overlap mechanics](/textbook/02f-collectives-and-overlap) are the subject of a later chapter.
+
+---
+
+## Sequence parallelism (Korthikanti) {#sequence-parallel}
+
+Plain TP, as derived above, has a memory leak. Megatron's MLP and attention splits shard the hidden dimension *inside* the sub-layers, but the operations *between* sub-layers — LayerNorm, RMSNorm, dropout, the residual stream — are **not tensor-parallel**: every TP rank stores a full copy of their inputs and outputs because the rank is sharded along the hidden dimension and LayerNorm reduces along that same dimension. The residual stream itself is replicated across the TP group. At Llama-class sizes this replicated activation is the dominant per-rank activation memory, and the cost of recomputing it during the backward pass — full activation checkpointing — is the dominant overhead reported in early Megatron runs.
+
+Korthikanti et al. (2022, arXiv:2205.05198), "Reducing Activation Recomputation in Large Transformer Models" — published at MLSys 2023 — closed this leak with the technique now universally called **sequence parallelism** (SP). The construction shards along the **sequence dimension** in the non-TP regions, so that the residual stream and the normalised activations are no longer replicated $t$ times but distributed across the $t$ ranks in $s/t$ chunks each. The transformer block is restructured as
+
+```
+   ┌─ sequence-parallel region (s/t × h on each rank) ─┐
+   │   LayerNorm                                       │
+   └──────────────── f̄ ──────────────────────────────┘
+   ┌──────── tensor-parallel region (s × h/t) ────────┐
+   │   Linear → GeLU → Linear  (or Q,K,V → attn → O)  │
+   └──────────────── ḡ ──────────────────────────────┘
+   ┌─ sequence-parallel region (s/t × h on each rank) ─┐
+   │   Dropout, residual add                           │
+   └───────────────────────────────────────────────────┘
+```
+
+In the SP region each rank holds $s/t \times h$ activations — sharded by sequence, full hidden. In the TP region each rank holds $s \times h/t$ — full sequence, sharded by hidden. The transitions between regions are handled by two new operators:
+
+- **$\bar f$ operator**: AllGather in forward (gather the sequence shards into a full sequence; each rank already has full $h$), ReduceScatter in backward (sum partial gradients along the hidden dimension, scatter along the sequence dimension).
+- **$\bar g$ operator**: ReduceScatter in forward (sum partial outputs along the hidden dimension, scatter along the sequence dimension), AllGather in backward.
+
+The critical algebraic fact is that **the total communication volume is unchanged**. A ring-AllReduce is implemented as a ReduceScatter followed by an AllGather; this is a standard identity in the NCCL literature and the foundation of every modern AllReduce implementation. So replacing one AllReduce in the original Megatron design with one AllGather ($\bar f$ forward) plus one ReduceScatter ($\bar g$ forward) carries identical bytes per rank per layer. Korthikanti et al. (§4.2) state this directly: "the total amount of communication is the same as in tensor parallelism." The benefit of SP is purely memory, not bandwidth.
+
+Korthikanti et al. derive the activation memory bookkeeping in full and give three formulas. For a single transformer block at bf16, with $s$ = sequence length, $b$ = microbatch size, $h$ = hidden dimension, $a$ = number of attention heads, $t$ = TP degree:
+
+$$
+M_{\text{single}} = sbh\!\left(34 + \frac{5as}{h}\right)
+$$
+
+is the per-layer activation memory on a single GPU (no TP, no SP). The constant 34 covers the residual stream, the LayerNorm inputs and outputs, the QKV inputs and outputs, the attention output, the MLP intermediate (which is itself $4h$ wide), and the dropout masks. The $5as/h$ term is the attention probability matrix and its softmax-dropout buffers; it scales as $s^2$ once the head count is folded in, which is the well-known quadratic-in-sequence-length term that motivates [FlashAttention](/textbook/00b-attention-variants#flash-attention) and context parallelism.
+
+$$
+M_{\text{TP}} = sbh\!\left(10 + \frac{24}{t} + \frac{5as}{ht}\right)
+$$
+
+is the per-layer activation memory with TP alone. The constant 10 is the residual stream and LayerNorm activations that TP does **not** shard — this is the leak that SP closes. The $24/t$ is the part TP does shard: the QKV inputs and outputs, the MLP intermediate, and a few smaller buffers. The attention probability scales as $1/t$ because heads are partitioned across ranks.
+
+$$
+M_{\text{TP+SP}} = \frac{sbh\!\left(34 + \dfrac{5as}{h}\right)}{t}
+$$
+
+is the per-layer memory with TP and SP together. Now **everything** scales with $1/t$. The TP-to-TP+SP saving is the constant 10 collapsing to $10/t$. At $t = 8$, the TP-only formula evaluates to $sbh(10 + 3 + 5as/(8h))$ and TP+SP to $sbh(4.25 + 5as/(8h))$; the ratio of the non-attention parts is approximately $13 / 4.25 \approx 3.06\times$, and the saving grows with $t$.
+
+Selective activation recomputation, also from the same paper, exploits the observation that the attention probability matrix and softmax-dropout — the $5as/h$ term — is what dominates at long context and is also cheap to recompute, because the attention softmax is memory-bound rather than compute-bound. Recomputing **only these** during the backward pass eliminates the $5as/h$ term entirely at a cost of fewer than 5 % of total FLOPs. Combined with SP, the per-layer activation memory becomes
+
+$$
+M_{\text{TP+SP+selective}} = \frac{34\,sbh}{t}
+$$
+
+independent of sequence length. Across $L$ layers the total activation footprint is $34 \, s\,b\,h\,L / t$. Korthikanti et al. report, in their abstract, "5× reduction in activation memory … over 90 % reduction in execution time overhead from activation recomputation," and on a 530-billion-parameter training run across 2240 A100s the combined techniques raised the model-FLOPs utilisation (MFU) from 42.1 % (with full activation recomputation) to 54.2 %.
+
+<Callout variant="warning" title="The Korthikanti constants assume a specific block layout">
+The constants 10, 24, 34, and 5 in the Korthikanti formulas were derived for a standard 2019-era transformer block: multi-head attention (not GQA), GeLU MLP with two matrices, dropout in two specific locations. Modern SwiGLU + GQA blocks reduce these constants by roughly 15–25 %: the three SwiGLU matrices (with $d_{ff} = \tfrac{2}{3}\cdot 4h$) trim the MLP intermediate term; GQA reduces the QKV input/output term in proportion to $H_{kv}/H_q$; the $5as/h$ attention-probability term becomes $5\,H_{kv}\,s/h$ if the formula is read literally. The *qualitative* scaling — $1/t$ for everything under SP, the dominance of the $s^2$ term at long context — is unchanged, and the formulas are accurate enough for back-of-envelope sizing of any 2026-era frontier model.
+</Callout>
+
+---
+
+## Communication traffic per layer {#comm-traffic}
+
+The bandwidth bill of a TP forward-and-backward pass over one layer is the chapter's second most-quoted number after "four AllReduces." The bill is identical between TP-only and TP+SP — both schemes move the same bytes per rank per layer — and the analysis is worth doing carefully because it directly explains why TP cannot cross the NVLink boundary.
+
+Per layer in plain TP, the work is four AllReduces (two forward, two backward), each of payload $b \, s \, h$ bf16 bytes. The ring-AllReduce algorithm moves $2(t-1)/t \times |\text{payload}|$ bytes per rank — once in the reduce-scatter phase and once in the all-gather phase. So per-rank per-layer traffic is
+
+$$
+\text{traffic}_{\text{TP}} = 4 \cdot \frac{2(t-1)}{t} \cdot b\,s\,h \cdot 2 = \frac{16(t-1)}{t}\,b\,s\,h\;\text{bytes}
+$$
+
+with the factor of 2 for the bf16 byte width. At $t = 8$ this evaluates to $14\,b\,s\,h$ bytes per layer per microbatch per rank. Per token (dividing by $bs$) it is $14h$ bytes per layer per token per rank.
+
+For Llama-3.1 405B with $h = 16384$ and $L = 126$ layers, the per-token traffic across the full network is $14 \cdot 16384 \cdot 126 \approx 29$ MB per token per rank per microbatch. At a microbatch of 8 k tokens this is roughly 230 GB per rank per microbatch, which at 900 GB/s NVLink takes about 260 ms minimum if entirely on the critical path. In practice 60-80 % of that overlaps with compute, leaving the effective overhead between 15 % and 30 % of per-layer wall time depending on the implementation and the model size. Korthikanti's original A100 measurements landed at the high end of this range; H100 with TransformerEngine's fused kernels lands at the low end.
+
+With sequence parallelism the per-rank traffic is **the same**. Each AllReduce is replaced by one AllGather plus one ReduceScatter, each of which carries $(t-1)/t \times |\text{payload}|$ bytes per rank. There are now twice as many collectives (four AllGathers and four ReduceScatters per layer instead of four AllReduces), but each one is half the per-rank traffic of an AllReduce. The total per-rank per-layer traffic remains $16(t-1)/t \cdot b\,s\,h$ bytes. The critical-path latency profile is also nearly identical, modulo small constant-factor differences between NCCL's AllReduce and the AllGather + ReduceScatter pair. SP is a memory optimisation, not a bandwidth optimisation.
+
+<ComparisonTable
+  caption="Per-rank per-layer bandwidth and high-bandwidth-domain limits on May 2026 hardware. Bandwidth numbers are vendor specifications for the highest-bandwidth in-domain pairwise link; TP across a domain boundary drops 2–5× to InfiniBand or Ethernet speeds. The 'TP ceiling' is the highest TP degree commonly used in published production runs."
+  columns={["Platform", "GPUs per high-BW domain", "Pairwise BW", "TP ceiling (production)", "Source"]}
+  rows={[
+    [
+      "HGX H100 / H200 (4× NVSwitch)",
+      "8",
+      "900 GB/s NVLink 4",
+      "TP = 8",
+      "https://developer.nvidia.com/blog/introducing-nvidia-hgx-h100-an-accelerated-server-platform-for-ai-and-high-performance-computing/"
+    ],
+    [
+      "DGX-GH200 / NVL32",
+      "32",
+      "900 GB/s NVLink-Switch",
+      "TP = 8 standard; TP = 16 reported",
+      "https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/parallelisms.html"
+    ],
+    [
+      "DGX B200 NVL72",
+      "72",
+      "1.8 TB/s NVLink 5",
+      "TP = 8 standard; TP = 16 in perf briefs",
+      "https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/"
+    ],
+    [
+      "AMD MI300X 8-GPU node (Infinity Fabric)",
+      "8",
+      "896 GB/s",
+      "TP = 8",
+      "https://github.com/NVIDIA/Megatron-LM"
+    ],
+    [
+      "Inter-node (InfiniBand HDR/NDR)",
+      "—",
+      "25–50 GB/s",
+      "TP across nodes is avoided",
+      "https://arxiv.org/abs/2201.11990"
+    ]
+  ]}
+/>
+
+<Callout variant="warning" title="TP = 16 in production is briefly documented, not peer-reviewed">
+NVIDIA's performance briefs for the GB200 NVL72 platform describe TP = 16 configurations for very large dense models, and NeMo / Megatron-Bridge supports it out of the box. No peer-reviewed frontier training run as of May 2026 uses TP = 16 — Llama-3.1 405B, the Megatron-Turing 530B retrospectives, and DeepSeek-V3 all stayed at TP = 8 with PP and CP absorbing the extra parallelism. The TP = 16 production picture is therefore informed almost entirely by vendor performance briefs (NVIDIA's GB200 launch material, Hot Chips 2024 disclosures) rather than independent measurement. The qualitative claim — that NVL72's NVLink-5 fabric makes TP = 16 mechanically feasible — is uncontroversial; the quantitative claim about MFU at TP = 16 should be treated as provisional until a peer-reviewed run reports it.
+</Callout>
+
+The cross-node story is the reason TP is the most operationally constrained of the parallelism choices. NVLink 4 inside an HGX-H100 node delivers 900 GB/s of pairwise bandwidth. The best InfiniBand HDR or NDR fabric between nodes delivers 25–50 GB/s of effective bandwidth per GPU after the all-to-all decomposition. The ratio is 18–36×. A TP AllReduce that fits in 30 ms inside the node would take 600–900 ms across the node boundary, and because the AllReduce is on the critical path, every layer of every step would stall for that latency. No production frontier run does this. The Megatron-Turing 530B paper (Smith et al., 2022, arXiv:2201.11990) reported early ablations at TP = 16 across two nodes with substantially degraded throughput and reverted to TP = 8 with pipeline parallelism across nodes; that pattern has held since.
+
+---
+
+## Context parallelism {#context-parallel}
+
+Sequence parallelism shards the sequence dimension *between* sub-layers but leaves the attention computation itself unsharded along sequence. Every TP rank needs access to all keys and values for its query block, because attention is intrinsically all-to-all in the sequence dimension. For sequences up to about 32 k tokens this is fine: the $5as^2b$ term in the activation memory (the attention probability matrix) is manageable. At 128 k or 1 M tokens the attention buffer alone overwhelms HBM even after SP, and a different sharding axis is required.
+
+Context parallelism (CP) generalises sequence sharding into the attention kernel. The algorithmic core is Ring Attention (Liu, Zaharia, Abbeel, 2023, arXiv:2310.01889), "Ring Attention with Blockwise Transformers for Near-Infinite Context." Each CP rank holds a contiguous block of $s/p$ tokens (where $p$ is the CP degree) along the sequence dimension. To compute attention, the $p$ ranks form a ring; on each step every rank exchanges its KV block with its neighbour while concurrently computing partial attention scores against the KV block it currently holds. After $p$ ring steps each rank has seen all KV blocks and accumulated the full attention output for its query block. The blockwise softmax statistics are accumulated using the same online-softmax recurrence FlashAttention uses internally.
+
+TP and CP shard along **orthogonal axes**. TP partitions the head dimension; CP partitions the sequence dimension. The two compose naturally: a TP $\times$ CP grid has $t \cdot p$ ranks, each holding $H/t$ heads' worth of $s/p$ tokens. Because the KV blocks exchanged in the ring already contain only $1/t$ of the head dimension (TP has already sharded the heads), the CP ring traffic is reduced by a factor of $t$ relative to a CP-only configuration. This is one of the reasons CP composes so well with TP in practice.
+
+**Frontier example: Llama-3.1 405B.** Dubey et al. (2024, arXiv:2407.21783) and the follow-up systems paper Yang et al. (2025, ISCA), "Scaling Llama 3 Training with Efficient Parallelism Strategies," document the production configuration for the 131 k-token training phase as **TP = 8, PP = 16, CP = 16, DP = 4** across 16 384 H100s. The CP = 16 degree was chosen, per the ISCA paper, because further increases hurt pipeline efficiency and CP = 16 was the smallest CP degree that fit the per-rank attention buffer at 131 k context. Meta reports 400 TFLOPs/GPU at 8 k sequence and 380 TFLOPs/GPU at 131 k sequence on this configuration — a roughly 5 % drop attributable to the CP ring overhead at the long sequence. The same paper also reports that Meta's CP-attention implementation outperforms Transformer Engine's ring-style CP for small CP values (CP = 4) by up to 13.5 % in hardware-FLOPs utilisation (HFU), because TE's kernel fragmentation hurts efficiency at short sequences.
+
+A simpler alternative to ring CP is to AllGather all KV blocks at the start of each attention layer and then do a single local attention pass. Memory cost is $p\times$ higher than ring CP at the attention input, but the AllGather has lower latency than $p$ ring steps and the implementation is much simpler. Meta's paper notes both designs are implemented in their stack; production uses the ring variant for long contexts and the AllGather variant for short contexts where memory is not the binding constraint.
+
+CP is the third pillar of the "TP family" of techniques and the chapter closes the loop on activation memory: TP shards the hidden dimension, SP shards the residual-stream sequence dimension between sub-layers, CP shards the attention sequence dimension inside sub-layers. Together they make the per-layer activation memory linear in $1/(tp)$ rather than constant, which is what enables the 131 k-context regime that defines May 2026 frontier training. The algorithmic details of Ring Attention itself, including the Striped Attention causal-mask optimisation (Liu et al., 2023, arXiv:2311.09431) used in some CP implementations, are covered in the [long-context chapter](/textbook/01g-long-context).
+
+---
+
+## Activation memory math {#activation-memory}
+
+The three Korthikanti formulas are central enough to be worth collecting in one place and reading carefully. Repeating them verbatim:
+
+$$
+M_{\text{single}} = sbh\!\left(34 + \frac{5as}{h}\right)
+$$
+
+$$
+M_{\text{TP only}} = sbh\!\left(10 + \frac{24}{t} + \frac{5as}{ht}\right)
+$$
+
+$$
+M_{\text{TP + SP}} = \frac{sbh\!\left(34 + \dfrac{5as}{h}\right)}{t}
+$$
+
+$$
+M_{\text{TP + SP + selective recompute}} = \frac{34\,sbh}{t}\quad\text{per layer; }\frac{34\,sbhL}{t}\text{ across the network}
+$$
+
+Reading the formulas in sequence makes the design's logic visible. Plain single-GPU memory has two terms: a constant-in-$s$ piece (the 34, covering everything that scales as $sbh$) and a quadratic-in-$s$ piece (the $5as^2bh / h = 5as^2b/h \cdot h$, written compactly as $5as^2b$ inside the parentheses). TP partitions some of the constant-in-$s$ piece (the $24/t$ slice) and most of the quadratic piece (the $5as/(ht)$ slice), but leaves the constant 10 — the residual stream and LayerNorm activations — unsharded. SP collapses that 10 into $10/t$ by sharding the residual stream along the sequence dimension, completing the partitioning. Selective recomputation discards the remaining $5as/h$ term by recomputing the attention probability matrix during the backward pass. The final formula $34 \, sbhL / t$ is independent of sequence length, which is what allows the long-context phase to extend $s$ from 8 k to 131 k without the activation budget exploding.
+
+The qualitative scaling is the right thing to remember for sizing exercises. **Without SP, the leak is large**: the 10 term dominates at moderate context, and the ratio of TP-only to TP+SP memory at $t = 8$ is roughly $3\times$. **Long-context capability requires either SP or CP**, because the $5as/h$ term is what blows up at 128 k; SP shrinks it by $t$, CP shrinks it by an additional $p$, and selective recomputation removes it altogether at a small FLOPs cost. **Selective recomputation is essentially free**: the attention softmax is memory-bound, so recomputing it during the backward pass adds less than 5 % to total FLOPs while removing the worst term in the activation budget.
+
+<Callout variant="note" title="What the formulas don't include">
+Korthikanti's accounting is *training activation memory* only. The per-rank memory footprint at training time also includes weights ($\sim P / t$ bytes per rank for a $P$-parameter model with TP $= t$), gradients (another $P / t$), and optimiser state (typically $8 P / t$ bytes for Adam in fp32 with bf16 master weights, or $12 P / t$ before any [ZeRO / FSDP](/textbook/02e-fsdp-and-zero) sharding). For a 70-billion-parameter model with TP $= 8$, the weights alone are 17.5 GB per rank in bf16; Adam optimiser state is 35 GB per rank in fp32 without ZeRO; activations with SP and selective recompute are roughly another 40 GB per rank at 8 k sequence. The total per-rank footprint on an 80 GB H100 is tight without ZeRO; production runs combine TP with FSDP or ZeRO-3 to fit comfortably.
+</Callout>
+
+---
+
+## Worked example: TP = 8 on Llama-70B {#worked-example}
+
+A concrete configuration fixes the arithmetic. The chapter walks through a Llama-3 70B-class dense model on a single HGX-H100 node — 8 H100 80 GB GPUs, NVLink 4, TP = 8 with sequence parallelism and selective recomputation. The model specification is $h = 8192$, $L = 80$, $H_q = 64$ query heads, $H_{kv} = 8$ KV heads (GQA), $d_{\text{head}} = 128$, $\text{vocab} = 128 \, 000$, SwiGLU MLP with $d_{ff} = (2/3) \cdot 4h \approx 22{,}016$.
+
+**Weight partitioning.** The TP-8 split puts disjoint slices on disjoint ranks:
+
+<ComparisonTable
+  caption="Weight memory accounting for Llama-3-70B at TP = 8, bf16. SwiGLU has three MLP matrices each of size h × d_ff, with d_ff = 22,016. Per-layer attention QKVO is approximately 8h × h after GQA reduces the KV projections. Numbers are illustrative; the exact 70 B parameter count includes norms and biases not broken out here."
+  columns={["Block", "Total memory (bf16)", "Per-rank at TP = 8", "Source"]}
+  rows={[
+    [
+      "Embedding (128 k × 8192, vocab-parallel)",
+      "2.1 GB",
+      "0.26 GB",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "Per-layer attention QKV + O (GQA-reduced)",
+      "≈ 134 MB",
+      "≈ 17 MB",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "Per-layer SwiGLU MLP (3 × h × d_ff)",
+      "≈ 1.07 GB",
+      "≈ 134 MB",
+      "https://arxiv.org/abs/1909.08053"
+    ],
+    [
+      "Per-layer total",
+      "≈ 1.21 GB",
+      "≈ 151 MB",
+      "—"
+    ],
+    [
+      "80 layers",
+      "≈ 96.7 GB",
+      "≈ 12.1 GB",
+      "—"
+    ],
+    [
+      "Output head (128 k × 8192, vocab-parallel)",
+      "2.1 GB",
+      "0.26 GB",
+      "https://arxiv.org/abs/2407.21783"
+    ]
+  ]}
+/>
+
+Total weights at TP = 8: about 12.6 GB per rank — well under the 80 GB H100 limit and leaving room for optimiser state, gradients, and activations.
+
+**Activation memory per layer.** With microbatch size $b = 1$, sequence $s = 8192$, $h = 8192$, $a = 64$, $t = 8$:
+
+$$
+sbh = 1 \cdot 8192 \cdot 8192 \cdot 2 \text{ bytes} = 128 \text{ MB}
+$$
+
+The TP-only formula evaluates to
+
+$$
+M_{\text{TP only}} = 128 \text{ MB} \cdot \left(10 + \frac{24}{8} + \frac{5 \cdot 64 \cdot 8192}{8192 \cdot 8}\right) = 128 \text{ MB} \cdot (10 + 3 + 40) = 128 \text{ MB} \cdot 53 = 6.78 \text{ GB}
+$$
+
+per layer. Across 80 layers, $542$ GB — far too large to fit on the 8 ranks of the node without aggressive activation checkpointing.
+
+TP + SP divides by $t = 8$:
+
+$$
+M_{\text{TP+SP}} = \frac{128 \text{ MB} \cdot 53}{8} = 0.85 \text{ GB per layer}
+$$
+
+Across 80 layers, $68$ GB — fits comfortably with margin for optimiser state. Adding selective recomputation removes the $5as/h$ term:
+
+$$
+M_{\text{TP+SP+selective}} = \frac{34 \cdot 128 \text{ MB}}{8} = 0.54 \text{ GB per layer}
+$$
+
+Across 80 layers, $43$ GB. The 25 GB savings between SP-only and SP+selective is exactly the attention probability matrix and the softmax-dropout buffers — the term that scales with the sequence length. At 32 k sequence the savings would be $4\times$ larger; at 131 k, $16\times$ larger and the selective recomputation becomes mandatory rather than optional.
+
+**Per-microbatch communication.** Four AllReduces per layer, payload $bsh = 128$ MB each:
+
+$$
+\text{TP traffic per layer per rank} = 4 \cdot \frac{2 \cdot 7}{8} \cdot 128 \text{ MB} = 4 \cdot \frac{7}{4} \cdot 128 \text{ MB} = 896 \text{ MB}
+$$
+
+Across 80 layers, $71.7$ GB per microbatch per rank. At NVLink 4's 900 GB/s, that is about 80 ms of nominal traffic; with 60–80 % overlap, the effective on-critical-path cost is roughly 15–30 ms per microbatch per rank. The compute per microbatch is approximately $6 P b s = 6 \cdot 70 \text{ B} \cdot 1 \cdot 8192 \approx 3.4 \text{ PFLOPs}$ per microbatch, which at 400 TFLOPs/GPU sustained takes about 1.1 seconds across 8 GPUs — comfortably larger than the TP communication.
+
+**Per-step communication.** Assume a global batch of 2 M tokens, distributed across some number of DP groups. For a single TP-only node (DP = 1), 244 microbatches per step. For a multi-node configuration with DP across nodes, each DP rank does the same 244-microbatch budget and then participates in one DP gradient AllReduce per step. The DP gradient AllReduce carries $P / \text{DP-rank-count}$ bytes per rank: at 70 B parameters and DP = 8 it is $17.5$ GB per rank, which at 25 GB/s InfiniBand effective bandwidth is about 700 ms — but amortised over a step that takes 30+ seconds, so the DP communication is below 2 % of step time. This is the standard observation: TP communication is dense and on the critical path; DP communication is sparse and amortised.
+
+**MFU estimate.** Compute per token is $6 P \approx 420$ GFLOPs (forward + backward including activations). At 400 TFLOPs/GPU sustained on H100 in bf16 with FlashAttention and TransformerEngine, $400 \times 10^{12} / 420 \times 10^9 \approx 950$ tokens/second/GPU. On 8 GPUs that is about 7600 tokens/second; for a 2 M-token batch, about 263 seconds per step before TP overhead. Measured MFU on configurations of this shape is 50–55 %, matching the Korthikanti 530 B paper and the Llama-3 ISCA paper's reports of 400 TFLOPs/GPU sustained at 8 k sequence on H100.
+
+The point of working through the arithmetic is that it generalises: any frontier configuration can be reduced to the same five line items — weight partitioning, activation memory, per-microbatch TP communication, per-step DP communication, and MFU — and the back-of-envelope numbers track the published production reports closely enough to catch obvious sizing errors before a run is launched.
+
+---
+
+## Frontier-lab TP configs {#frontier-configs}
+
+The May 2026 frontier-training configuration space is narrower than the parameter-count space might suggest. TP $= 8$ is the universal default; everything else is a function of the model size, the cluster topology, and the target context length.
+
+<ComparisonTable
+  caption="Published TP / SP / CP / PP / DP configurations for frontier training runs as of May 2026. Where TP = 16 is reported, the source is a vendor performance brief rather than a peer-reviewed paper; these rows are flagged. Context length refers to the longest training-phase context, not the deployed context."
+  columns={["Model", "TP", "PP", "CP", "DP", "Total GPUs", "Context", "Source"]}
+  rows={[
+    [
+      "Llama-3.1 405B (Meta, 2024)",
+      "8",
+      "16",
+      "16",
+      "4",
+      "16 384 H100",
+      "131 k",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "Llama-3.1 405B systems report (Meta, ISCA 2025)",
+      "8",
+      "16",
+      "16",
+      "4",
+      "16 384 H100",
+      "131 k @ 380 TFLOPs/GPU; 8 k @ 400 TFLOPs/GPU",
+      "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf"
+    ],
+    [
+      "Megatron-Turing NLG 530B (MS + NVIDIA, 2022)",
+      "8",
+      "35",
+      "—",
+      "varies",
+      "2240 A100",
+      "2 k",
+      "https://arxiv.org/abs/2201.11990"
+    ],
+    [
+      "Korthikanti 530B (NVIDIA, MLSys 2023)",
+      "8",
+      "varies",
+      "—",
+      "varies",
+      "2240 A100",
+      "2 k @ 54.2 % MFU",
+      "https://arxiv.org/abs/2205.05198"
+    ],
+    [
+      "DeepSeek-V3 (Dec 2024)",
+      "8",
+      "16",
+      "—",
+      "varies",
+      "2048 H800",
+      "128 k (YaRN stages)",
+      "https://arxiv.org/abs/2412.19437"
+    ],
+    [
+      "NVIDIA GB200 NVL72 performance brief (2024)",
+      "16",
+      "—",
+      "—",
+      "—",
+      "72 GB200",
+      "vendor brief; not peer-reviewed",
+      "https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/"
+    ]
+  ]}
+/>
+
+Several patterns are worth calling out.
+
+**TP $= 8$ is essentially universal.** Every dense model in the table from Megatron-Turing 530B (2022) through Llama-3.1 405B (2024) and DeepSeek-V3 (Dec 2024) uses TP $= 8$. The reason is the conjunction of three facts: the HGX-style 8-GPU node is the dominant LLM-training building block; NVLink inside that node is 10–50× faster than the best inter-node fabric; and the Megatron split saturates per-rank weight memory savings at modest $t$ for typical hidden sizes (4096–16384). TP $= 8$ also satisfies the GQA divisibility constraint $t \mid H_{kv}$ for the typical $H_{kv} = 8$ used in Llama-3, DeepSeek, and Mixtral.
+
+**PP and CP absorb the rest of the parallelism budget.** For Llama-3.1 405B, after TP = 8 inside the node, the remaining 16 384 / 8 = 2048-way parallelism is split as PP = 16 (depth) × CP = 16 (sequence) × DP = 4 (batch). CP is recent — it was not used in Megatron-Turing 530B because the training context was only 2 k tokens — and its introduction is what made 128 k-context dense training feasible at frontier scale.
+
+**TP = 16 is mechanically feasible on Blackwell-class hardware.** NVIDIA's GB200 NVL72 platform supports a 72-GPU NVLink-5 fabric at 1.8 TB/s per pair, comfortably enough for TP = 16. Performance briefs from NVIDIA's 2024 GB200 launch and subsequent Hot Chips disclosures document TP = 16 configurations for very large dense models. The hedge in this chapter is on the second-order question: as of May 2026, no peer-reviewed frontier training run uses TP = 16 — the published Blackwell-era training reports still use TP = 8 with deeper PP and/or wider CP. TP = 16's production status is therefore informed by vendor performance briefs, not by independent peer-reviewed measurement. The qualitative claim that TP = 16 will become standard on NVL72-class hardware over the next 12–18 months is plausible but not yet evidenced.
+
+**AMD MI300X is at parity but sparsely documented.** The MI300X 8-GPU node uses Infinity Fabric at 896 GB/s pairwise — comparable to H100 NVLink. ROCm-Megatron supports TP = 8 cleanly. Published end-to-end MFU numbers for TP = 8 on MI300X are scarcer than for H100, and what is reported (e.g., AMD's own MLPerf submissions and a small number of independent benchmarks) suggests the bandwidth is comparable but the software stack lags. The chapter records this as "TP = 8 is the standard on MI300X" without claiming exact MFU parity with H100.
+
+**Inter-node TP is the rare exception.** A handful of research configurations have reported TP = 16 across two HGX nodes via InfiniBand. The Megatron-Turing 530B paper documents this as an ablation that was abandoned because the throughput dropped substantially relative to TP = 8 + PP across nodes. NVIDIA's recommendation since the 2021 SC paper (Narayanan et al., 2021) has been unchanged: keep TP inside the NVLink domain. The recommendation has held through every subsequent generation of hardware.
+
+---
+
+## Chapter summary {#summary}
+
+Tensor parallelism is the matrix-split member of the model-parallelism family. The technique introduced by Shoeybi et al. (2019) partitions each transformer layer's MLP and attention sub-layers across $t$ ranks such that all the necessary synchronisation reduces to one AllReduce per sub-layer per direction — four AllReduces per layer per microbatch, packaged in the conjugate operators $f$ (identity forward, AllReduce backward) and $g$ (AllReduce forward, identity backward). The MLP split is column-then-row: the first matrix $A$ is partitioned along columns, the second matrix $B$ along rows, with no synchronisation between them because GeLU is elementwise. The attention split is per-head: $W_Q, W_K, W_V$ are column-partitioned in groups of $H/t$ heads, $W_O$ is row-partitioned, and under GQA the constraint $t \mid H_{kv}$ pins the practical TP degree to a divisor of the KV-head count.
+
+Sequence parallelism (Korthikanti et al., 2022) closes the activation-memory leak of plain TP by sharding the residual stream and LayerNorm activations along the sequence dimension between sub-layers, replacing each AllReduce with one AllGather plus one ReduceScatter. The total communication volume is identical (a ring-AllReduce is exactly a ReduceScatter followed by an AllGather), but per-layer activation memory drops from $sbh(10 + 24/t + 5as/(ht))$ to $sbh(34 + 5as/h)/t$. Selective recomputation of the attention probability matrix removes the $5as/h$ term entirely at a cost of fewer than 5 % of FLOPs, leaving $34\,sbhL/t$ — independent of sequence length.
+
+Context parallelism (Liu et al., 2023; Llama-3.1 production deployment) extends sequence sharding into the attention computation itself using ring-style KV exchange, making per-layer activation memory scale as $1/(tp)$ across the combined TP × CP grid. The Llama-3.1 405B production configuration — TP = 8, PP = 16, CP = 16, DP = 4 across 16 384 H100s, sustaining 400 TFLOPs/GPU at 8 k sequence and 380 TFLOPs/GPU at 131 k — is the canonical reference for what this combination looks like at frontier scale.
+
+Four operational rules summarise practice in May 2026: **(1)** TP belongs inside the NVLink domain; crossing the node boundary is avoided because the AllReduce traffic is on the critical path. **(2)** TP = 8 is the universal default on 8-GPU HGX-class nodes; TP = 16 is mechanically supported on NVL72-class hardware but is documented mostly in vendor performance briefs, not peer-reviewed training runs. **(3)** Sequence parallelism should be enabled whenever TP > 1; the bandwidth cost is zero and the memory savings are large. **(4)** Context parallelism is required for training contexts beyond about 32 k tokens; CP = 16 is the Llama-3.1 405B production choice for 131 k-token training.
+
+The next chapter, [pipeline parallelism](/textbook/02c-pipeline-parallel), covers the depth-axis partitioning that composes with TP to give the standard 3D parallelism layout. [FSDP / ZeRO](/textbook/02e-fsdp-and-zero) covers the optimiser-state sharding that composes with all of the above. [Collectives and overlap](/textbook/02f-collectives-and-overlap) covers the ring-vs-tree-AllReduce algorithm choices and the compute–communication overlap mechanics. [3D/4D composition](/textbook/02h-3d-4d-composition) finally fits TP × PP × CP × DP together into a single mental model.
+
+---
+
+<Sources items={[
+  {
+    authors: "Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J., Catanzaro, B.",
+    year: 2019,
+    title: "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism",
+    venue: "NVIDIA; arXiv:1909.08053",
+    url: "https://arxiv.org/abs/1909.08053",
+    note: "The canonical TP paper. Defines the column-then-row MLP split, per-head attention split, f / g operator pair, and the 4-AllReduce-per-layer pattern. 8.3 B parameter GPT-2-class model at 76 % scaling efficiency on 512 V100s."
+  },
+  {
+    authors: "Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Patwary, M., Korthikanti, V., et al.",
+    year: 2021,
+    title: "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM",
+    venue: "SC '21 (NVIDIA + Stanford + Microsoft)",
+    url: "https://people.eecs.berkeley.edu/~matei/papers/2021/sc_megatron_lm.pdf",
+    note: "3D parallelism (TP + PP + DP) production formulation; established the TP = 8 within-node convention; reports 502 PFLOPs sustained on 3072 A100s."
+  },
+  {
+    authors: "Korthikanti, V. A., Casper, J., Lym, S., McAfee, L., Andersch, M., Shoeybi, M., Catanzaro, B.",
+    year: 2022,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "NVIDIA; arXiv:2205.05198; MLSys 2023",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Sequence parallelism plus selective activation recomputation. Derives the exact per-layer activation memory formulas; reports 5× memory reduction and 54.2 % MFU on 530 B-parameter training across 2240 A100s."
+  },
+  {
+    authors: "Korthikanti et al. (MLSys 2023 proceedings PDF)",
+    year: 2023,
+    title: "Reducing Activation Recomputation in Large Transformer Models (proceedings version)",
+    venue: "MLSys 2023",
+    url: "https://proceedings.mlsys.org/paper_files/paper/2023/file/80083951326cf5b35e5100260d64ed81-Paper-mlsys2023.pdf",
+    note: "Authoritative typeset version; the activation memory formulas (10 + 24/t + 5as/(ht), 34 + 5as/h, 34 sbhL/t) are stated in §4."
+  },
+  {
+    authors: "Liu, H., Zaharia, M., Abbeel, P.",
+    year: 2023,
+    title: "Ring Attention with Blockwise Transformers for Near-Infinite Context",
+    venue: "UC Berkeley; arXiv:2310.01889",
+    url: "https://arxiv.org/abs/2310.01889",
+    note: "The ring-KV-exchange algorithm that is the inner mechanism of context parallelism. Establishes that blockwise attention with ring KV passing has linear memory in sequence length per device."
+  },
+  {
+    authors: "Liu, H., Yan, W., Zaharia, M., Abbeel, P.",
+    year: 2023,
+    title: "Striped Attention: Faster Ring Attention for Causal Transformers",
+    venue: "UC Berkeley; arXiv:2311.09431",
+    url: "https://arxiv.org/abs/2311.09431",
+    note: "Causal-mask-aware optimisation of ring attention. The striped-block layout removes the load imbalance that the naive ring suffers from when applied to causal transformers; cited in some production CP implementations."
+  },
+  {
+    authors: "Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A., Letman, A., et al. (Meta AI)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "Meta AI; arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3.1 405B parallelism configuration: TP = 8, PP = 16, CP = 16, DP = 4 across 16 384 H100s. The first frontier-scale paper to document a CP-using production configuration."
+  },
+  {
+    authors: "Yang, M., et al. (Meta AI)",
+    year: 2025,
+    title: "Scaling Llama 3 Training with Efficient Parallelism Strategies",
+    venue: "ISCA 2025",
+    url: "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf",
+    note: "The systems-architecture follow-up to the Llama-3.1 paper. Concrete TFLOPs/GPU numbers (400 at 8 k context, 380 at 131 k context), CP design choices, and a comparison of Meta's CP attention to Transformer Engine's ring CP showing up to 13.5 % HFU gain at CP = 4."
+  },
+  {
+    authors: "Smith, S., Patwary, M., Norick, B., LeGresley, P., Rajbhandari, S., Casper, J., et al.",
+    year: 2022,
+    title: "Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B",
+    venue: "Microsoft + NVIDIA; arXiv:2201.11990",
+    url: "https://arxiv.org/abs/2201.11990",
+    note: "The production 530 B training. Confirms TP = 8 within node, pipeline across nodes; documents an early TP = 16 across-node ablation that was abandoned due to throughput loss."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "DeepSeek-AI; arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "DeepSeek-V3 production configuration: TP = 8 with MLA, EP = 64 for MoE experts, PP = 16. The MoE-specific parallelism aspects are covered in 02g-expert-parallel; the TP = 8 dense baseline is identical to the schemes in this chapter."
+  },
+  {
+    authors: "NVIDIA",
+    year: "2024–2026",
+    title: "Megatron-Bridge Parallelism Guide",
+    venue: "NVIDIA docs",
+    url: "https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/parallelisms.html",
+    note: "Reference documentation for TP / SP / CP configuration in NeMo and Megatron-Core; consolidates the 2019–2024 design space into a single configuration surface."
+  },
+  {
+    authors: "NVIDIA",
+    year: "2019–2026",
+    title: "Megatron-LM repository",
+    venue: "GitHub",
+    url: "https://github.com/NVIDIA/Megatron-LM",
+    note: "Reference implementation. Operator names (`f`, `g`, `_reduce_from_tensor_model_parallel_region`, `_gather_from_sequence_parallel_region`) match the paper's notation; useful for confirming the autograd asymmetry of the f/g pair."
+  },
+  {
+    authors: "Carrigan, S., et al. (HuggingFace)",
+    year: 2022,
+    title: "The Technology Behind BLOOM Training (Megatron-DeepSpeed)",
+    venue: "HuggingFace Blog",
+    url: "https://huggingface.co/blog/bloom-megatron-deepspeed",
+    note: "Pedagogical walkthrough of the TP MLP and attention split with diagrams. Cited for the 'TP = 8 within node' rule as it appears in practitioner material."
+  },
+  {
+    authors: "Nanotron team (HuggingFace)",
+    year: 2025,
+    title: "Ultra-Scale Playbook",
+    venue: "HuggingFace Spaces",
+    url: "https://huggingface.co/spaces/nanotron/ultrascale-playbook",
+    note: "Up-to-date public guide on TP / SP / CP composition and 4D parallelism patterns. Useful complement to the original Megatron and Korthikanti papers for practitioners."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2022,
+    title: "Introducing NVIDIA HGX H100: An Accelerated Server Platform",
+    venue: "NVIDIA Technical Blog",
+    url: "https://developer.nvidia.com/blog/introducing-nvidia-hgx-h100-an-accelerated-server-platform-for-ai-and-high-performance-computing/",
+    note: "NVLink 4 / NVSwitch 3 bandwidth specification (900 GB/s pairwise) underpinning the TP = 8 ceiling on HGX H100 nodes."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Supercharging Llama 3.1 Across NVIDIA Platforms",
+    venue: "NVIDIA Technical Blog",
+    url: "https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/",
+    note: "Training and inference throughput numbers for Llama-3 405B on H100 / H200 / GB200; vendor source for the TP = 16 on NVL72 hedge."
+  },
+  {
+    authors: "Shen, H., et al.",
+    year: 2024,
+    title: "Context Parallelism for Scalable Million-Token Inference",
+    venue: "arXiv:2411.01783",
+    url: "https://arxiv.org/abs/2411.01783",
+    note: "Inference-side counterpart to training context parallelism. Useful for contrasting the training CP discussed in this chapter with the inference-time chunked-prefill variants covered in 04-inference."
+  }
+]} />

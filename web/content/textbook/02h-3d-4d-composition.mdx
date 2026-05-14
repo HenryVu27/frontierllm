@@ -1,0 +1,548 @@
+---
+slug: 02h-3d-4d-composition
+title: 3D / 4D parallelism composition
+description: Combining DP / TP / PP / EP / CP into a working frontier recipe — verbatim configs for Llama-3 405B, DeepSeek-V3, OLMo-2, Kimi-K2, and the heuristics for picking your own.
+order: 27
+chapter: 26
+module: 2
+module_title: Distributed training
+reading_minutes: 45
+depends_on: [02a-data-parallel, 02b-tensor-parallel, 02c-pipeline-parallel, 02d-expert-parallel, 02e-fsdp-and-zero, 02f-collectives-and-overlap, 02g-mixed-precision-and-recompute]
+provides: [3d-parallelism, 4d-parallelism, 5d-parallelism, mfu, parallel-tuple, rank-assignment]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+The preceding seven chapters of this module introduced each parallelism axis in isolation: data parallelism in [02a](/textbook/02a-data-parallel), tensor parallelism in [02b](/textbook/02b-tensor-parallel), pipeline parallelism in [02c](/textbook/02c-pipeline-parallel), expert parallelism in [02d](/textbook/02d-expert-parallel), the FSDP / ZeRO family in [02e](/textbook/02e-fsdp-and-zero), collective primitives and overlap in [02f](/textbook/02f-collectives-and-overlap), and the mixed-precision and recomputation budget in [02g](/textbook/02g-mixed-precision-and-recompute). Each axis answers one memory or throughput question; no single axis answers all of them at frontier scale. The present chapter is the synthesis: it shows how production runs compose those axes into a single tuple $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ whose product equals the world size $W$, and how that tuple is then mapped onto the cluster topology so the most communication-heavy axis lands on the fastest link.
+
+The compositional story is now stable enough across labs that a reader can predict, from a model's size and a cluster's topology, roughly which tuple a competent team will pick. The 2024–2026 disclosures from Meta, DeepSeek, Allen AI, Moonshot AI, NVIDIA, and Google converge on a small library of valid configurations rather than a continuous design space. The chapter walks through that library: the canonical 3D mix that descended from Megatron-LM, the 4D extension Llama-3 used for long-context pretraining, the 5D vocabulary Llama-4 introduced, the no-TP alternative DeepSeek-V3 demonstrated, and the FSDP-only configuration Allen AI ran at 32B dense. The chapter is calibrated to May 14, 2026; the closed-frontier labs (OpenAI, Anthropic, Google, xAI, Mistral) do not disclose pretraining parallelism, and the chapter does not impute values for them.
+
+Two background facts from the prerequisite module belong up front. First, communication on a frontier cluster is hierarchical: an NVLink island of typically 8 H100 / H800 GPUs sits inside an InfiniBand or RoCE pod of 256–1024 GPUs, which sits inside the data-centre fabric (DCN) for cross-pod traffic. NVLink full-duplex bandwidth is 900 GB/s on H100; H800 — the export-compliant variant — runs at roughly half that, with effective per-link figures quoted in the 200–400 GB/s range across published measurements. InfiniBand and RoCE between nodes give 400 Gb/s ≈ 50 GB/s per port. The DCN tier is one to two orders of magnitude slower. Second, every parallelism axis has a characteristic communication primitive whose volume and frequency determine which tier of the hierarchy it can tolerate. The rest of the chapter follows from those two facts.
+
+---
+
+## The canonical 3D mix {#canonical-3d}
+
+The phrase "3D parallelism" entered the field through Narayanan et al.'s SC '21 paper on Megatron-LM, which named its composition **PTD-P** — Pipeline, Tensor, Data Parallelism. The paper trained a 1T-parameter GPT-3-style model on 3 072 A100 GPUs at 502 PetaFLOP/s aggregate throughput, ≈ 52% of peak. At the time this was the highest reported Model FLOPs Utilization (MFU) at that scale, and the first explicit demonstration that the 3D composition beat any 2D combination on the iso-GPU frontier. The configuration was $(\text{TP}=8, \text{PP}=64, \text{DP}=6)$ with sequence length 2 048 and global batch 1 536; per-GPU throughput came out at 163 TFLOPS at FP16.
+
+The three axes are orthogonal in the sense that every GPU has a unique triple $(\text{tp\_rank}, \text{pp\_rank}, \text{dp\_rank})$, and the global rank is recovered by the linear addressing
+
+$$\text{global\_rank} = \text{tp\_rank} + \text{dp\_rank} \cdot \text{TP} + \text{pp\_rank} \cdot \text{TP} \cdot \text{DP}.$$
+
+This formula encodes a critical engineering fact. **TP is the innermost (fastest-varying) dimension.** The 8 GPUs of a single NVLink-connected server form a single TP group; PP groups span multiple servers; DP groups span replicas. Megatron's `core.parallel_state` module exposes both `tp-dp-pp` and `tp-pp-dp` orderings, but the innermost slot is always TP because TP's blocking AllReduce after every attention output projection and every MLP output projection is the most bandwidth-hungry operation in the entire training loop.
+
+The bandwidth taxonomy is what enforces this ordering. Each axis stresses the cluster network at a different point:
+
+<ComparisonTable
+  caption="Parallelism-axis bandwidth taxonomy. Frequencies are per training step; volumes are per primitive invocation. Letter conventions: B = micro-batch, S = sequence length, d = hidden dim, L = layers, N = parameters."
+  columns={["Axis", "Comms primitive", "Frequency", "Per-call volume", "Tier required"]}
+  rows={[
+    ["TP", "AllReduce (attention out; MLP out)", "every layer, fwd + bwd", "B · S · d activation", "intra-node (NVLink 900 GB/s)"],
+    ["CP", "Ring AllGather KV / all-to-all KV", "per attention call", "KV shards", "intra-node preferred"],
+    ["PP", "P2P send/recv of stage activations", "per microbatch boundary", "B · S · d at boundary", "inter-node IB (50 GB/s) tolerable"],
+    ["EP", "all-to-all dispatch + combine", "per MoE layer", "routed token shards", "intra-node; inter-node with custom kernels"],
+    ["DP-replicated", "gradient AllReduce", "once per step", "2N bytes", "DCN-tolerable"],
+    ["FSDP / ZeRO-3", "AllGather params; ReduceScatter grads", "per layer fwd + per layer bwd", "param shard", "fast IB; intra-island"],
+    ["SP", "AllGather + ReduceScatter around LN / dropout", "per layer (inside TP region)", "activation slice", "inherits TP's locality"]
+  ]}
+/>
+
+The asymmetry between rows — TP needs roughly 1 TB/s of full-duplex bandwidth between every pair of group members, DP-replicated needs roughly 50 GB/s once per step — is what drives the rank-assignment story. The rule is "the fastest-varying axis gets the fastest links". On a standard H100 cluster with 8 GPUs per node connected by NVSwitch at 900 GB/s and nodes connected by Quantum-2 IB at 400 Gb/s, the implications are:
+
+- $\text{TP} \le 8$ is enforced almost universally; TP=8 fills one NVLink island.
+- PP crosses node boundaries on the IB fabric; the pipeline bubble (not raw bandwidth) is the binding constraint.
+- DP-replicated AllReduce can span racks, pods, and DCN with hidden-latency tricks because it fires once per step.
+- FSDP / ZeRO-3 sits between TP and DP-replicated: per-layer AllGathers are heavy but overlap with compute and are typically confined to a single island.
+
+The 3D mix is the historical default for dense models with 70B–500B parameters. Every dense model in the open frontier since 2021 — GPT-3 175B reproduced by NVIDIA, Megatron-Turing 530B, BLOOM 176B, PaLM 540B, the Llama family, OPT-175B — runs with TP=8 across an NVLink island, PP across pods on IB, and DP across the remainder. The numerical values that follow vary; the structural ordering does not.
+
+---
+
+## The 4D / 5D / 6D vocabulary {#nd-vocab}
+
+The "3D" name became a misnomer the moment a fourth or fifth axis was needed. The 2024–2026 literature now speaks of 4D, 5D, and even 6D parallelism. The numeric label is a count, not a taxonomy: it tells the reader how many parallel-dim axes were composed, not which axes were chosen. This section pins down the vocabulary.
+
+The most common 4D mix is **TP × PP × DP × CP** (context parallelism added). It is the configuration Llama-3 405B used for long-context pretraining at 128K sequence length. Context parallelism shards the sequence dimension of activations across an additional group of GPUs that sit between TP and PP in the rank-assignment hierarchy; see [02f](/textbook/02f-collectives-and-overlap) for the ring-AllGather and all-to-all implementations. CP fires per attention call, which means its latency budget is comparable to TP's. The herd report places CP as the second-innermost axis, immediately outside TP.
+
+The second 4D mix is **TP × PP × DP × EP** (expert parallelism added). It is the configuration GPT-OSS, Mixtral-style MoEs, and many internal MoE recipes adopt. EP shards expert MLPs along the expert dimension and fires per MoE layer with an all-to-all dispatch and an all-to-all combine. The MoE chapters (see [02d](/textbook/02d-expert-parallel)) document the kernels; the composition question is where EP sits in the rank hierarchy.
+
+The 5D mix is **TP × PP × DP × EP × CP**. Llama-4 disclosed this label in its April 2025 release: the model card states that "context lengths are evaluated across 512 GPUs using 5D parallelism." Meta has not published the tuple values; the architecture (MoE with 16 or 128 experts and long context) implies all five axes are non-trivial, but the exact $(TP, PP, DP, EP, CP)$ assignment is `[inferred]` and remains undisclosed at the time of writing. [Inferred] EP is plausibly 16 for Scout (17B active, 16 experts) and as high as 128 for Maverick (17B active, 128 experts), but neither value is confirmed.
+
+The 6D mix counts SP (sequence parallelism inside a TP region, see [02e](/textbook/02e-fsdp-and-zero)) as a separate axis. SP is not orthogonal to TP — it inherits TP's group structure and reuses the same GPUs — so calling it a separate dimension is a labelling convention rather than a topological choice. NeMo and TorchTitan use the 6D framing when they want to make SP explicit in a config file. The TP × SP relationship is treated in detail in [02b](/textbook/02b-tensor-parallel); the upshot for composition is that SP adds an AllGather and ReduceScatter around LayerNorm and dropout regions but does not consume a new rank dimension.
+
+A glossary footnote is worth attaching here. CP and SP both shard along the sequence dimension, and they are easy to confuse. SP is *internal* to a TP group: it shards LayerNorm and dropout activations across the same GPUs that already host the TP shard, recovering the activation memory that TP cannot. CP is *between* TP groups: it shards the sequence dimension across additional GPUs to scale to very long contexts. The herd report uses both terms in the same paragraph, which has confused many readers; the worked example in [the axes catalogue below](#pareto) keeps them separate.
+
+<Callout variant="note" title="The N in ND parallelism">
+The 3D / 4D / 5D / 6D count is a label for "n-axis composition". It is not a meaningful taxonomy and there is no canonical numbering — different codebases count SP and FSDP differently. TorchTitan, NeMo, and Megatron-LM all use slightly different schemes. The useful quantities are the tuple itself and its product $W$, not the count.
+</Callout>
+
+The frontier configs in [the comparison table below](#frontier-configs) show every gradation from 1D (OLMo-2: HSDP only) to 5D (Llama-4: TP × PP × DP × EP × CP, values undisclosed). The pattern across the 2024–2026 window is that dense pretraining runs at 70B–500B use 3D, dense long-context runs add CP for 4D, MoE runs add EP for 4D, MoE-plus-long-context runs use 5D. There is no public 6D run in the open literature; the closest is Megatron-Core's internal benchmarking, which composes all axes but has not been disclosed as a production training run.
+
+---
+
+## Rank assignment: innermost vs outermost {#rank-assignment}
+
+The choice of which axis varies fastest in the global-rank formula is the second-most consequential decision after the tuple itself. The rule, stated again, is that the most communication-intensive axis must sit innermost so its group members are co-located on the fastest link. The Llama-3 herd report quotes the rule almost verbatim:
+
+> The ordering of parallelism dimensions … is optimized based on the requirements for network bandwidth and latency, ensuring that the most communication-intensive operations occur within the highest-bandwidth links, typically within a single server.
+
+The herd report's chosen rank ordering for the long-context 4D run is `[TP, CP, PP, DP]`, innermost-to-outermost. Concretely, with TP=8 filling one NVLink island, CP=16 spanning two adjacent islands on a single IB rail, PP=16 distributing the 126 transformer layers across pods, and DP=4 sitting outermost, the rationale is:
+
+- TP=8 ⇒ one NVLink island per TP group (900 GB/s intra-group full-duplex).
+- CP=16 ⇒ two adjacent islands per CP group; ring-AllGather of KV runs over an IB rail but uses the same physical pod as the TP islands.
+- PP=16 ⇒ pipeline stages distributed across pods on the IB fabric; P2P send/recv tolerates 50 GB/s with hidden latency.
+- DP=4 ⇒ outermost; DP-replicated AllReduce can be hidden behind backward compute and tolerates the slowest available link.
+
+The reason CP gets the second-innermost slot rather than PP is comparative communication frequency. CP communicates per attention call — at sequence length 128K, that means a ring-AllGather of the KV cache for every layer's attention forward pass. PP communicates per microbatch boundary, which is far less frequent. CP's volume per primitive is also higher, so CP's latency budget is shorter. The bandwidth taxonomy of the previous section then forces CP to live inside the fast tier.
+
+The same rule places EP at the second-innermost slot in MoE configurations. DeepSeek-V3's tuple — discussed in detail in [the frontier-configs section](#frontier-configs) — orders the rank assignment with EP=64 spanning 8 nodes per replica, PP=16 spanning replicas, and ZeRO-1 DP outermost. EP fires per MoE layer with all-to-all dispatch + combine, which is even more bandwidth-hungry than TP's AllReduce; placing EP at or near the innermost slot is non-negotiable. DeepSeek-V3 imposes an additional **node-limited routing constraint** that bounds inter-node EP traffic, discussed in [the frontier-configs section](#frontier-configs).
+
+A subtle point is that the rank-assignment formula generalises naturally to higher dimensions. For a 5D tuple $(\text{TP}, \text{CP}, \text{PP}, \text{EP}, \text{DP})$ in that innermost-to-outermost order, the global rank is
+
+$$\text{global\_rank} = r_{\text{TP}} + r_{\text{CP}} \cdot \text{TP} + r_{\text{PP}} \cdot \text{TP} \cdot \text{CP} + r_{\text{EP}} \cdot \text{TP} \cdot \text{CP} \cdot \text{PP} + r_{\text{DP}} \cdot \text{TP} \cdot \text{CP} \cdot \text{PP} \cdot \text{EP},$$
+
+with each $r_X$ ranging over its axis size. The product of all five axis sizes equals the world size $W$, and there are no spare ranks. The Llama-3 bulk configuration verifies this trivially: $8 \times 1 \times 16 \times 64 = 8\,192$; the long-context configuration: $8 \times 16 \times 16 \times 4 = 16\,384$. The numbers fit; the tuple is not over- or under-allocated.
+
+<Callout variant="info" title="Why TP × CP × PP × DP, not TP × DP × CP × PP">
+Two orderings give the same product but different physical layouts. Llama-3's `[TP, CP, PP, DP]` placement lets CP groups stay on a single IB rail and PP groups cross pods on the IB fabric. The alternative `[TP, DP, CP, PP]` would force CP groups to span multiple pods, blowing CP's latency budget. The orderings are not algebraically equivalent because the cluster topology is hierarchical, not flat.
+</Callout>
+
+---
+
+## Pareto frontier: comm, memory, compute {#pareto}
+
+A composition tuple is a Pareto-optimal point in a three-objective space: communication cost (fraction of step time in collectives), activation memory (peak per-GPU HBM consumed during the backward pass), and compute efficiency (achievable MFU). Each axis moves a config along a different ray.
+
+<ComparisonTable
+  caption="How each parallelism axis moves a config in the (communication, activation memory, MFU) space. Arrows show the direction of change as the axis is increased."
+  columns={["Axis", "Comm cost", "Activation memory", "Compute efficiency"]}
+  rows={[
+    ["↑ TP", "↑ per-layer AllReduce", "↓ shards activations", "↓ if TP > 8 (cross-node)"],
+    ["↑ PP", "↑ bubble grows; activations stored at stage boundary grow", "↑ holds PP microbatches", "↓ bubble dominates"],
+    ["↑ EP", "↑ all-to-all volume", "↓ expert params sharded", "depends on overlap"],
+    ["↑ CP", "↑ ring AllGather KV", "↓ sequence-sharded activations", "↓ if CP > intra-node"],
+    ["↑ FSDP / ZeRO-3", "↑ per-layer AllGather", "↓ params sharded", "↑ if overlap is good"],
+    ["↑ DP-replicated", "flat (one AllReduce / step)", "flat", "flat until cluster saturates"],
+    ["↑ batch / DP", "↓ per-token (amortise comm)", "↑ larger microbatches", "↑ to a point, then plateau"]
+  ]}
+/>
+
+A useful mnemonic categorises the axes by what they shard along which tensor dimension. **TP shards along model-width** (the hidden dim, the output dim of $W_1$ or input dim of $W_2$). **PP shards along model-depth** (the layer dim). **SP shards along sequence-length inside a TP region** (the same GPUs that already host the TP shard). **CP shards along sequence-length globally** (a separate group of GPUs). **EP shards along the expert-routing dim** (MoE experts only). **DP shards along the batch dim** (replicated DP) or along the parameter dim (FSDP).
+
+Every frontier config is Pareto-optimal for its specific constraints — not a global optimum, which does not exist. The constraints that determine the point are:
+
+1. **Model size relative to per-GPU memory.** If the model plus activations plus optimizer state fit on one GPU, TP and PP are wasted complexity; use DP plus FSDP. If the model does not fit on one node (8 × 80 GB ≈ 640 GB at H100), TP=8 plus PP is forced.
+2. **Sequence length.** Long context blows up activation memory as $O(S \cdot d)$ and attention compute as $O(S^2)$ per layer. CP is the only axis that scales activation memory along the sequence dimension. See [01g](/textbook/01g-long-context) for the architectural side.
+3. **MoE vs dense.** MoE shifts the parameter-storage problem from "all weights on every GPU" to "experts sharded across the EP group". EP replaces or augments TP for MoE; for dense models EP does not apply.
+4. **Cluster topology.** Three or more interconnect tiers (NVLink → IB rack → IB pod → DCN) means the rank assignment must be hierarchical: TP / CP innermost, PP / EP next, DP-replicated outermost. A flat cluster (everything on one fabric tier) collapses the hierarchy and admits simpler 1D or 2D configs.
+
+The trade-offs interact. Increasing PP reduces per-GPU parameter memory but increases activation memory at the stage boundary (the buffer that holds in-flight microbatches), so PP cannot grow arbitrarily large even on a memory-constrained run. Increasing TP shards activations but adds a per-layer AllReduce, so beyond TP=8 (cross-node) the MFU drops faster than the memory saves. Increasing CP keeps activation memory tractable at long context but adds a per-attention ring-AllGather, so CP=16 is already aggressive; CP=32 has not been reported in published runs as of May 2026.
+
+---
+
+## Choosing your config: heuristics {#heuristics}
+
+The following heuristics are synthesised from TorchTitan, the Megatron-Core parallelism guide, the Llama-3 herd report, and DeepSeek-V3 §4. They are presented as a decision tree because the choices are sequential: each later decision is conditioned on the earlier ones.
+
+**Start with FSDP.** For dense models up to roughly 30B parameters, or up to roughly 8 nodes of compute, 1D FSDP gives the best throughput at the cost of one full-cluster ReduceScatter and AllGather per training step. TorchTitan defaults to this; OLMo-2 confirms the regime up to 32B dense. The chapter's [frontier-configs section](#frontier-configs) records OLMo-2's HSDP recipe at 1 280 H100 GPUs as the canonical instance.
+
+**Add TP when the model exceeds one NVLink island.** Standard FSDP becomes communication-bound beyond roughly 128 H100 GPUs even for 7B models (Anthony et al. 2024, Figure 4) because the per-layer AllGather latency dominates the per-layer compute. At that point introducing TP=2 or TP=4 within each node restores throughput parity. The general rule: if the per-GPU activations plus parameters exceed roughly 70 GB at H100, TP=8 is forced. The Megatron-Core guide formalises this as $\text{TP} = \lceil \text{layer\_memory} / 80 \text{ GB} \rceil$ capped at 8.
+
+**Add PP when TP=8 is not enough.** Once TP saturates an NVLink island and FSDP cannot shard the parameters fast enough — because of the per-layer AllGather latency on inter-island links — introduce PP. The PP degree is chosen so that one pipeline stage's parameters fit comfortably in a single TP group's combined HBM. For a 405B model with TP=8 (so per-TP-group capacity ≈ 640 GB in BF16, accounting for optimizer overhead), PP must satisfy $\text{PP} \ge 405 \cdot 4 / 640 \approx 3$ for raw parameter capacity; in practice PP=16 is chosen to accommodate activation buffers and the bubble compensation that interleaved schedules require.
+
+**Add CP only for long context.** If $B \cdot S \cdot d / \text{GPU}$ exceeds the activation budget after TP and SP, CP is forced. The Llama-3 long-context configuration is the canonical example: 128K context at TP=8 requires CP ≥ 16 to keep per-GPU activation memory under the 80 GB H100 cap.
+
+**Replace TP with EP for MoE.** For MoE models, EP shards expert MLPs along the expert dimension. Full sharding (one expert per GPU) is the strongest form; partial sharding (EP < total experts) replicates each expert on $\text{experts}/\text{EP}$ GPUs. DeepSeek-V3 uses EP=64 against 256 routed experts — averaged, one expert per 4 GPUs. When EP is sufficient to shard the expert parameters and the architectural choices (MLA, latent attention, shared expert sizing) keep the dense path resident on a single GPU, TP can be dropped entirely. This is the DeepSeek-V3 / Kimi-K2 strategy.
+
+The decision tree, written compactly:
+
+```
+Does the model + activations + optimizer state fit on one GPU?
+├── Yes → DP-replicated only
+└── No  → Does it fit on one node (8 × 80 GB)?
+    ├── Yes → FSDP only (HSDP across groups for large clusters)
+    └── No  → Is the model MoE?
+        ├── Yes → EP (intra-node or across 1–2 nodes)
+        │        + ZeRO-1 DP + PP if depth requires
+        └── No  → TP = 8 (intra-node) + FSDP across nodes
+                  + PP if model still doesn't fit
+                  + CP if sequence length forces it
+```
+
+The tree is conservative. It does not exhaust the design space — there are dense-model regimes where dropping TP and using only FSDP-ZeRO-3 plus PP can win — but it reproduces every published frontier-2026 dense configuration and most MoE ones. The remaining design freedom lies in the schedule choice (interleaved 1F1B vs DualPipe, see [02c](/textbook/02c-pipeline-parallel)) and the ZeRO level (1, 2, or 3, see [02e](/textbook/02e-fsdp-and-zero)).
+
+<Callout variant="warning" title="No ZeRO-3 at the open frontier">
+No published 2024–2026 frontier pretraining run uses ZeRO-3 (full parameter sharding). Llama-3 uses ZeRO-1 with an explicit no-reshard-after-forward modification; DeepSeek-V3 uses ZeRO-1; Kimi-K2 uses ZeRO-1; OLMo-2 uses HSDP (FSDP intra-group, DDP inter-group). ZeRO-2 appears only as a Llama-3 fallback for small batches. The per-layer AllGather cost of ZeRO-3 at frontier scale outweighs its memory benefit when PP and TP already shard the parameters.
+</Callout>
+
+---
+
+## Per-axis bandwidth requirements {#per-axis-bw}
+
+This section makes the bandwidth taxonomy of [the canonical 3D mix section](#canonical-3d) numerical. Let $B$ be the micro-batch, $S$ the sequence length, $d$ the hidden dim, $L$ the layer count, $N$ the total parameter count, and $M$ the number of microbatches in flight per pipeline step. Activations are in BF16 (2 bytes per element).
+
+The per-step per-GPU communication volume by axis, with rough H100-class numerical limits:
+
+<ComparisonTable
+  caption="Per-step per-GPU communication volume by axis and the link tier required. Times are wall-clock estimates assuming perfect bandwidth saturation; real-world values include 20–40% overhead."
+  columns={["Axis", "Per-step volume per GPU", "NVLink 900 GB/s", "IB 50 GB/s"]}
+  rows={[
+    ["TP=8 AllReduce", "2 · M · L · B · S · d · 2 B", "dominant intra-node", "infeasible"],
+    ["PP=16 send/recv", "(M + 15) · B · S · d · 2 B", "negligible (not used)", "tolerable"],
+    ["EP=64 all-to-all", "M · L_MoE · B · S · d · 2 B · routing", "NVLink-saturating", "needs DeepEP-class kernels"],
+    ["CP=16 ring AllGather KV", "(15/16) · M · L · B · S · d_kv · 2 B", "tight intra-node", "borderline"],
+    ["FSDP AllGather params", "2 · L · (N / FSDP) bytes (per fwd + bwd)", "mostly hidden by overlap", "possible"],
+    ["DP-replicated AllReduce", "2 · N · bytes / DP · (DP − 1) per step", "trivial", "trivial inter-pod"]
+  ]}
+/>
+
+A concrete number for TP=8 is illustrative. At $B = 4$, $S = 8\,192$, $d = 16\,384$, $L = 126$, $M = 8$ microbatches in a 1F1B schedule, the TP AllReduce volume per step per GPU is
+
+$$2 \cdot 8 \cdot 126 \cdot 4 \cdot 8\,192 \cdot 16\,384 \cdot 2 \text{ B} \approx 2.2 \text{ TB}.$$
+
+At 900 GB/s NVLink full-duplex, transferring 2.2 TB takes ≈ 2.5 s per step assuming perfect bandwidth saturation. In practice, with kernel-launch and overlap overhead, it is 3–4 s, which corresponds to 30–40% of step time — consistent with the Llama-3 disclosed 43% MFU on the bulk pretraining run.
+
+If the same TP were spread across nodes on IB at 50 GB/s, the same 2.2 TB would take 44 s per step. This is unworkable; the step would be 90% communication. **This is the hard reason TP almost never exceeds the NVLink island.** The same numerical argument forces EP to stay intra-node unless custom kernels (DeepEP) and node-limited routing constraints reduce the all-to-all volume by an order of magnitude.
+
+H800 changes the arithmetic uncomfortably. The H800 is the export-compliant H100 with NVLink bandwidth reduced. Published measurements quote effective per-link figures in the 200–400 GB/s range, depending on workload and kernel; the spec figure is one cap on the four-way NVLink links, the realised bandwidth from a TP AllReduce kernel typically falls below the spec. At 400 GB/s the 2.2 TB TP volume takes ≈ 5.5 s per step, doubling the TP overhead fraction relative to H100. At 200 GB/s the overhead is roughly quadrupled. This is the structural reason DeepSeek-V3 dropped TP entirely on its H800 cluster — TP's bandwidth cost grew faster than its memory benefit, and the architectural choices (MLA, shared expert) made the dense path small enough to omit TP.
+
+The DP-replicated AllReduce stands out for being effectively free. At $N = 70$B parameters in BF16, the gradient volume per step is $140$ GB; with DP=16 the per-rank AllReduce volume is $140 \cdot (15/16) \approx 131$ GB; at 50 GB/s IB this completes in 2.6 s once per step, fully overlappable with backward compute. The DP gradient AllReduce was the dominant communication concern in the pre-2020 era and is essentially solved by overlap on a modern frontier cluster.
+
+---
+
+## Worked example: 70B on 512 H100s {#worked-example}
+
+This section derives a recommended 4D configuration for a hypothetical 70B dense transformer on 512 H100 GPUs, walking the memory accounting explicitly so each numerical choice can be reproduced.
+
+**Specifications.** 70B dense decoder with grouped-query attention (GQA), MLP expansion 8/3 SwiGLU, RoPE. Hidden dimension $d = 8\,192$, $L = 80$ layers (close to Llama-3 70B). Sequence length $S = 8\,192$ for medium-context pretraining. Cluster: 512 H100 SXM5 GPUs in 64 nodes of 8, NVLink intra-node (900 GB/s), Quantum-2 IB inter-node (400 Gb/s ports ≈ 50 GB/s). Target: full BF16 training with selective recomputation on attention only (see [02g](/textbook/02g-mixed-precision-and-recompute)).
+
+**Memory accounting with no sharding.** Parameters in BF16: $70 \text{B} \times 2 \text{ B} = 140 \text{ GB}$. Already too large for a single 80 GB H100. Optimizer state in Adam (FP32 first moment, FP32 second moment, FP32 master weights): $12 \text{ B} \times 70 \text{B} = 840 \text{ GB}$. So the full state — parameters plus gradients plus optimizer — is roughly 1 TB. The cluster has $512 \times 80 \text{ GB} = 40\,960 \text{ GB}$ of aggregate HBM, so the model fits comfortably across the cluster; the question is how to distribute it.
+
+**Step 1 — Apply TP=8.** Sharding across one NVLink island reduces per-GPU parameter memory to $140 / 8 = 17.5 \text{ GB}$. Activation memory per layer, at $B = 1$ microbatch in BF16, is $B \cdot S \cdot d \cdot 2 \text{ B} = 1 \cdot 8\,192 \cdot 8\,192 \cdot 2 = 128 \text{ MB}$ per layer. Across 80 layers without recomputation, activations occupy $80 \cdot 128 \text{ MB} = 10.2 \text{ GB}$ per GPU. With SP enabled inside the TP group (as Llama-3 does), the activation tensor is sharded across TP=8 too, so per-GPU activation memory drops to roughly 1.3 GB per microbatch.
+
+**Step 2 — Apply PP=4.** Four pipeline stages divide the 80 layers as 20 per stage. Per-stage parameter memory drops to $17.5 / 4 \approx 4.4 \text{ GB}$ per GPU. The pipeline must store roughly $M \approx 2 \cdot \text{PP} = 8$ microbatches' worth of activations at the worst stage under a 1F1B schedule (see [02c](/textbook/02c-pipeline-parallel)). At 1.3 GB per microbatch with SP, the activation buffer is roughly $8 \cdot 1.3 = 10.5 \text{ GB}$ per GPU.
+
+**Step 3 — Compute DP.** With $\text{TP} = 8$ and $\text{PP} = 4$, the remaining axis size is $\text{DP} = 512 / (8 \cdot 4) = 16$. ZeRO-1 sharding of optimizer state across DP=16 reduces the per-rank optimizer state to $840 / 16 = 52.5 \text{ GB}$. After TP=8 already shards the parameter dimension, the optimizer state on each GPU is $52.5 / 8 = 6.6 \text{ GB}$.
+
+**Total per-GPU memory.** Adding the components: $4.4$ (parameters) + $6.6$ (optimizer) + $10$ (activations including pipeline buffer) + recompute scratch + framework workspace ≈ $30 \text{ GB}$ per GPU. This fits comfortably under the 80 GB cap, leaving headroom for the KV cache during eval, framework overhead, and gradient checkpoint buffers.
+
+**Recommended tuple: $(\text{TP}=8, \text{PP}=4, \text{DP}=16, \text{CP}=1, \text{EP}\text{ N/A})$. Total: 512 GPUs.** The per-DP micro-batch is 1; with $\text{PP} = 4$ there are 4 microbatches in flight; with $M = 8$ microbatches per pipeline step, the global batch in samples is $\text{DP} \cdot \text{micro-batch} \cdot M = 16 \cdot 1 \cdot 8 = 128$ microbatches at sequence length 8 192 = **1 048 576 tokens** ≈ 1 M token batch per step.
+
+**Step-time estimate.** TP communication is roughly 30% of step time (per the per-axis bandwidth calculation above). The PP bubble for a 4-stage 1F1B schedule with $M = 8$ microbatches is $(\text{PP} - 1) / (\text{PP} - 1 + M) = 3 / 11 \approx 27\%$. The DP cross-node AllReduce is fully hidden behind backward compute. Predicted MFU is in the 35–45% range, matching the published Llama-3 70B numbers and the NVIDIA DGXC benchmarks for Llama-3.1 70B at comparable scales.
+
+**Variants by constraint shift.**
+- **Sequence length grows to 32K.** Activation memory per layer grows by 4×; CP=2 is forced to fit the activation budget. The tuple becomes $(\text{TP}=8, \text{CP}=2, \text{PP}=4, \text{DP}=8)$, holding the world size at 512.
+- **Cluster grows to 2 048.** Scale DP linearly: $(\text{TP}=8, \text{PP}=4, \text{DP}=64)$, holding per-GPU step compute constant. The global token batch grows to 4M.
+- **The model becomes MoE with 70B active and 500B total.** Replace TP with EP: $(\text{TP}=1, \text{PP}=4, \text{EP}=8, \text{DP}=16)$, with EP=8 sharding experts across one node. ZeRO-1 over DP handles optimizer-state sharding for the dense path.
+
+The exercise illustrates the heuristics: TP=8 first to fit one NVLink island, PP next to spread depth across nodes, ZeRO-1 DP to shard optimizer state across replicas, CP only when the sequence length forces it. The numerical chain — 140 GB → 17.5 GB → 4.4 GB for parameters; 840 GB → 52.5 GB → 6.6 GB for optimizer state — is the same chain the Llama-3 ISCA-25 paper walks through for the 405B at 8 192 GPUs.
+
+---
+
+## Frontier-lab configs, May 2026 {#frontier-configs}
+
+This section collects the publicly disclosed pretraining parallelism tuples from the major 2021–2026 frontier runs. Cells marked "undisclosed" reflect the absence of disclosure in the cited primary source; the chapter does not impute values for closed labs (OpenAI, Anthropic, Google, xAI), and inferred values are tagged `[inferred]` and traced to the corroborating source.
+
+<ComparisonTable
+  caption="Frontier pretraining parallelism configs, May 2026. Tuples are quoted verbatim from primary tech reports; '[inferred]' indicates a value not directly stated but derivable from disclosed model-parallel-group size or other published figures."
+  columns={["Model", "Year", "Params (total / active)", "Tokens", "Cluster", "TP", "PP", "DP / FSDP", "EP", "CP", "Pipeline schedule", "MFU", "Source"]}
+  rows={[
+    ["GPT-3 175B (NVIDIA repro)", "2021", "175B / 175B (dense)", "300B", "1 024 A100", "8", "16", "8 (DDP)", "—", "—", "interleaved 1F1B", "44%", "https://arxiv.org/abs/2104.04473"],
+    ["BLOOM 176B", "2022", "176B / 176B (dense)", "366B", "384 A100", "4", "12", "8 (ZeRO-1)", "—", "—", "1F1B", "~40%", "https://huggingface.co/blog/bloom-megatron-deepspeed"],
+    ["Megatron-Turing 530B", "2022", "530B / 530B (dense)", "270B", "2 240 A100", "8", "35", "8 (DDP)", "—", "—", "interleaved 1F1B", "54%", "https://arxiv.org/abs/2201.11990"],
+    ["PaLM 540B", "2022", "540B / 540B (dense)", "780B", "6 144 TPU v4", "12 (model parallel)", "—", "256 (sharded; two-pod)", "—", "—", "Pathways data+model (no PP)", "46.2% MFU / 57.8% HFU", "https://arxiv.org/abs/2204.02311"],
+    ["Llama-3 405B (bulk)", "2024", "405B / 405B (dense)", "15T", "8 192 H100", "8", "16", "64 (FSDP ZeRO-1)", "—", "1", "interleaved 1F1B", "43%", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-3 405B (long-ctx)", "2024", "405B / 405B (dense)", "(extension)", "16 384 H100", "8", "16", "4 (FSDP)", "—", "16", "1F1B + all-gather CP", "38%", "https://arxiv.org/abs/2407.21783"],
+    ["DeepSeek-V3", "2024", "671B / 37B (MoE 256r + 1s)", "14.8T", "2 048 H800", "1", "16", "128 (ZeRO-1)", "64 (× 8 nodes, node-limited M=4)", "—", "DualPipe (bidirectional)", "~45% [inferred from H800-hour budget]", "https://arxiv.org/abs/2412.19437"],
+    ["OLMo-2 32B", "2025", "32B / 32B (dense)", "6T", "1 280 H100 (Augusta)", "1", "1", "256 (HSDP intra-group; DDP inter-group)", "—", "—", "none", "38%, 1 800 tok/s/GPU", "https://allenai.org/blog/olmo2-32B"],
+    ["Kimi-K2", "2025", "1.04T / 32B (MoE 384r + 1s)", "15.5T", "H800 (cluster size undisclosed)", "1 [inferred]", "16 (virtual stages)", "ZeRO-1 (degree undisclosed)", "16", "—", "interleaved 1F1B with decoupled wgrad", "undisclosed", "https://arxiv.org/abs/2507.20534"],
+    ["Llama-4 Maverick", "2025", "~400B / 17B (MoE 128 experts)", "~22T", "undisclosed; '512 GPUs for context evals'", "undisclosed", "undisclosed", "undisclosed", "undisclosed [inferred 16–128]", "undisclosed ('5D' was named)", "undisclosed", "undisclosed", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Qwen-3 235B-A22B", "2025", "235B / 22B (MoE 128 experts)", "36T", "undisclosed", "undisclosed", "undisclosed", "undisclosed", "undisclosed", "undisclosed", "undisclosed", "undisclosed", "https://arxiv.org/abs/2505.09388"]
+  ]}
+/>
+
+A handful of observations follow from the table.
+
+**TP=8 is the universal default for dense frontier models.** Every dense model from 2021 to 2024 — GPT-3 175B reproduced, BLOOM (TP=4), Megatron-Turing 530B, Llama-3 405B — trains with TP at or near the NVLink-island boundary. The single exception in the table is OLMo-2, which runs HSDP-only at 1 280 H100 GPUs without TP or PP. OLMo-2's regime is sub-50B dense; the lab's blog explicitly states that 256-GPU HSDP groups (FSDP intra-group, DDP inter-group) carry the entire run, with 1 800 tokens/s/GPU at ~38% MFU on the Augusta Google Cloud Hypercomputer cluster.
+
+**The MoE-frontier alternative explicitly drops TP.** DeepSeek-V3 and Kimi-K2 — the two largest disclosed MoE runs of 2024–2025 — use TP=1, replacing tensor parallelism with expert parallelism. The DeepSeek-V3 technical report is explicit: "we meticulously optimized the memory footprint, making it possible to train DeepSeek-V3 without using costly Tensor Parallelism (TP)." Three architectural choices enable this: (a) MoE structure means only 37B of 671B parameters activate per token, keeping the dense path small; (b) MLA (multi-head latent attention) compresses the KV cache to a low-rank latent, shrinking per-layer activations by an order of magnitude versus standard MHA; (c) the H800 NVLink penalty makes TP relatively more expensive than on H100, tilting the cost-benefit toward EP. Kimi-K2's tuple is `(TP=1 [inferred], PP=16, EP=16, DP=ZeRO-1)`; the TP=1 value is inferred from the disclosed model-parallel-group size of 256 GPUs, which forces $\text{TP} \cdot 16 \cdot 16 = 256$ so $\text{TP} = 1$. K2 runs on H800 with 8 × 400 Gbps RoCE inter-node — RoCE rather than IB, but bandwidth-comparable. The cluster size is not disclosed; the model-parallel-group of 256 GPUs supports flexible scaling to any cluster size that is a multiple of 32.
+
+**PP=16 is also a universal value for ≥ 70B-active models.** The bubble is the dominant overhead at large PP; interleaved 1F1B (Megatron) or DualPipe (DeepSeek) recovers most of it. Llama-3 uses 126 transformer layers — explicitly chosen so that 16 pipeline stages have no leftover layers, see [02c](/textbook/02c-pipeline-parallel). DeepSeek-V3's DualPipe schedule introduces a bidirectional pipeline that feeds microbatches from both ends simultaneously and overlaps the forward and backward chunks of paired microbatches. The chunk granularity is split into four sub-phases — attention, all-to-all dispatch, MLP, all-to-all combine — so that the EP all-to-all of one chunk overlaps with the compute of the next. The cost is one extra microbatch of activation memory per replica (peak memory $\approx 2 \cdot \text{PP} + 1$ microbatches of activations vs $\text{PP}$ for 1F1B); the DeepSeek-V3 report claims roughly 30% throughput gain on the V3 MoE workload for the 6% memory tax.
+
+**CP appears only when sequence length > 32K.** Llama-3's long-context phase is the first frontier-scale instance of context parallelism, deployed for the 8K → 128K extension with CP=16. The tuple transition from bulk to long-context — $(\text{TP}=8, \text{CP}=1, \text{PP}=16, \text{DP}=64)$ on 8 192 H100 to $(\text{TP}=8, \text{CP}=16, \text{PP}=16, \text{DP}=4)$ on 16 384 H100 — preserves the token batch (16M per step) by trading DP for CP: sequence length grew 16×, per-DP batch dropped 2×, DP shrank 16× from 64 to 4. The 2× drop in per-DP batch is what keeps activation memory tractable across the sequence-length expansion.
+
+**ZeRO-1 with explicit no-reshard-after-forward is the dominant DP form.** The Llama-3 herd report describes the optimisation: "we shard optimizer states and gradients, but for model shards we do not reshard after forward computation." This is ZeRO-1+ behaviour: optimizer states sharded (ZeRO-1), gradients sharded (ZeRO-2), but parameters kept resident (not ZeRO-3). TorchTitan calls this configuration `HSDP-2.5` and confirms it for the 405B run. The rationale: at PP=16, each stage already holds 1/16 of the model; resharding the parameters again across DP would force a second AllGather every forward, and the latency savings from larger per-batch compute outweigh the memory savings. Llama-3 also switches by batch size — batch $\ge 2 \cdot \text{PP}$ uses FSDP ZeRO-1 plus interleaved 1F1B; batch $< 2 \cdot \text{PP}$ uses FSDP ZeRO-2 plus all-forward-all-backward (GPipe-style). This is the cleanest published exposition of the ZeRO-level switching logic.
+
+**DeepSeek-V3's node-limited routing.** EP=64 spanning 8 nodes per replica means each token's chosen experts could, in the worst case, all-to-all dispatch across 8 IB hops. DeepSeek-V3 imposes a node-limited routing constraint: each token is sent to at most $M = 4$ nodes during MoE dispatch. The router selects top-K experts (K=8 of 256 routed experts per layer) under the constraint that they live on no more than 4 of the 8 EP nodes. This caps inter-node all-to-all traffic at half the worst case. Combined with DualPipe's overlap and the DeepEP library's custom kernels, the V3 report claims "near-zero all-to-all communication overhead" — the all-to-all latency is fully hidden behind the next chunk's compute.
+
+**Disclosure is bifurcating.** Meta, DeepSeek, Allen AI, and Moonshot AI disclose tuples; OpenAI, Anthropic, Google, xAI, Mistral, and Alibaba (Qwen) do not. Qwen-3 explicitly omits all infrastructure detail in its May 2025 technical report — no tuple, no cluster size, no GPU type, no MFU, no throughput. The Qwen 2.5 report from December 2024 also omitted infrastructure; this is a deliberate institutional choice and not an oversight. The Llama-4 release blog and model card disclose only the label ("5D parallelism") and the cluster size used for context-length evaluation (512 GPUs); the actual training tuple is undisclosed. The chapter records these gaps as "undisclosed" rather than imputing plausible values.
+
+<Callout variant="info" title="The H800 bandwidth question">
+H800 NVLink bandwidth is widely quoted as half of H100's, but the realised per-link figure depends on workload and varies across measurements. Effective bandwidth on TP AllReduce and EP all-to-all kernels has been reported in the 200–400 GB/s range; the spec figure caps the four-way NVLink. Published H800 numbers should be read as a range rather than a single value, and the structural conclusion (TP is more expensive on H800 than on H100) is robust to the exact figure within that range. DeepSeek-V3's choice to drop TP is consistent across the full 200–400 GB/s band.
+</Callout>
+
+**PaLM 540B and the TPU exception.** PaLM is the odd row in the table. Google trained PaLM on 6 144 TPU v4 chips using Pathways with a 12-way *model parallelism* axis (TP-equivalent) and a 256-way sharded data parallelism over two TPU pods; there is no pipeline parallelism in the published configuration. TPU v4 pods have a 3D-torus interconnect that gives much more uniform bandwidth than GPU clusters, which is why Google could omit PP and still achieve 46.2% MFU at 540B. The architectural transferability of this choice to GPU clusters is limited; the row is included for completeness but does not generalise.
+
+**Llama-4 and the 5D label.** Meta's April 2025 Llama-4 release introduces "5D parallelism" as a name. The five axes are presumably TP × PP × DP × EP × CP, but the tuple is not published. The model card notes the 512-GPU evaluation cluster for long-context tests; the training cluster size is not stated. The 16-expert Scout and 128-expert Maverick variants imply non-trivial EP, and the 10M-token Scout context implies non-trivial CP for context-extension phases. The exact $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ assignment is `[inferred]` and remains a research gap.
+
+---
+
+## Chapter summary {#summary}
+
+The composition story of the 2024–2026 frontier reduces to a small number of structural choices. A configuration tuple $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ is fixed by four constraints: the model's size relative to per-GPU memory, the sequence length, the dense-vs-MoE architectural choice, and the cluster topology. Once those constraints are set, the rank-assignment rule — the most communication-intensive axis sits innermost on the fastest link — fixes the physical layout almost uniquely.
+
+The canonical 3D mix descends from Megatron-LM's PTD-P composition: TP=8 across one NVLink island, PP across pods on InfiniBand, DP outermost spanning the rest of the cluster. Llama-3's bulk pretraining configuration $(\text{TP}=8, \text{CP}=1, \text{PP}=16, \text{DP}=64)$ on 8 192 H100 at 43% MFU is the 2024 reference 4D point with CP=1 (CP enabled but trivial). The long-context extension to 128K transitions the tuple to $(\text{TP}=8, \text{CP}=16, \text{PP}=16, \text{DP}=4)$ on 16 384 H100 at 38% MFU, preserving the token batch by trading DP for CP and reducing per-DP microbatch by 2×.
+
+DeepSeek-V3 demonstrates the no-TP frontier on H800: $(\text{TP}=1, \text{PP}=16, \text{EP}=64, \text{DP}=\text{ZeRO-1})$ on 2 048 GPUs. The architectural enablers are MoE structure (37B / 671B activated), MLA latent attention (KV-cache compression), and H800's reduced NVLink bandwidth, which makes TP relatively more expensive. The DualPipe bidirectional schedule and node-limited routing constraint together hide most of the EP all-to-all behind compute, giving the report's "near-zero" all-to-all overhead claim and an inferred ~45% MFU from the disclosed H800-hour budget.
+
+OLMo-2 32B confirms the FSDP-only regime up to ~30B dense on a 1 280 H100 Google Cloud cluster: HSDP with 256-GPU intra-group sharding, DDP across groups, 38% MFU and 1 800 tokens/s/GPU. Kimi-K2's $(\text{TP}=1\text{ [inferred]}, \text{PP}=16, \text{EP}=16, \text{DP}=\text{ZeRO-1})$ tuple on H800 mirrors the DeepSeek-V3 no-TP pattern with the model-parallel-group size implicitly forcing TP=1. PaLM 540B's TPU v4 configuration (12-way model parallel × 256-way sharded DP, no PP) is a TPU-specific outlier.
+
+The library of valid configurations is small. The 11-row comparison table in [the frontier-configs section](#frontier-configs) covers essentially every disclosed frontier pretraining run since 2021. The open-disclosure labs (Meta, DeepSeek, Allen AI, Moonshot AI, NVIDIA, Google's PaLM) publish tuples; the closed-disclosure labs (OpenAI, Anthropic, Google's Gemini, xAI, Mistral, Alibaba) do not, and the chapter records gaps as "undisclosed" without imputing values. Llama-4's "5D parallelism" label confirms the axes but not the values; the exact $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ assignment is undisclosed at the time of writing.
+
+The worked 70B-on-512-H100 example walks the memory chain that underlies every dense configuration: parameters $140 \text{ GB} \to 17.5 \text{ GB}$ after TP=8 $\to 4.4 \text{ GB}$ after PP=4; optimizer state $840 \text{ GB} \to 52.5 \text{ GB}$ after ZeRO-1 over DP=16 $\to 6.6 \text{ GB}$ after the TP=8 shard. The same arithmetic, with different constants, produces every row of the comparison table.
+
+A composition tuple is a fingerprint of the cluster topology, the chip generation, the model architecture, and the sequence-length regime. The 2024–2026 frontier is converging on a small library of valid configs rather than a continuous design space; the chapter's heuristic decision tree reproduces every published dense configuration and most MoE ones. The remaining design freedom lies in the pipeline schedule (interleaved 1F1B vs DualPipe, see [02c](/textbook/02c-pipeline-parallel)), the ZeRO level (1, 2, or 3, see [02e](/textbook/02e-fsdp-and-zero)), and the precision format (BF16 vs FP8, see [02g](/textbook/02g-mixed-precision-and-recompute) and the FP8 discussion in [01h](/textbook/01h-annealing-and-stability#fp8)).
+
+<Sources items={[
+  {
+    authors: "Narayanan, D. et al.",
+    year: 2021,
+    title: "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM",
+    venue: "SC '21",
+    url: "https://arxiv.org/abs/2104.04473",
+    note: "Origin of the PTD-P 3D-parallelism composition. 1T-param GPT-3-style model on 3 072 A100 at 52% MFU; TP=8, PP=64, DP=6. Defines the rank-assignment formula with TP innermost."
+  },
+  {
+    authors: "Shoeybi, M. et al. (NVIDIA)",
+    year: 2019,
+    title: "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism",
+    venue: "arXiv:1909.08053",
+    url: "https://arxiv.org/abs/1909.08053",
+    note: "Original Megatron column/row sharding of attention and MLP weight matrices."
+  },
+  {
+    authors: "Korthikanti, V. et al.",
+    year: 2022,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "MLSys '23",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Sequence parallelism (SP) inside the TP region. Activation memory accounting tables used in the worked example."
+  },
+  {
+    authors: "Rajbhandari, S. et al.",
+    year: 2019,
+    title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+    venue: "SC '20",
+    url: "https://arxiv.org/abs/1910.02054",
+    note: "ZeRO-1, -2, -3 layered sharding of optimizer state, gradients, and parameters."
+  },
+  {
+    authors: "Zhao, Y. et al.",
+    year: 2023,
+    title: "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel",
+    venue: "VLDB '23",
+    url: "https://arxiv.org/abs/2304.11277",
+    note: "FSDP design and the per-layer AllGather / ReduceScatter mechanism."
+  },
+  {
+    authors: "Liu, H. et al.",
+    year: 2023,
+    title: "Ring Attention with Blockwise Transformers for Near-Infinite Context",
+    venue: "arXiv:2310.01889",
+    url: "https://arxiv.org/abs/2310.01889",
+    note: "Ring-attention algorithm used by CP. Per-attention ring AllGather of K, V."
+  },
+  {
+    authors: "Lepikhin, D. et al.",
+    year: 2020,
+    title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding",
+    venue: "arXiv:2006.16668",
+    url: "https://arxiv.org/abs/2006.16668",
+    note: "Origin of expert parallelism (EP). All-to-all dispatch + combine for MoE."
+  },
+  {
+    authors: "Grattafiori, A. et al. (Meta Llama Team)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "§3.3 Infrastructure. Bulk: TP=8, CP=1, PP=16, DP=64 on 8 192 H100 at 43% MFU. Long-ctx: TP=8, CP=16, PP=16, DP=4 on 16 384 H100 at 38% MFU. ZeRO-1 with no-reshard-after-forward; batch-size-dependent switch to ZeRO-2."
+  },
+  {
+    authors: "Vasudev, S. et al.",
+    year: 2025,
+    title: "Scaling Llama 3 Training with Efficient Parallelism Strategies",
+    venue: "ISCA '25",
+    url: "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf",
+    note: "Companion systems paper to the Llama 3 herd report. Bandwidth analysis and rank-ordering rationale ([TP, CP, PP, DP] innermost-to-outermost)."
+  },
+  {
+    authors: "Liang, W. et al.",
+    year: 2024,
+    title: "TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training",
+    venue: "arXiv:2410.06511",
+    url: "https://arxiv.org/abs/2410.06511",
+    note: "Composing parallelisms. HSDP-2.5 nomenclature for the Llama-3 ZeRO-1+ configuration. Decision-heuristic appendix."
+  },
+  {
+    authors: "Yang, A. et al.",
+    year: 2024,
+    title: "Context Parallelism for Scalable Million-Token Inference",
+    venue: "MLSys '25",
+    url: "https://arxiv.org/abs/2411.01783",
+    note: "All-gather CP and ring CP variants. Used in Llama-3 long-context phase."
+  },
+  {
+    authors: "Liu, A. et al. (DeepSeek-AI)",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "§4 Infrastructures. Tuple: TP=1, PP=16, EP=64 spanning 8 nodes, ZeRO-1 DP on 2 048 H800. Node-limited routing M=4. §3.4 DualPipe bidirectional schedule."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DualPipe: A bidirectional pipeline parallelism algorithm",
+    venue: "GitHub",
+    url: "https://github.com/deepseek-ai/DualPipe",
+    note: "Open-source release of the DualPipe schedule, 2025-02-27. 6% memory tax for ~30% throughput gain."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DeepEP: an efficient expert-parallel communication library",
+    venue: "GitHub",
+    url: "https://github.com/deepseek-ai/DeepEP",
+    note: "Custom kernels for inter-node EP all-to-all, used in DeepSeek-V3 to hide all-to-all behind compute."
+  },
+  {
+    authors: "DeepSeek-AI et al.",
+    year: 2025,
+    title: "Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures",
+    venue: "arXiv:2505.09343",
+    url: "https://arxiv.org/abs/2505.09343",
+    note: "Hardware retrospective on V3. H800 bandwidth analysis; the 200–400 GB/s realised range."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: Multimodal Intelligence",
+    venue: "Meta AI blog",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama-4 Scout (17B/109B) and Maverick (17B/400B) release. '5D parallelism' label disclosed; tuple undisclosed."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "Llama 4 Model Cards",
+    venue: "llama.com",
+    url: "https://www.llama.com/docs/model-cards-and-prompt-formats/llama4/",
+    note: "Model card states '512 GPUs for context evals using 5D parallelism'. No training-config tuple."
+  },
+  {
+    authors: "Kimi Team (Moonshot AI)",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence — Technical Report",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "1.04T-param MoE / 32B active / 384 routed experts. Disclosed: PP=16, EP=16, ZeRO-1 DP, model-parallel-group of 256 GPUs (forces TP=1 [inferred]). Interleaved 1F1B with decoupled weight-gradient. H800 cluster, RoCE inter-node."
+  },
+  {
+    authors: "Walsh, P. et al. (Ai2 OLMo Team)",
+    year: 2025,
+    title: "2 OLMo 2 Furious",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "OLMo-2 7B / 13B / 32B. HSDP-only configuration (no TP, no PP, no EP)."
+  },
+  {
+    authors: "Ai2",
+    year: 2025,
+    title: "OLMo 2 32B: First fully open model to outperform GPT-3.5 and GPT-4o-mini",
+    venue: "Ai2 blog",
+    url: "https://allenai.org/blog/olmo2-32B",
+    note: "OLMo-2 32B on 1 280 H100 (Augusta, Google Cloud Hypercomputer). HSDP intra-group 256 GPUs, DDP inter-group. 1 800 tokens/s/GPU at ~38% MFU."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "36T tokens, 119 languages, three-stage pretraining, MoE 235B-A22B. Infrastructure entirely undisclosed."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Megatron-Core Parallelism Strategies Guide",
+    venue: "NVIDIA docs",
+    url: "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html",
+    note: "Reference implementation of the rank-assignment formula and the decision heuristics."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Boosting Llama 3.1 405B Throughput on H200 with NVLink Switch",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/boosting-llama-3-1-405b-throughput-by-another-1-5x-on-nvidia-h200-tensor-core-gpus-and-nvlink-switch/",
+    note: "DGXC benchmark numbers for Llama-3.1 405B / 70B at H200 with NVLink Switch. Comparable to the worked-example 70B / 512 H100 MFU estimate."
+  },
+  {
+    authors: "HuggingFace / BigScience",
+    year: 2022,
+    title: "The Technology Behind BLOOM Training",
+    venue: "HuggingFace blog",
+    url: "https://huggingface.co/blog/bloom-megatron-deepspeed",
+    note: "BLOOM 176B tuple: TP=4, PP=12, DP=8 (ZeRO-1) on 384 A100 at ~40% MFU."
+  },
+  {
+    authors: "Smith, S. et al. (NVIDIA / Microsoft)",
+    year: 2022,
+    title: "Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B",
+    venue: "arXiv:2201.11990",
+    url: "https://arxiv.org/abs/2201.11990",
+    note: "Megatron-Turing 530B: TP=8, PP=35, DP=8 on 2 240 A100 at 54% MFU. Interleaved 1F1B."
+  },
+  {
+    authors: "Chowdhery, A. et al. (Google)",
+    year: 2022,
+    title: "PaLM: Scaling Language Modeling with Pathways",
+    venue: "arXiv:2204.02311",
+    url: "https://arxiv.org/abs/2204.02311",
+    note: "PaLM 540B: 12-way model parallel × 256-way sharded DP on 6 144 TPU v4 (two pods), no PP. 46.2% MFU / 57.8% HFU."
+  },
+  {
+    authors: "SemiAnalysis",
+    year: 2024,
+    title: "100,000 H100 Clusters: Power, Network Topology, Ethernet vs InfiniBand, Reliability, Failures, Checkpointing",
+    venue: "SemiAnalysis newsletter",
+    url: "https://newsletter.semianalysis.com/p/100000-h100-clusters-power-network",
+    note: "Cluster-topology reference for the hierarchical NVLink → IB → DCN tiers underlying rank assignment."
+  },
+  {
+    authors: "Anthony, Q. et al.",
+    year: 2024,
+    title: "Hardware Scaling Trends and Diminishing Returns in Large-Scale Distributed Training",
+    venue: "arXiv:2411.13055",
+    url: "https://arxiv.org/abs/2411.13055",
+    note: "Empirical FSDP communication-bound threshold beyond ~128 H100 GPUs for 7B-class dense models (Figure 4)."
+  },
+  {
+    authors: "Hoffmann, J. et al.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "Chinchilla; the C ≈ 6ND compute model used for step-time estimates in the worked example."
+  },
+  {
+    authors: "Jiang, A. et al. (Mistral)",
+    year: 2024,
+    title: "Mixtral of Experts",
+    venue: "arXiv:2401.04088",
+    url: "https://arxiv.org/abs/2401.04088",
+    note: "Mixtral architecture; training parallelism not disclosed. Cited as a row in the comparison table's 'undisclosed' bucket."
+  }
+]} />

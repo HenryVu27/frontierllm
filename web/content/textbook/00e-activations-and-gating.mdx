@@ -53,6 +53,10 @@ Three functions have dominated language-model practice:
 - **GELU** (Gaussian Error Linear Unit): smooth weighting by the Gaussian CDF. Allows small negative outputs and small positive gradients for negative inputs.
 - **SiLU** (Sigmoid Linear Unit), also called **Swish** at $\beta = 1$: smooth weighting by the sigmoid. Numerically close to GELU on typical pre-activation ranges.
 
+<Figure caption="ReLU, GELU, and SiLU overlaid on the same axes. Near zero all three look similar; the differences are in the negative tail, where ReLU is exactly zero, GELU is a smooth Gaussian-weighted soft-zero, and SiLU is a smooth sigmoid-weighted soft-zero. Toggle each curve to compare.">
+  <ActivationCurves />
+</Figure>
+
 ### Math
 
 **ReLU** (Nair & Hinton, ICML 2010; popularised at scale by Krizhevsky et al., 2012):

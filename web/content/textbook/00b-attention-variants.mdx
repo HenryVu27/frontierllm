@@ -24,6 +24,10 @@ Throughout this chapter: $d$ denotes the model's hidden dimension; $H$ the numbe
 
 ---
 
+<Figure caption="Q-head to K/V-head wiring across the four variants. MHA keeps one K/V per Q-head; GQA groups Q-heads onto fewer K/V-heads; MQA collapses to a single K/V-head; MLA replaces the K/V cache with a low-rank latent c plus a decoupled RoPE-key.">
+  <AttentionVariantsDiagram />
+</Figure>
+
 ## Multi-Head Attention {#mha}
 
 ### Mechanism

@@ -1,0 +1,445 @@
+---
+slug: 02d-expert-parallel
+title: Expert parallelism (EP)
+description: Route MoE tokens across ranks via AlltoAll — DeepSeek-V3's EP=64, Mixtral's EP=8, node-limited routing, and the AlltoAll-vs-AllReduce bandwidth comparison.
+order: 23
+chapter: 22
+module: 2
+module_title: Distributed training
+reading_minutes: 32
+depends_on: [00h-moe-plumbing]
+provides: [expert-parallel, alltoall-dispatch, alltoall-combine, node-limited-routing, ep-tp-composition]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Expert parallelism is the form of model parallelism specific to mixture-of-experts (MoE) transformers. It exists because the central premise of MoE — many experts, only a few activated per token — produces a parameter inventory that cannot be replicated on every device. DeepSeek-V3's 256 routed experts span roughly 1.3 TB of weights across 61 MoE layers in bf16, and that is before optimizer state. Data parallelism alone cannot support such a model; tensor parallelism over each individual expert is wasteful because the experts are already small; pipeline parallelism cuts the model the wrong way. The clean fit is to partition experts across devices, give each device a slice of the full expert pool, and pay the communication cost of moving tokens to the rank that owns the expert they were routed to. That communication cost is two AlltoAll calls per MoE layer per forward pass.
+
+This chapter takes the conceptual sketch in [Mixture-of-experts plumbing](/textbook/00h-moe-plumbing#top-k-routing) and turns it into operational arithmetic. The questions it answers are concrete. How many bytes leave each rank during an AlltoAll dispatch as a function of top-$k$, hidden dimension, and token count? How does that compare with the AllReduce cost of a dense tensor-parallel feed-forward block on the same hardware? Why does DeepSeek-V3 restrict each token to a subset of nodes rather than letting the router fan out freely? What changes when EP is composed with tensor parallelism inside the attention block, as it must be for any frontier-scale model? The answers determine whether an MoE design that looks attractive on a single GPU survives the move to a multi-node cluster.
+
+Three caveats frame the discussion. Training-time EP world sizes for several frontier models — Qwen3, Llama 4, and Mixtral — are not publicly disclosed; the public reports describe the model architecture but not the parallelism layout used during training. Closed-frontier models from OpenAI, Google, and Anthropic do not publish system numbers at all and are out of scope. And every numerical claim about DeepSeek-V3 in what follows is grounded in the V3 technical report (arXiv:2412.19437) or the open-source DeepEP and DualPipe repositories that accompany it; the per-rank micro-batch size $T$ used in the worked example is illustrative rather than quoted, and is flagged as such where it appears.
+
+## The EP idea {#ep-idea}
+
+Let $E$ be the number of routed experts in a single MoE layer, $k$ the top-$k$ routing count, $D$ the EP world size, and $W$ the data-parallel world size from [02a]. Expert parallelism partitions the experts of each MoE layer across the $D$ EP ranks. Rank $r$ holds experts $\{rE/D, \ldots, (r+1)E/D - 1\}$, an evenly sized slice. The non-MoE components of the transformer — attention projections, normalisation layers, embeddings, the final unembedding — are unaffected by this partitioning. They are replicated under data parallelism, or sharded under tensor parallelism, exactly as in a dense transformer.
+
+The point of departure from data parallelism is the MoE layer itself. In pure DP, every rank holds a full copy of every parameter, so the per-token forward pass is local; no inter-rank communication is required inside the layer. In EP, the parameters of an MoE layer are sharded across $D$ ranks. Each rank begins the layer with its own batch of tokens, but the experts that those tokens were routed to are scattered across the other ranks. A communication pattern is therefore required to move tokens to the rank that owns the expert they need, run the expert computation locally on each rank, and move the expert outputs back. That pattern is the AlltoAll pair: a dispatch AlltoAll before the expert compute, a combine AlltoAll after.
+
+The forward pass through an MoE layer under EP decomposes into five steps. First, each rank runs the router locally on its $T$ tokens. The router produces, for each token, the top-$k$ expert indices and gate values; no communication is required because the router is a small matrix multiply that lives on every rank. Second, the dispatch AlltoAll ships each token to the rank that hosts each of the $k$ experts it was routed to. Because experts are partitioned by rank, this is a *personalised* AlltoAll: rank $r$ sends a different bundle of tokens to every other rank, with bundle size determined by how many of its tokens happened to select experts on each destination. Third, each rank now holds a variable-size bundle of received tokens for each of its $E/D$ local experts, and runs the SwiGLU on each bundle. No inter-rank communication; just $E/D$ batched GEMM groups. Fourth, the combine AlltoAll ships the expert outputs back to the originating rank for each token, with the same volume as the dispatch in the symmetric case. Fifth, each rank performs the local weighted sum over the $k$ expert outputs using the gate values it computed in step one.
+
+The two AlltoAll calls — steps two and four — are the defining communication primitive of expert parallelism. They are blocking with respect to the layer's critical path unless explicitly overlapped against compute, which is exactly what DualPipe (described briefly in the worked example and at length in [3D/4D composition](/textbook/02h-3d-4d-composition)) is designed to do.
+
+Why pay this cost at all? With many small experts, the total expert parameter count quickly exceeds any single device's memory. DeepSeek-V3 has 256 routed experts per MoE layer, each a SwiGLU with intermediate dimension 2 048 and model dimension 7 168, comprising three matrices (gate, up, down). That is $256 \times 3 \times 2{,}048 \times 7{,}168 \times 2 \approx 22$ GB of expert weights *per MoE layer* in bf16, before optimizer state. Across 61 layers the routed-expert weights alone occupy roughly 1.3 TB. Full replication under DP is not an option on any current GPU. Tensor-parallel sharding of each individual expert is wasteful because each expert is already small enough (its hidden dimension is 2 048, well below the threshold where TP becomes efficient). Expert parallelism — assigning whole experts to whole devices — is the natural fit.
+
+## AlltoAll dispatch and combine {#alltoall}
+
+Both AlltoAll calls in an MoE layer are personalised in the MPI sense: each source rank sends a distinct buffer to each destination rank. They are neither AllGather (where every rank sends the same payload) nor ReduceScatter (where reductions happen in transit). In NCCL, the calls are implemented either as a single `ncclAllToAll` (when buffers are uniform-size) or as `ncclAllToAllv` or a sequence of `Send`/`Recv` pairs (when buffers vary). MoE almost always requires the variable-size form because token-to-expert load is data-dependent: routing decisions are made by a learned router on actual input tokens, and the number of tokens that land on each expert fluctuates from micro-batch to micro-batch.
+
+The dispatch ships three quantities per routed (token, expert) pair: the token's hidden vector of $d$ elements, the gate value for that (token, expert) pair as a single fp32 scalar, and an index field that identifies the originating rank and position so the combine can route the expert output back to the right place. The hidden vector dominates the byte count; the gate and metadata are negligible to first order. If a token is routed to $k$ experts, the dispatch in principle sends $k$ copies of its hidden vector, one to each of the $k$ host ranks. In practice, implementations deduplicate within a rank: if two of a token's $k$ experts both live on the same destination rank $r'$, the hidden vector is shipped to $r'$ only once and replicated locally. DeepSeek-V3 exploits a stronger version of this deduplication via node-limited routing, discussed in the next section.
+
+The combine ships, for each (token, expert) pair, the expert's $d$-dimensional output back to the originating rank. Two implementation choices exist for the reduction. The destination-side combine — used by GShard, Switch, Mixtral, and most off-the-shelf systems — has each rank receive all $k$ expert outputs for each of its tokens and locally compute the weighted sum. The in-transit variant, used by Tutel's hierarchical scheme, performs partial reductions inside the AlltoAll itself, saving a factor of $k$ in receive-side memory at the cost of custom kernels. The destination-side approach is the simpler and more common default and is assumed by the bandwidth math below.
+
+Real implementations almost never use truly variable-size AlltoAll for the dispatch. Instead they allocate a static buffer of size $C = \lfloor \mathrm{CF} \cdot T_\text{global} / E \rfloor$ tokens per expert per rank, where $\mathrm{CF}$ is the [capacity factor](/textbook/00h-moe-plumbing#capacity-factor). This makes the AlltoAll shape static — buffer dimensions are known at compile time — which avoids both kernel-launch overhead and memory-allocator pressure. The trade-off is that tokens beyond capacity must be dropped (the Switch / GShard default) or padded (the JAX / TPU convention). Dropless variants such as MegaBlocks sidestep the static-shape requirement by using block-sparse GEMM kernels that accept variable-length per-expert inputs natively. They still pay the variable-size cost at the collective level but recover quality at the expert compute level.
+
+The canonical algebraic description of the dispatch comes from GShard (Lepikhin et al., 2020), which expresses it as a `combine_weights` tensor of shape $[G, S, E, C]$ — $G$ local groups, $S = T/G$ tokens per group, $E$ experts, $C$ capacity — that simultaneously encodes the routing assignment and the gate weights. Tutel (Hwang et al., 2022) and DeepSpeed-MoE (Rajbhandari et al., 2022) inherit the same matrix structure and optimise the implementation; DeepEP (DeepSeek, 2025) writes the kernels directly in warp-specialised CUDA. The mathematical content is the same across all of these.
+
+In the absence of dropping, the dispatch and combine carry the same total byte volume. With dropping, the combine ships marginally less than the dispatch because tokens that were dropped never reached an expert and so produce no output. The asymmetry is small in well-balanced runs — typically a few percent — and can be ignored for first-order bandwidth analysis. The next section makes the bandwidth analysis precise.
+
+## Capacity factor in a distributed setting {#capacity-ep}
+
+The [capacity factor mechanism](/textbook/00h-moe-plumbing#capacity-factor) is defined in the MoE plumbing chapter; this section elaborates on the way it interacts with EP specifically.
+
+AlltoAll kernels are most efficient when buffer sizes are known ahead of time, which is the reason the capacity factor is essentially mandatory for traditional EP implementations. The dispatch buffer has a fixed shape $[D, E/D, C, d]$, with $C = \lfloor \mathrm{CF} \cdot k \cdot T / E \rfloor$ tokens per expert per rank under one common convention. (Conventions vary on whether the $k$ factor is included in $C$ or carried separately; the algebra is unaffected.) Tokens are placed into this buffer in routing order, and any token whose target slot is already full is *overflow*: it is either dropped, in which case its hidden state passes through unchanged via the residual connection (Switch Transformer's choice), or padded, in which case downstream kernels apply a mask (the TPU dialect).
+
+The relevant counts at EP world size $D$, per-rank token count $T$, expert count $E$, top-$k$ routing, and capacity factor $\mathrm{CF}$ are direct. The total number of (token, expert) assignments per rank-batch is $kT$. The expected number of assignments per (rank, expert) pair at perfect balance is $kT/E$. The capacity per expert per rank is $C = \lfloor \mathrm{CF} \cdot kT / E \rfloor$. At perfect balance the drop rate is zero; at realistic imbalance it grows roughly with the variance of expert load across the batch. Switch Transformer used $\mathrm{CF}$ in $[1.0, 1.25]$ during training. DeepSeek-V3 reports no token dropping during training, made possible by the auxiliary-loss-free bias-balancing mechanism described in [auxiliary losses](/textbook/00h-moe-plumbing#aux-losses), which keeps load variance low enough that $\mathrm{CF} = 1.0$ with a small slack absorbs the residual imbalance. Mixtral reports no token dropping at inference; training-time $\mathrm{CF}$ is not publicly disclosed.
+
+Even with token dropping enabled, runtime imbalance is unavoidable: routing is data-dependent, so the rank that happens to host the overloaded experts in a particular micro-batch will be the last to finish its expert compute. The combine AlltoAll is blocking, which means every rank waits for the slowest rank's expert outputs before the layer can complete. This is the *straggler effect*. Capacity-aware inference analyses quantify the cost at inference time: the slowest rank's expert compute can run 1.5 to 2 times longer than the mean, wasting 30 to 50 percent of device time across the EP group in pathological cases. Auxiliary-loss-free balancing during training, and hot-expert replication during inference (DeepSeek's EPLB, described in the frontier landscape section), are the two production mitigations.
+
+A separate dropless track is established by MegaBlocks (Gale et al., MLSys 2023), which uses block-sparse GPU kernels that accept variable-length per-expert inputs without static-shape requirements. There is no capacity factor; no tokens are dropped or padded; the AlltoAll still pays the variable-size cost, but the GEMM kernels handle the rest natively. DBRX (Databricks, March 2024) uses this approach in production. As of May 2026 the MegaBlocks-style dropless pattern has not been adopted by the DeepSeek family, Mixtral, or Qwen3, which all use static capacity buffers in conjunction with strong load-balancing mechanisms.
+
+## Node-limited routing {#node-limited}
+
+The node-limited routing strategy was introduced as *device-limited routing* in DeepSeek-V2 (arXiv:2405.04434, §4.1) and refined into node-limited routing in DeepSeek-V3 (arXiv:2412.19437, §2.1.2). Its motivation is bandwidth asymmetry. In a multi-node H800 cluster, NVLink within a node sustains roughly 160 GB/s per direction, while InfiniBand across nodes sustains roughly 50 GB/s per direction — a ratio of about 3.2 to 1. If the router fans a token out to too many nodes, the cross-node IB ports saturate and the dispatch becomes IB-bound, while the much faster NVLink interconnect sits underused.
+
+The mechanism partitions experts into nodes and routes in two stages. Let $D_\text{node}$ be the number of nodes in the EP group, $E_\text{per-node} = E / D_\text{node}$ the experts per node, and $M$ the *node-limit* — a hyperparameter capping the number of nodes a single token may visit. For each token, the router first computes the per-expert affinities $s_{i,t} = \sigma(\mathbf{u}_t^\top \mathbf{e}_i)$ for $i = 1, \ldots, E$ in the usual way (DeepSeek-V3 uses a sigmoid rather than a softmax over all experts). It then groups affinities by node and computes a per-node aggregate — DeepSeek-V3 uses the sum of the top-2 expert affinities on each node — and selects the top-$M$ nodes by that aggregate. This is the *node-affinity* stage. Within those $M$ chosen nodes, the router then selects the top-$k$ experts overall by raw $s_{i,t}$. This is the *expert-affinity* stage.
+
+For DeepSeek-V3 the relevant numbers are $D_\text{node} = 8$, $E_\text{per-node} = 32$, $M = 4$, $k = 8$. Each token uses at most 4 of 8 nodes (50 percent of IB endpoints) and at most 2 experts per chosen node on average ($k/M = 8/4$).
+
+The bandwidth implication is direct. Without node-limited routing, the worst case for cross-node dispatch volume per token is $k \cdot d \cdot s$ bytes — if all $k$ chosen experts happen to lie on different nodes. With node-limit $M$, the cross-node volume drops to at most $M \cdot d \cdot s$ bytes per token, a $k/M = 2 \times$ reduction at the same $k$ and $d$. Within a chosen node, the token still fans out to its $k/M = 2$ local experts on average, but that traffic travels over NVLink rather than IB. DeepSeek-V3 §3.2.3 states the result directly: "This design ensures that communications via IB and NVLink are fully overlapped, allowing each token to efficiently select an average of 3.2 experts per node without incurring additional overhead from NVLink."
+
+There is a quality cost. Restricting routing to $M$ nodes prevents the router from selecting the globally best top-$k$ experts when those experts happen to spread across more than $M$ nodes. DeepSeek-V3 reports that the resulting quality loss is small; no precise number is published, but the model's final performance ranks competitively against unrestricted MoE designs of similar size (Mixtral 8x22B, Qwen3-235B-A22B). The trade-off is judged worthwhile in practice.
+
+Other frontier MoE designs use related but distinct node-limit schemes. Kimi-K2 (Moonshot AI, arXiv:2507.20534, July 2025) operates at EP=16 across 384 experts and top-8 routing; the paper does not use the term "node-limited" but does adopt what it calls "the smallest feasible EP parallelization strategy," chosen to relax expert-balance constraints and allow near-optimal speed without further tuning. Mixtral 8x7B and 8x22B both have only 8 experts per layer, which means EP=8 places one expert per GPU within a single node and the cross-node routing question does not arise; no node-limit is needed. Qwen3-235B-A22B uses 128 experts and top-8 routing; the training EP and any node-limit policy are not specified in the public technical report.
+
+## EP + TP composition {#ep-tp}
+
+A frontier MoE model usually needs *both* expert parallelism for the MoE feed-forward blocks and tensor parallelism for the attention block, where the query, key, value, and output projections are too large to fit on a single GPU once context length and KV-cache size are taken into account. Composing the two requires some care, because they make different demands on the communication topology.
+
+The pattern adopted by Megatron-Core (NVIDIA, 2024) and DeepSpeed-MoE looks as follows. The transformer block begins with attention, sharded across the TP group of a given rank. The attention output is reduced across the TP group via AllReduce, which is the standard $O(d^2 T s)$ tensor-parallel cost per layer. The residual connection and the layer norm execute locally on each rank. The router runs locally — every rank has the full router weights, since the router is a small matrix and replicating it is cheaper than sharding. The dispatch AlltoAll then runs across the EP group, which may be the same set of ranks as the TP group (when EP and TP are co-located on the same GPUs), or orthogonal to it (when EP runs across nodes and TP runs within nodes). The expert FFN compute happens locally on each EP rank. The combine AlltoAll runs back across the same EP group. The residual connection and the final layer norm execute locally. The MoE layer's two AlltoAll calls have, in this layout, replaced the two AllReduces that a dense TP feed-forward block would have used.
+
+Megatron-Core's 2025 *MoE Parallel Folding* paper (arXiv:2504.14960) generalises this composition by allowing different parallelism groupings for attention versus MoE layers within the same model. Attention layers use a $\mathrm{TP} \times \mathrm{CP} \times \mathrm{DP} \times \mathrm{PP}$ grouping; MoE layers use a separate $\mathrm{ETP} \times \mathrm{EP} \times \mathrm{DP} \times \mathrm{PP}$ grouping, where $\mathrm{ETP}$ denotes expert-internal tensor parallelism — sharding within a single expert when the expert itself is large enough to warrant it. A token-level dispatcher orchestrates the transition between the two parallel groupings at every MoE-layer boundary using AlltoAll-V and related collectives. This is the pattern used at the 600B-and-above parameter scale on heterogeneous clusters.
+
+The intuition that the MoE AlltoAll *replaces* the dense AllReduce can be made precise. For a dense transformer feed-forward with TP across $D$ ranks, the two AllReduces in each layer cost approximately $4 d T s$ bytes per rank in total — two AllReduces times $2 d T s$ each at the bandwidth-optimal ring algorithm. For a sparse MoE feed-forward with EP across the same $D$ ranks at top-$k$ routing, the two AlltoAll calls cost approximately $2 k T d s$ bytes per rank. At $k = 2$ — Mixtral, Switch — these are equal. At $k = 8$ — DeepSeek-V3 — the AlltoAll cost is 4 times the AllReduce cost in bytes, *before* node-limited routing is applied. Node-limited routing brings the cross-node portion back down to 1 times the AllReduce cost by capping the cross-node fan-out at $M = 4$, leaving the within-node NVLink portion to absorb the rest at much higher bandwidth.
+
+<Callout variant="note" title="Implementation libraries">
+The four most commonly cited implementations of EP communication are Tutel (Microsoft, 2022), DeepSpeed-MoE (Microsoft, 2022), DeepEP (DeepSeek, 2025), and MegaScale-MoE (ByteDance, 2025). Tutel introduced the two-dimensional hierarchical AlltoAll that splits dispatch into intra-node and inter-node phases, reporting up to a 20.7x speedup over plain AlltoAll on 2 048 A100 GPUs. DeepSpeed-MoE provided the first hierarchical AlltoAll with $O(G + p/G)$ complexity (intra-node group size $G$, total ranks $p$), folding EP into the DeepSpeed ZeRO stack. DeepEP uses warp-specialised CUDA kernels with 20 SMs partitioned into 10 communication channels and is the reference implementation for high-bandwidth EP on Hopper and Blackwell. MegaScale-MoE reports training a 352B MoE on 1 440 Hopper GPUs at 1.41M tokens/second, 1.88x faster than Megatron-LM.
+</Callout>
+
+A standard companion choice for EP is ZeRO-1 (optimizer states sharded, parameters fully resident per rank) rather than ZeRO-3 (parameters sharded). The reason is that ZeRO-3 requires all-gathering parameters layer by layer, and that all-gather conflicts with EP's "each rank holds different experts" design. The fix used in DeepSeek-V3 and in most production runs is ZeRO-1 plus EP, which keeps the full local expert parameters resident on each rank and shards only the optimizer state. ZeRO-3 plus EP is possible with care — separate parameter groups for MoE and non-MoE layers, separate sharding policies — but it is not the default pattern.
+
+## Bandwidth: AlltoAll vs AllReduce {#alltoall-vs-allreduce}
+
+At the link level, an AlltoAll and an AllReduce of the same message size move roughly the same bytes per rank. For a dense layer of weight size $S$ bytes, gradient AllReduce over $D$ ranks ships $2((D-1)/D) S \approx 2S$ bytes per rank in the bandwidth-optimal ring algorithm — half on the reduce-scatter, half on the all-gather. For an AlltoAll where each rank sends $S$ bytes total partitioned into $D$ chunks of $S/D$ bytes each, the per-rank send volume is $((D-1)/D) S \approx S$. The factor-of-two difference comes from the fact that AllReduce moves each gradient twice (once to be reduced, once to be broadcast); AlltoAll moves each chunk once.
+
+The differences that matter in practice are latency and topology fit, not raw byte counts.
+
+Latency favours AlltoAll for small messages. A ring AllReduce takes $2(D-1)$ steps, because each rank must pass its chunk around the ring twice. An AlltoAll completes in a single pairwise exchange (in principle one step, $D-1$ in a naive implementation). For very small messages where per-step latency dominates over per-byte transmission time, AlltoAll wins; for very large messages on a fully populated ring, AllReduce can become more bandwidth-efficient because every link is utilised in every step.
+
+Topology fit favours AllReduce in heterogeneous fabrics. AllReduce respects bidirectional ring or tree structures naturally; AlltoAll wants a fully-connected (or nearly so) topology. On hierarchical fabrics — NVLink within a node, InfiniBand across nodes — AlltoAll requires either a hierarchical two-stage implementation (Tutel's two-dimensional algorithm) or careful token routing to avoid IB hotspots (DeepSeek-V3's node-limited routing). Without these techniques, the asymmetric link bandwidths penalise AlltoAll disproportionately, because every cross-node transfer goes through the slowest link.
+
+<ComparisonTable
+  caption="Communication patterns in dense vs MoE transformer layers, per rank per layer. Bytes are per direction in steady state; the (D-1)/D factor is dropped for clarity."
+  columns={["Layer type", "Pattern", "Bytes per rank (per direction)", "Latency steps", "Topology fit"]}
+  rows={[
+    ["Dense FFN with TP=D", "AllReduce (x2)", "≈ 4 · d · T · s", "2(D-1) for ring", "Any (ring or tree) — https://arxiv.org/abs/1909.08053"],
+    ["Dense FFN, DP only", "None within layer", "0", "0", "n/a — https://arxiv.org/abs/2006.16668"],
+    ["MoE FFN with EP=D, top-k", "AlltoAll (x2: dispatch + combine)", "≈ 2 · k · T · d · s", "1 (ideal)", "Fully connected best — https://arxiv.org/abs/2201.05596"],
+    ["MoE FFN, node-limited (limit M)", "AlltoAll, hierarchical", "Cross-node: ≈ 2 · M · T · d · s (IB); intra-node: ≈ 2 · k · T · d · s (NVLink)", "1–2 (hierarchical)", "NVLink + IB — https://arxiv.org/abs/2412.19437"],
+    ["Gradient sync, DP=W", "AllReduce", "≈ 2 · |g| · s (where |g| = layer params)", "2(W-1)", "Any — https://arxiv.org/abs/1909.08053"],
+  ]}
+/>
+
+Two observations follow from the table. First, for top-$k = 2$ (Mixtral and Switch), the MoE AlltoAll cost is comparable to the dense TP AllReduce cost on the same hardware; the two parallelism strategies are essentially interchangeable from a bandwidth standpoint. Second, for top-$k = 8$ (DeepSeek-V3), the MoE AlltoAll cost is 4 times the dense TP AllReduce cost *before* node-limited routing, and roughly equal *after* node-limited routing — which is precisely why node-limited routing exists. The capacity expansion of top-8 routing comes at no additional cross-node communication cost relative to a dense TP layer of the same hidden dimension, provided the routing is restricted to $M = 4$ of the available 8 nodes.
+
+The effective bandwidth numbers cited above for H800 — 160 GB/s NVLink per direction within a node, 50 GB/s IB per direction across nodes — come from the DeepSeek-V3 technical report (§3.2.3) and the DeepEP repository. H800 is the export-restricted variant of H100 with reduced NVLink; H100 itself runs at roughly 900 GB/s NVLink per direction, with similar IB. The asymmetry between intra-node and inter-node bandwidth is the central architectural fact that node-limited routing and DeepEP's warp-specialised kernels are designed to exploit.
+
+## Worked example: DeepSeek-V3 EP=64 {#worked-example}
+
+The arithmetic so far has been parametric. This section grounds it in DeepSeek-V3's training configuration, taking the values directly from the technical report and computing the resulting bandwidth, time, and memory consequences explicitly. Two configurations are worked through: a hypothetical single-node EP=8 deployment, used to establish the basic accounting, and the actual EP=64 across 8 nodes used in V3 training.
+
+The configuration is fixed by the model architecture and the published training stack:
+
+- $d_\text{model} = 7{,}168$ (the residual-stream width).
+- $E = 256$ routed experts per MoE layer, plus 1 shared expert per layer (the shared expert is replicated rather than partitioned, so it contributes no AlltoAll traffic).
+- top-$k = 8$ routing.
+- 61 transformer layers in total, of which 58 are MoE layers and 3 are dense.
+- bf16 activations, so $s = 2$ bytes per element on the dispatch and combine wire (DeepSeek-V3 also supports fp8 dispatch, which halves these numbers; the figures here use the bf16 path for clarity).
+- EP world size $D = 64$ across 8 nodes of 8 H800 GPUs each.
+- Node-limit $M = 4$ of 8 nodes per token.
+- Per-rank micro-batch token count $T = 4{,}096$. (DeepSeek-V3 does not publish the exact micro-batch sizing; this is an illustrative value consistent with typical large-MoE training and is used to make the per-layer numbers concrete.)
+
+### EP=8, single node
+
+At EP=8, each rank holds $E/D = 256/8 = 32$ routed experts. The router on each rank fires on its $T = 4{,}096$ tokens and produces $T \cdot k = 32{,}768$ token-expert assignments per rank-batch. With perfect load balance, each of the 8 ranks receives $32{,}768 / 8 = 4{,}096$ token-expert assignments — that is, the 32 local experts on each rank together process 4 096 tokens on average, or 128 tokens per expert.
+
+The dispatch AlltoAll moves the token hidden vectors to their assigned experts:
+
+$$
+B_\text{dispatch} = k \cdot T \cdot d \cdot s \cdot \frac{D-1}{D} = 8 \times 4{,}096 \times 7{,}168 \times 2 \times \frac{7}{8}
+$$
+
+$$
+= 469{,}762{,}048 \times 0.875 = 411{,}041{,}792 \text{ bytes} \approx 411 \text{ MB per rank}
+$$
+
+The combine AlltoAll returns the expert outputs and carries the same volume in the symmetric (no-drop) case: approximately 411 MB per rank. The total AlltoAll traffic per MoE layer per rank is therefore $2 \times 411 = 822$ MB.
+
+At H800 NVLink bandwidth of roughly 160 GB/s per direction, the unidirectional transmission time for one dispatch is
+
+$$
+t_\text{dispatch} = \frac{411 \text{ MB}}{160 \text{ GB/s}} \approx 2.57 \text{ ms}
+$$
+
+The combine adds approximately the same time, for a total of about 5.1 ms of EP communication per MoE layer at link saturation. Across the 58 MoE layers of a forward pass, this comes to roughly 300 ms of communication per forward pass before any overlap with compute. That is the cost that overlap techniques like DualPipe are designed to hide.
+
+The corresponding expert compute is comparatively cheap. Each token visits $k = 8$ experts, each a SwiGLU with intermediate dimension 2 048. The SwiGLU FLOPs per token per expert are $3 \times 2 \times d_\text{model} \times d_\text{expert} = 3 \times 2 \times 7{,}168 \times 2{,}048 \approx 88$ MFLOPs, where the factor of 3 accounts for the three SwiGLU matrices (gate, up, down). Per token total: $8 \times 88 \approx 704$ MFLOPs. The expert workload is spread across the EP group, so each rank performs $32{,}768 / 8 = 4{,}096$ token-expert pairs, for $4{,}096 \times 88 \approx 360$ GFLOPs per rank per layer. At H800 sustained bf16 throughput of roughly 600 TFLOP/s, this corresponds to about 0.6 ms per layer of expert compute. The expert compute is *less* than the EP communication time — the 1:1 compute-to-communication ratio reported by DeepSeek-V3 §3.2.2 is, properly speaking, a ratio in which communication is the slow side, and is precisely the situation in which an overlap scheme like DualPipe pays off.
+
+### EP=64, across 8 nodes
+
+The transition from EP=8 to EP=64 changes two things in the arithmetic. First, each rank now holds only $E/D = 256/64 = 4$ experts, so its share of the expert pool is much smaller. Second, the $(D-1)/D$ factor in the dispatch volume increases from $7/8 = 0.875$ to $63/64 \approx 0.984$. The dispatch volume per rank therefore *grows* slightly in absolute terms:
+
+$$
+B_\text{dispatch, EP=64} = k \cdot T \cdot d \cdot s \cdot \frac{D-1}{D} = 8 \times 4{,}096 \times 7{,}168 \times 2 \times \frac{63}{64} \approx 463 \text{ MB per rank}
+$$
+
+The combine carries the same volume, for approximately 926 MB total AlltoAll traffic per MoE layer per rank.
+
+The critical change is in *where* those bytes travel. Without node-limited routing, the worst case for an EP=64 dispatch is that all 8 of a token's experts lie on 8 distinct nodes, so the entire 463 MB per rank flows over IB. With node-limit $M = 4$, each token is restricted to at most 4 of the 8 nodes, so the cross-node portion of the dispatch is bounded by $4/8 = 50$ percent of the total. The remaining 50 percent stays within a node and flows over NVLink at 3.2 times the bandwidth.
+
+Setting bandwidth limits, the IB-bound floor for the cross-node dispatch is
+
+$$
+t_\text{dispatch, IB} \geq \frac{0.5 \times 463 \text{ MB}}{50 \text{ GB/s}} \approx 4.6 \text{ ms}
+$$
+
+while the within-node NVLink portion completes in roughly $0.5 \times 463 / 160 \approx 1.4$ ms. If the two phases were perfectly serialised the dispatch would take about 6.0 ms; in a hierarchical implementation with NVLink and IB phases overlapped, the dispatch is bounded below by the slower of the two phases, approximately 4.6 ms.
+
+Across 58 MoE layers and the dispatch-plus-combine pair, the IB-bound contribution to a forward pass is therefore on the order of $58 \times 2 \times 4.6 \approx 530$ ms before overlap. The DeepSeek-V3 paper reports that DualPipe — which decomposes the layer into four chunks (attention, dispatch, MLP, combine) and bidirectionally schedules forward and backward passes to overlap one with the other — is the mechanism that brings this down to acceptable levels in steady state. The 1:1 compute-to-communication ratio that DeepSeek-V3 §3.2.2 describes is the engineering target that justifies the cost of DualPipe.
+
+The dispatch buffer memory follows directly from the static-shape requirement. At $\mathrm{CF} = 1.0$ with no overflow, the buffer of shape $[D, E/D, C, d]$ is exactly the volume shipped. At EP=8 with $C = k T / E = 128$:
+
+$$
+8 \times 32 \times 128 \times 7{,}168 \times 2 \text{ bytes} = 469 \text{ MB per rank}
+$$
+
+This matches the dispatch volume above, as it must. At $\mathrm{CF} = 1.25$ the buffer grows to roughly 590 MB per rank — per layer, in activation memory, across all 58 MoE layers. Activation memory budgets at frontier scale are not large; this is one reason DeepSeek-V3's training run is described as no-drop with $\mathrm{CF} = 1.0$, supported by the bias-balancing mechanism rather than overflow tolerance.
+
+The full forward-pass per-rank EP traffic at EP=64 is the per-layer total times the number of MoE layers: $58 \times 926 \approx 54$ GB per rank, or, if all 61 layers were MoE, $61 \times 2 \times 463 \approx 57$ GB per rank. Across 2 048 GPUs in the V3 training cluster, that is on the order of 115 TB of AlltoAll traffic per global forward pass. The aggregate is a useful sanity check on the infrastructure design but is not, in itself, a bottleneck: AlltoAll volume per *rank* is what determines per-rank wall-clock time, and that is what the analysis above bounds.
+
+## Frontier MoE EP landscape {#frontier-landscape}
+
+Public knowledge of EP world sizes across major MoE deployments as of May 2026 is uneven. DeepSeek (V2, V3, and the V3.1 / V3.2 successor releases throughout 2025) publishes detailed training and inference configurations. Kimi-K2 publishes the training EP world size and the deployment configuration. Mixtral's inference EP is documented through the open-source vLLM implementation. DBRX states its EP configuration in the Databricks announcement. Llama 4 and Qwen3 publish detailed model architectures but not the parallelism layout used during training. The closed-frontier models (GPT-4, Gemini, Claude) publish nothing about their parallelism choices and are out of scope.
+
+<ComparisonTable
+  caption="Frontier MoE expert-parallel deployments (May 2026). Training EP, inference EP, and node-limit policy where known. 'Not publicly disclosed' indicates the model's public report describes architecture but not parallelism."
+  columns={["Model", "E (routed)", "top-k", "EP (training)", "EP (inference)", "Node-limit", "Source"]}
+  rows={[
+    ["Mixtral 8x7B", "8", "2", "Not publicly disclosed", "EP=8 (1 expert/GPU, single node)", "n/a (single node)", "https://arxiv.org/abs/2401.04088"],
+    ["Mixtral 8x22B", "8", "2", "Not publicly disclosed", "EP=8 (1 expert/GPU)", "n/a", "https://mistral.ai/news/mixtral-8x22b/"],
+    ["DBRX", "16", "4", "EP=16 (one node, MegaBlocks dropless)", "EP=16", "n/a", "https://arxiv.org/abs/2211.15841"],
+    ["DeepSeek-V2", "160 + 2 shared", "6", "EP=160 (device-limited routing)", "EP=8 or 16 (decode)", "Device-limited (predecessor)", "https://arxiv.org/abs/2405.04434"],
+    ["DeepSeek-V3", "256 + 1 shared", "8", "EP=64 across 8 nodes", "EP=32 (prefill, 4 nodes); wide-EP up to 320 GPU (decode)", "M = 4 of 8 nodes", "https://arxiv.org/abs/2412.19437"],
+    ["Llama 4 Scout", "16 + 1 shared", "1", "Not publicly disclosed", "Not publicly disclosed", "Not publicly disclosed", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Llama 4 Maverick", "128 + 1 shared", "1", "Not publicly disclosed", "Not publicly disclosed", "Not publicly disclosed", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Qwen3-30B-A3B", "128", "8", "Not publicly disclosed", "Not publicly disclosed", "Not publicly disclosed", "https://arxiv.org/abs/2505.09388"],
+    ["Qwen3-235B-A22B", "128", "8", "Not publicly disclosed", "Not publicly disclosed", "Not publicly disclosed", "https://arxiv.org/abs/2505.09388"],
+    ["Kimi-K2", "384", "8", "EP=16 (smallest feasible)", "EP up to 128 (LMSYS 128xH200 deployment)", "Not publicly disclosed", "https://arxiv.org/abs/2507.20534"],
+    ["Grok-1", "8", "2", "EP=8 (one node)", "EP=8", "n/a", "https://x.ai/news/grok-os"],
+  ]}
+/>
+
+DeepSeek-V3's training stack is 64-way EP across 8 nodes (with the 256 routed experts evenly distributed: 4 experts per GPU), combined with 16-way pipeline parallelism using the DualPipe schedule, ZeRO-1 for optimizer states, and bf16 with fp8 dispatch for the AlltoAll. The full training cluster is 2 048 H800 GPUs, for 2.788M H800-hours of training [arXiv:2412.19437, §3.1–§3.2]. For inference, DeepSeek operates two distinct deployments. The prefill stage, which is compute-bound, runs on a minimum unit of 4 nodes (32 GPUs) at EP=32. The decode stage, which is memory- and communication-bound, is deployed in a *wide-EP* configuration that scales EP up to 256 or 320 GPUs to reduce per-GPU KV-cache and expert memory pressure. LMSYS reports 2.2k tokens/second/H200 at this scale; the vLLM project documents the same wide-EP pattern in its December 2025 large-scale serving guide. The expert-parallelism load balancer (EPLB) replicates the hottest experts across multiple GPUs at inference, turning the 256 logical experts into up to 288 physical experts placed across the deployment. Hot-expert replication is an inference-time optimisation only; training enforces load balance via the bias-update rule.
+
+Mixtral 8x7B and 8x22B both have exactly 8 experts per layer, so EP=8 maps cleanly to a single 8-GPU node with one expert per GPU, and the cross-node routing question does not arise. The vLLM Mixtral implementation defaults to EP=8 for tensor-parallel inference with a fused MoE kernel for the local SwiGLU. No token dropping at inference is reported. Training-time configuration has not been published by Mistral.
+
+Kimi-K2 (Moonshot AI, July 2025) deliberately chose EP=16 — the smallest feasible value given its 384-expert architecture — on the explicit grounds that smaller EP groups have less load-balance variance and avoid the need for additional balancing. With 384 experts at EP=16, each rank holds 24 experts. For deployment, LMSYS published a 128-H200 wide-EP setup analogous to DeepSeek's decode configuration. The Kimi paper notes that the smallest feasible EP "relaxes expert-balance constraints" and allows "near-optimal speed without further tuning."
+
+Qwen3 (Alibaba, May 2025) describes the model architecture in detail — 128 experts and top-8 routing for both the 30B-A3B and 235B-A22B variants — but does not publish the EP world size or the framework specifics. The report cites a "global-batch load balance loss" as the routing-quality mechanism but does not elaborate on the system. Training was performed on Alibaba's own clusters; no detailed accounting is publicly available.
+
+Llama 4 (Meta, April 2025) announces Scout (109B / 17B) and Maverick (400B / 17B) with 16 and 128 routed experts respectively, each with one shared expert and top-1 routing. The blog post does not state the EP world size, the capacity factor, or the token-dropping policy. The dense-and-MoE alternation pattern (not every layer is MoE) concentrates the EP burden on roughly half the layers; the exact policy is not published.
+
+<Sidenote>The DeepSeek-V3.1 and V3.2 releases throughout 2025 retain the same MoE EP configuration as V3. V3.2's main architectural change is sparse attention rather than routing or EP, so V3 remains the canonical reference for the expert-parallelism numbers discussed here.</Sidenote>
+
+## Chapter summary {#summary}
+
+Expert parallelism partitions the experts of each MoE layer across $D$ ranks and pays for the partition with two AlltoAll calls per layer per forward pass — a dispatch that routes tokens to their host ranks, and a combine that returns the expert outputs. The per-rank byte volume of each AlltoAll is, to first order, $k \cdot T \cdot d \cdot s \cdot (D-1)/D$, with $k$ the top-$k$ routing count, $T$ the per-rank token count, $d$ the hidden dimension, and $s$ the bytes per element. At top-$k = 8$, $d = 7{,}168$, $T = 4{,}096$, and bf16, this comes to roughly 411 MB per rank at EP=8 and 463 MB per rank at EP=64. The combine carries the same volume in the symmetric case.
+
+The bandwidth comparison with the dense alternative is clean. A dense feed-forward block under tensor parallelism pays roughly $4 d T s$ bytes per rank in two AllReduces; a sparse MoE feed-forward under expert parallelism pays roughly $2 k T d s$ bytes per rank in two AlltoAll calls. The two are equal at $k = 2$ (Mixtral), and the MoE cost is 4 times the dense cost at $k = 8$ (DeepSeek-V3). Node-limited routing — restricting each token to $M < D_\text{node}$ nodes — brings the cross-node portion of the MoE cost back down to roughly the dense cost, at the price of a small (but unquantified) quality penalty. DeepSeek-V3 uses $M = 4$ of 8 nodes.
+
+The composition with tensor parallelism in attention follows a standard pattern: TP for attention with two AllReduces per layer, EP for MoE FFN with two AlltoAll calls per layer. Megatron-Core's MoE Parallel Folding generalises this by allowing attention and MoE layers to use different parallelism groupings within the same model. ZeRO-1 is the standard companion to EP; ZeRO-3 conflicts with EP's "each rank holds different experts" design.
+
+The frontier landscape as of May 2026 is dominated by DeepSeek-V3's EP=64 training configuration, Kimi-K2's EP=16, Mixtral's EP=8 inference, and DBRX's EP=16 with MegaBlocks dropless. Llama 4 and Qwen3 publish architecture but not parallelism; closed-frontier models publish nothing. The detailed engineering — DualPipe overlap, EPLB hot-expert replication, fp8 dispatch, hierarchical AlltoAll kernels — lives in the libraries that surround these models and is the subject of the [NCCL collectives](/textbook/02f-collectives-and-overlap) and [3D/4D composition](/textbook/02h-3d-4d-composition) chapters that follow.
+
+---
+
+<Sources items={[
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "Primary source for EP=64 across 8 nodes; 256 routed + 1 shared experts; top-8 routing; node-limited routing with M=4; DualPipe overlap; 20 SMs for AlltoAll; 2.788M H800-hours training cost; 1:1 compute-to-communication ratio. §2.1.2, §3.2.2, §3.2.3."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "Source for device-limited routing (predecessor of node-limited routing); 160 routed + 2 shared experts; top-6 routing. §4.1."
+  },
+  {
+    authors: "Rajbhandari, S. et al.",
+    year: 2022,
+    title: "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale",
+    venue: "ICML 2022; arXiv:2201.05596",
+    url: "https://arxiv.org/abs/2201.05596",
+    note: "Formal definition of expert parallelism; hierarchical AlltoAll with O(G + p/G) complexity; PR-MoE design; 7.3x latency reduction."
+  },
+  {
+    authors: "Hwang, C. et al.",
+    year: 2022,
+    title: "Tutel: Adaptive Mixture-of-Experts at Scale",
+    venue: "MLSys 2023; arXiv:2206.03382",
+    url: "https://arxiv.org/abs/2206.03382",
+    note: "Adaptive parallelism switching; 2D hierarchical AlltoAll algorithm; 20.7x speedup on 2 048 A100s; 4.96x single-layer speedup on 16 A100s."
+  },
+  {
+    authors: "Lepikhin, D. et al.",
+    year: 2020,
+    title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding",
+    venue: "ICLR 2021; arXiv:2006.16668",
+    url: "https://arxiv.org/abs/2006.16668",
+    note: "Canonical dispatch and combine matrix formulation (combine_weights of shape [G, S, E, C]); capacity factor; local-group dispatching."
+  },
+  {
+    authors: "Fedus, W., Zoph, B., Shazeer, N.",
+    year: 2022,
+    title: "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity",
+    venue: "JMLR 23 (2022) 1–40; arXiv:2101.03961",
+    url: "https://arxiv.org/abs/2101.03961",
+    note: "Top-1 routing baseline; CF in [1.0, 1.25] at training; load-balance auxiliary loss; token dropping with residual pass-through."
+  },
+  {
+    authors: "Jiang, A. et al.",
+    year: 2024,
+    title: "Mixtral of Experts",
+    venue: "arXiv:2401.04088",
+    url: "https://arxiv.org/abs/2401.04088",
+    note: "Mixtral 8x7B architecture; 8 experts, top-2; no token dropping at inference."
+  },
+  {
+    authors: "Gale, T., Narayanan, D., Young, C., Zaharia, M.",
+    year: 2023,
+    title: "MegaBlocks: Efficient Sparse Training with Mixture-of-Experts",
+    venue: "MLSys 2023; arXiv:2211.15841",
+    url: "https://arxiv.org/abs/2211.15841",
+    note: "Block-sparse GPU kernels for dropless MoE; no capacity factor; used by DBRX."
+  },
+  {
+    authors: "Wang, A. et al.",
+    year: 2024,
+    title: "Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts",
+    venue: "ICLR 2025; arXiv:2408.15664",
+    url: "https://arxiv.org/abs/2408.15664",
+    note: "Bias-based balancing with update rule b_i ± γ at γ = 0.001; used in DeepSeek-V3 to eliminate token dropping during training."
+  },
+  {
+    authors: "He, J. et al.",
+    year: 2022,
+    title: "FastMoE: A Fast Mixture-of-Expert Training System",
+    venue: "arXiv:2103.13262",
+    url: "https://arxiv.org/abs/2103.13262",
+    note: "First PyTorch-native MoE training framework with EP; basis for many later systems."
+  },
+  {
+    authors: "NVIDIA / Megatron-Core team",
+    year: 2025,
+    title: "MoE Parallel Folding: Heterogeneous Parallelism Mappings for Efficient Large-Scale MoE Model Training with Megatron Core",
+    venue: "arXiv:2504.14960",
+    url: "https://arxiv.org/abs/2504.14960",
+    note: "Separate TP×CP×DP×PP for attention vs ETP×EP×DP×PP for MoE; token-level dispatcher with AlltoAll-V."
+  },
+  {
+    authors: "ByteDance / MegaScale-MoE team",
+    year: 2025,
+    title: "MegaScale-MoE: Large-Scale Communication-Efficient Training of Mixture-of-Experts Models in Production",
+    venue: "arXiv:2505.11432",
+    url: "https://arxiv.org/abs/2505.11432",
+    note: "352B MoE on 1 440 Hopper GPUs at 1.41M tokens/s; 1.88x speedup over Megatron-LM."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DeepEP: an efficient expert-parallel communication library",
+    venue: "GitHub: deepseek-ai/DeepEP",
+    url: "https://github.com/deepseek-ai/DeepEP",
+    note: "Warp-specialised AlltoAll kernels; 20 SMs partitioned into 10 communication channels; asymmetric-domain bandwidth forwarding between NVLink and RDMA/IB."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DualPipe: A bidirectional pipeline parallelism algorithm for computation-communication overlap in DeepSeek V3/R1 training",
+    venue: "GitHub: deepseek-ai/DualPipe",
+    url: "https://github.com/deepseek-ai/DualPipe",
+    note: "Forward-backward chunk overlap; 4-stage decomposition (attention / dispatch / MLP / combine); bidirectional pipeline scheduling."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "EPLB: Expert Parallelism Load Balancer",
+    venue: "GitHub: deepseek-ai/EPLB",
+    url: "https://github.com/deepseek-ai/EPLB",
+    note: "Hot-expert replication at inference (256 → 288 physical experts); hierarchical vs global load-balancing strategies."
+  },
+  {
+    authors: "Moonshot AI / Kimi Team",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "Kimi-K2 architecture (1.04T / 32B active, 384 experts, top-8, MLA); EP=16 training; 'smallest feasible EP' rationale."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Qwen3-30B-A3B and Qwen3-235B-A22B (128 experts, top-8); global-batch balance loss; 36T tokens. EP not published."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI Blog, April 5 2025",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Scout (16 + 1 shared, top-1) and Maverick (128 + 1 shared, top-1); alternating dense + MoE layers. EP and capacity-factor not published."
+  },
+  {
+    authors: "Microsoft / Tutel team",
+    year: 2025,
+    title: "Tutel MoE: Optimized Mixture-of-Experts Library",
+    venue: "GitHub: microsoft/Tutel",
+    url: "https://github.com/microsoft/Tutel",
+    note: "Production Tutel implementation; FP8 / NVFP4 / MXFP4 / BlockwiseFP8 dispatch support."
+  },
+  {
+    authors: "Meta Engineering",
+    year: 2025,
+    title: "Scaling LLM Inference: Innovations in Tensor Parallelism, Context Parallelism, and Expert Parallelism",
+    venue: "Meta Engineering Blog, October 17 2025",
+    url: "https://engineering.fb.com/2025/10/17/ai-research/scaling-llm-inference-innovations-tensor-parallelism-context-parallelism-expert-parallelism/",
+    note: "AlltoAll contributes 10–30% to end-to-end latency at decode-time; dynamic and persistent AlltoAll optimisations."
+  },
+  {
+    authors: "vLLM team",
+    year: 2025,
+    title: "Large Scale Serving: DeepSeek @ 2.2k tok/s/H200 with Wide-EP",
+    venue: "vLLM Blog, December 17 2025",
+    url: "https://blog.vllm.ai/2025/12/17/large-scale-serving.html",
+    note: "DeepSeek-V3 inference EP up to 320 GPU at decode; 2.2k tok/s/H200; wide-EP architecture."
+  },
+  {
+    authors: "LMSYS",
+    year: 2025,
+    title: "Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs",
+    venue: "LMSYS Blog, May 5 2025",
+    url: "https://www.lmsys.org/blog/2025-05-05-large-scale-ep/",
+    note: "Prefill/decode disaggregation; 4-node prefill unit; EP scaling to 96 GPUs."
+  },
+  {
+    authors: "LMSYS",
+    year: 2025,
+    title: "Deploying Kimi K2 with PD Disaggregation and Large-Scale Expert Parallelism on 128 H200 GPUs",
+    venue: "LMSYS Blog, July 20 2025",
+    url: "https://www.lmsys.org/blog/2025-07-20-k2-large-scale-ep/",
+    note: "Kimi-K2 inference wide-EP on 128 H200; deployment numbers."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures",
+    venue: "arXiv:2505.09343",
+    url: "https://arxiv.org/abs/2505.09343",
+    note: "Hardware co-design reflections; NVLink (160 GB/s on H800) vs IB (50 GB/s) bandwidth asymmetry analysis."
+  },
+  {
+    authors: "NVIDIA Developer Blog",
+    year: 2025,
+    title: "Optimizing Communication for Mixture-of-Experts Training with Hybrid Expert Parallel",
+    venue: "NVIDIA Developer Blog",
+    url: "https://developer.nvidia.com/blog/optimizing-communication-for-mixture-of-experts-training-with-hybrid-expert-parallel/",
+    note: "Hybrid-EP library; leveraging TMA, IBGDA, RDMA, Spectrum-X for hyperscale MoE AlltoAll."
+  },
+  {
+    authors: "Sun, C., Wang, X., et al.",
+    year: 2024,
+    title: "Shortcut-connected Expert Parallelism for Accelerating Mixture-of-Experts",
+    venue: "arXiv:2404.05019",
+    url: "https://arxiv.org/abs/2404.05019",
+    note: "ScMoE architecture; 100% communication-compute overlap; 1.49x training speedup, 1.82x inference speedup over top-2 baseline."
+  }
+]} />

@@ -1,0 +1,612 @@
+---
+slug: 01f-data-curriculum
+title: Data mixing and curriculum
+description: DoReMi, RegMix, Data Mixing Laws, multilingual temperature sampling, and the 2024–2026 frontier static/dynamic curriculum recipes.
+order: 16
+chapter: 15
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 35
+depends_on: [01a-data-pipeline]
+provides: [data-mixing, doremi, regmix, mixing-laws, multilingual-temperature, curriculum, synthetic-data]
+last_reviewed: 2026-05-11
+---
+
+## Orientation {#orientation}
+
+A frontier pretraining run begins with the output of the [data pipeline](/textbook/01a-data-pipeline): a collection of cleaned, deduplicated, quality-filtered per-domain buckets — typically web, code, math, books, academic, encyclopaedic, multilingual long-tail — each measured in trillions of tokens. The job of *this* chapter is to answer two operational questions about those buckets. First, given a fixed compute budget that fixes the total token count $D$, in what proportions $p_i$ should each domain be sampled? Second, do those proportions stay constant across training, or should they shift as the model approaches convergence?
+
+Both questions are now first-class engineering decisions in every published frontier recipe of 2024–2026. The empirical case is straightforward: a 1% absolute shift in the code share, or a 5% absolute shift in the multilingual share, can move headline benchmarks (MMLU, MATH, HumanEval, multilingual XNLI) by more than an additional 10% of compute buys at fixed mix. The methodological case has matured in parallel: between DoReMi (NeurIPS 2023) and the capacity-aware mixture law CAMEL (2026), the field has converged on a small family of scaling-law-style methods that fit at small scale and extrapolate to large.
+
+This chapter has eleven sections. § [Why mix matters](#why-mix-matters) presents the empirical evidence. § [Static-mix methods](#static-mix) covers the four canonical algorithms — DoReMi, RegMix, Data Mixing Laws, and the 2024–2026 follow-ups BiMix and CAMEL. § [Dynamic curriculum](#curriculum) introduces the conceptual story of a trajectory $\boldsymbol{p}(t)$ over training, leaving the mechanics to [annealing](/textbook/01h-annealing-and-stability). § [Multilingual balance](#multilingual) covers the temperature-sampling tradition and the recent multilingual scaling laws. § [Granularity](#granularity) distinguishes domain-level, document-level, and token-level selection. § [Synthetic data](#synthetic-data) covers the Phi-1-to-Phi-4 trajectory and the 2025 scaling laws for rephrased synthetic. § [Worked example](#worked-example) fits a four-domain Data Mixing Law on illustrative numbers. § [Frontier-lab landscape](#frontier-practice) is the comparison table with disclosure caveats. § [Chapter summary](#summary) closes.
+
+<Callout variant="note" title="Calibration and notation">
+Content calibrated to frontier-model practice as of May 11, 2026. Mix proportions for closed labs (OpenAI, Anthropic, Google Gemini) are *not publicly disclosed* and are not estimated here. Mix proportions for partially-disclosing labs (DeepSeek-V3, Kimi-K2, Mistral, Gemma-2/3) are quoted only at the level of granularity their reports support. Notation: $p_i$ is the mixing proportion for domain $i$ with $\sum_i p_i = 1$; $\alpha_i, k_i, c_i, t_{ij}$ are parameters of the Data Mixing Laws functional form; $T$ is the multilingual sampling temperature in the form $p_l \propto n_l^{1/T}$ (equivalent to the form $p_l \propto n_l^\tau$ with $\tau = 1/T$, which appears in some papers — both are noted where they occur); $L$ is per-token cross-entropy in nats per the module convention; $N$ is non-vocabulary parameter count and $D$ is total pretraining tokens.
+</Callout>
+
+The "domain" label is not standardised across labs. Llama-3's *code* bucket, DeepSeek-V3's *code* bucket, and Phi-4's *code* bucket may apply different filter pipelines and cover different languages; *math* may mean MATH-style proofs in one report, Common Crawl math-tagged content in another, and synthetic chain-of-thought in a third. The percentages quoted later in the chapter are faithful to each report's own terminology but should not be compared across labs as if they were drawn from a common taxonomy.
+
+---
+
+## Why mix matters {#why-mix-matters}
+
+The marginal nats-of-loss reduction from an additional web token is small. The marginal value of an additional well-formed code token, a math-proof token, or a multi-step chain-of-thought token is much larger. Three structural reasons account for the asymmetry. Web is highly redundant — deduplication and quality filtering already remove 30–70% of raw tokens, and what survives is still dominated by near-duplicate forum and blog patterns. Code, math, and reasoning text exercise circuits — symbolic manipulation, multi-step inference, formal syntax — that web prose rarely demands at concentration. And frontier evaluations are now dominated by reasoning-heavy benchmarks, so the unit of *evaluable quality* per token is much higher for the harder domains.
+
+The empirical evidence supporting these claims comes from three controlled studies that anchor the rest of the chapter.
+
+**The code-data ablation (Aryabumi et al., Cohere, 2024, arXiv:2408.10914).** Across 470M–2.8B-parameter ablations, adding code data to pretraining yielded **+8.2% relative improvement on natural-language reasoning, +4.2% on world knowledge, +6.6% on generative win-rate, and +12× on code benchmarks**. The result that should be loaded into memory: code helps *non-code* downstream tasks. The most plausible explanation is that code-shaped text — with its strict syntax, explicit variable bindings, and short-range structured dependencies — exercises composition circuits that transfer to natural-language reasoning. Whatever the mechanism, the empirical conclusion is settled: a pretraining mix that omits code underperforms on reasoning, not just on coding.
+
+**The Llama-3 annealing ablation (Grattafiori et al., Meta, 2024, arXiv:2407.21783).** Late in pretraining, Meta annealed the learning rate to zero while upsampling high-quality domain-specific data. On the 8B model, the annealing phase produced **+24.0% on GSM8K and +6.4% on MATH**; on the 405B model the effect was negligible. The directional interpretation is that smaller models, with weaker in-context reasoning, benefit far more from concentrated high-quality data at the end of training; larger models already have the latent capability, and the curriculum tail is mostly a refinement of expression.
+
+<Callout variant="warning" title="Llama-3 annealing is 40 MILLION tokens, not 40 billion">
+The Llama-3 paper, Section 3.4.3, explicitly states that the annealing phase covers "the final 40M tokens" — *forty million*, not forty billion. This is roughly 2.6 × 10⁻⁶ of the 15.6T-token total. The forty-billion misquote appears in several survey papers and blog posts; it is incorrect by a factor of one thousand. The intuition the small number forces is the important one: a *negligible* tail of high-quality data, sampled while the learning rate decays to zero, can move 8B-class reasoning benchmarks by tens of points. The Llama-3 annealing window is a worked example of how cheap curriculum effects can be at scale. The mechanics of the LR cooldown and the data-mix swap timing live in [annealing](/textbook/01h-annealing-and-stability) — this chapter only reports the headline.
+</Callout>
+
+**The Front-Loading Reasoning study (Akter, Prabhumoye et al., NVIDIA + CMU, 2025, arXiv:2510.03264).** A systematic pretraining-vs-SFT placement ablation. Front-loading reasoning data into pretraining yielded **+16% average improvement (math +28.4%, code +9%)** over a no-reasoning base. The crucial second-order finding: high-quality reasoning data inserted at pretraining unlocked an additional **+4% SFT gain** that no amount of SFT data alone could replicate. The implication for mix design is sharp — pretraining mix and post-training mix are *not* substitutes. They compound. A reasoning-rich pretraining mix lifts the ceiling that post-training can reach, and a reasoning-poor pretraining mix sets a ceiling that no SFT pipeline overcomes. The chapter's working assumption from here on is that mix decisions in pretraining are decisions about the post-training-attainable ceiling, not only about the base-model loss.
+
+The three results — Aryabumi's +8.2% from code, Llama-3's +24% from a 40M-token annealing tail, and Front-Loading's +16% from pretraining-side reasoning data — are the quantitative core of why mix matters. The methodological response to the evidence is the family of mix-optimisation algorithms in the next section.
+
+---
+
+## Static-mix methods {#static-mix}
+
+The static-mix problem is the following. The corpus has $K$ domains with raw token counts $n_1, \ldots, n_K$. Choose proportions $\boldsymbol{p} = (p_1, \ldots, p_K)$ with $\sum_k p_k = 1$ to minimise some downstream objective $\mathcal{J}(\boldsymbol{p})$ evaluated on a target model trained on the mix. The simplex of feasible $\boldsymbol{p}$ is low-dimensional — $K$ is typically between 5 and 20 — and would be tractable by direct search if training a frontier model were cheap. It is not, so the field has produced four families of indirect methods. They share a common shape: train *small* models on *many* mixes, fit a regression or scaling law, optimise the surrogate, and transfer the predicted optimum to the target scale.
+
+### DoReMi {#doremi}
+
+**Xie et al. (NeurIPS 2023, arXiv:2305.10429)** formalised the mix-optimisation problem and produced the first algorithm of consequence.
+
+The setup. Pretraining has $K$ domains. The goal is mixture proportions $\boldsymbol{\alpha} = (\alpha_1, \ldots, \alpha_K)$ that maximise downstream performance on the target model. DoReMi solves a surrogate problem instead: find $\boldsymbol{\alpha}$ that yields low *worst-case excess loss* relative to a reference model.
+
+The algorithm has four steps. First, train a reference model $M_{\text{ref}}$ on a default mix (e.g. The Pile's published proportions). Second, train a proxy model $M_{\text{proxy}}$ on the same $K$ domains using *group distributionally robust optimisation* (Group DRO). At each step, the per-domain weights $\alpha^{(t)}$ are updated to upweight the domains where the proxy's per-domain loss exceeds the reference's per-domain loss the most. The proxy minimises
+
+$$
+\max_{\boldsymbol{\alpha} \in \Delta^{K-1}} \sum_{k=1}^{K} \alpha_k \cdot \left( L_{\text{proxy}, k} - L_{\text{ref}, k} \right)
+$$
+
+maintained via an exponentiated-gradient update on $\log \alpha$. Third, take the resulting $\boldsymbol{\alpha}$ — either the trajectory's average or its final value — and treat it as the DoReMi mix. Fourth, train the full target model on that mix.
+
+The empirical headline is striking. A **280M-parameter proxy** produced mix weights that, transferred to train an **8B model on The Pile**, improved few-shot accuracy by **6.5 absolute points** over a default-mix baseline, and reached baseline accuracy in **2.6× fewer training steps**. On Google's GLaM corpus, DoReMi matched mix weights that had been hand-tuned on downstream tasks, despite using no downstream signal at all. The compute cost is one proxy run plus one reference run, both at small scale; the dominant cost is the reference run.
+
+The limitation, and the reason DoReMi has been largely superseded by 2026, is that it optimises a robustness criterion rather than a downstream-task objective. Domains where loss is structurally higher — raw web subsets with high entropy, multilingual subsets with poor tokenization — get upweighted by the Group DRO update even when their marginal contribution to downstream accuracy is low. RegMix's empirical follow-up (next section) found that the DoReMi weights are not optimal for downstream metrics in all settings. As of May 2026 no published frontier-lab report states "we use DoReMi" — but every successor algorithm references it as the formal starting point of the field.
+
+### RegMix {#regmix}
+
+**Liu et al. (ICLR 2025, arXiv:2407.01492)** reframed the problem as a regression.
+
+The setup. Collect $(\boldsymbol{\alpha}^{(i)}, y^{(i)})$ pairs by training many tiny models on diverse sampled mixes $\boldsymbol{\alpha}^{(i)}$ and measuring a downstream proxy $y^{(i)}$ — usually validation loss on a held-out reference distribution. Fit a regression $y = f(\boldsymbol{\alpha})$. Optimise $\boldsymbol{\alpha}^* = \arg\min_{\boldsymbol{\alpha}} f(\boldsymbol{\alpha})$ over the simplex. Train the full target model on $\boldsymbol{\alpha}^*$.
+
+The original RegMix instantiation used **N = 512 models with 1M parameters each, each trained for 1B tokens**. The regression was a gradient-boosted tree (LightGBM). The output was a predicted optimum that, at 1B target-model size and 25B target tokens, outperformed all 63 candidate mixes the authors evaluated and matched DoReMi's headline gain using roughly **10% of DoReMi's compute**. The finding that travelled furthest in the community: the regression revealed that *web corpora* — not Wikipedia or Books — had the strongest positive correlation with downstream performance, a counter-intuitive but reproducible result. The implication is that quality filtering matters more than source curation: a well-filtered web mix earns more downstream than an aesthetically chosen mix tilted toward books or encyclopaedias.
+
+Three structural reasons RegMix beats DoReMi at lower cost. The tiny runs parallelise; DoReMi's proxy and reference are sequential. The regression directly targets validation loss or any chosen downstream metric, whereas DoReMi targets per-domain robustness. And the regression captures non-linear interactions between domains — a doubling of code may not benefit the model independent of the math share, and a gradient-boosted tree learns the interaction automatically; the Group DRO update cannot represent it.
+
+The reference implementation is at `https://github.com/sail-sg/regmix`, and the RegMix-style "many tiny runs + tree regression" pattern is now part of the open-recipe playbook.
+
+### Data Mixing Laws {#mixing-laws}
+
+**Ye et al. (ICLR 2025, arXiv:2403.16952)** went a step further: rather than fit a black-box regression, fit a *scaling law* whose functional form encodes the structure of the mix-vs-loss surface.
+
+The functional form is the chapter's central equation:
+
+$$
+L_i(\boldsymbol{\alpha}) = c_i + k_i \cdot \exp\!\left( \sum_{j=1}^{K} t_{ij}\, \alpha_j \right)
+$$
+
+where $L_i$ is the validation loss on domain $i$, $\alpha_j$ is the *training* proportion of domain $j$, and $(c_i, k_i, t_{ij})$ are fitted constants. The overall validation loss is $L(\boldsymbol{\alpha}) = \sum_i v_i L_i(\boldsymbol{\alpha})$ for chosen evaluation weights $v_i$ summing to one. The exponential-of-linear form captures two effects: per-domain saturation when $\alpha_i$ is large (the diagonal $t_{ii}$ term dominates) and cross-domain interaction via off-diagonal $t_{ij}$. Both are visible in real ablation surfaces; an additive form would miss them.
+
+Some surveys mistakenly write the form additively, as $L_i(\boldsymbol{\alpha}) = c_i + \sum_j k_{ij} \alpha_j$. The correct form is exponential-of-linear; the additive variant does not fit the empirical surfaces.
+
+The full Data Mixing Laws procedure composes three scaling laws to extrapolate from small to large. A *data-size scaling law*, $L(D \mid \boldsymbol{\alpha}, N\text{ fixed})$, fit on small-$D$ runs. A *model-size scaling law*, $L(N \mid \boldsymbol{\alpha}, D\text{ fixed})$, fit on small-$N$ runs. And the *data-mixing law* above, $L(\boldsymbol{\alpha} \mid N, D\text{ fixed})$. The composition lets the practitioner fit only at small $(N, D)$ and predict the loss at large $(N, D)$ under any chosen $\boldsymbol{\alpha}$. The composed prediction is then optimised over the simplex by a projected-gradient or interior-point solver to obtain $\boldsymbol{\alpha}^*$.
+
+The empirical headline: on RedPajama at 1B parameters and 100B tokens, the predicted-optimal mix matched a baseline mix trained for **48% more steps**. Re-read that as a compute-efficiency multiplier: the mix-optimisation effect is equivalent to a ~1.5× increase in training compute, *for free*, before the first target-scale token is processed. Ye et al. also showed that the same nested-laws procedure predicted a mix that prevented catastrophic forgetting in a continual-pretraining setting, where the loss-prediction has to remain valid as the data distribution shifts mid-run.
+
+The exponential-of-linear form has been independently corroborated, with refinements, by BiMix and CAMEL — covered next.
+
+### BiMix, CAMEL, and 2024–2025 follow-ups {#bimix-camel}
+
+**BiMix (Ge et al. 2024, arXiv:2405.14908)** extends the Data Mixing Law into a *bivariate* form that jointly models mix and data volume. Where Ye et al. fit $L(\boldsymbol{\alpha})$ at a fixed $D$, BiMix fits $L(\boldsymbol{\alpha}, D)$ in a single multiplicative form. The empirical validation is unusually strong: **mean relative loss-prediction error below 0.2% and $R^2 > 0.97$** on held-out mixes. BiMix's chief contribution to the chapter's argument is methodological — it confirms that the Ye et al. functional form is not specific to one dataset or one run, and that the (mix, volume) coupling is captured well by a smooth multiplicative ansatz.
+
+**CAMEL — capacity-aware mixture law (Li, Gu & Zhang 2026, arXiv:2603.08022).** The 2026 state of the art. The implicit assumption in earlier mixing laws — that the optimal mix is independent of model size $N$, fit at small $N$ and extrapolated — fails at frontier scale. A 405B model and a 1B model do not benefit from the same code-to-math ratio. CAMEL adds a capacity term, modelling the nonlinear interplay between $N$ and optimal $\boldsymbol{\alpha}$. The reported gains: **~50% reduction in mix-optimisation cost** relative to prior methods, and **+3% downstream benchmark gain** at fixed compute. Validation runs covered MoE architectures up to 7B active over 150M-A, extrapolated to 55B-A1.2B targets.
+
+<Sidenote>
+CAMEL was posted with arXiv ID 2603.08022 in 2026 and is very recent as of this chapter's calibration date. The result has not yet been independently replicated outside the original group. Verify the arXiv ID stays stable and cross-check headline numbers before relying on CAMEL for a production decision. If the paper is revised or retracted, BiMix remains the SOTA bivariate-mixing-law citation.
+</Sidenote>
+
+**UtiliMax and MEDU (Held et al. 2025, arXiv:2501.11747).** A different methodological direction: instead of fitting a scaling law, *estimate* per-dataset utility from a few samples and combine with a token-count heuristic. UtiliMax extends token-count weighting with utility estimates from small ablations; MEDU uses an LLM to score utility directly from samples. The reported gains, relative to manual baselines: **10.6× speedup for UtiliMax, ~200× compute reduction for MEDU**. The take-away is that simple heuristics adjusted by a learned utility score are competitive with the more elaborate methods, at a fraction of the optimisation cost.
+
+The state of practice as of May 2026 is split. Large open labs with serious compute (Meta, Alibaba) run mini-scaling-law experiments in the Llama-3 style — many small runs at varied mixes, fit, extrapolate. Production teams with constrained compute use UtiliMax/MEDU-style heuristic-plus-utility methods. The Ye et al. / BiMix / CAMEL family is the academic frontier; DoReMi has been largely superseded but remains the historical reference point. The next two sections leave static-mix optimisation behind and turn to the *trajectory* of mix over training.
+
+---
+
+## Dynamic curriculum {#curriculum}
+
+The static-mix methods above choose a single $\boldsymbol{p}$. The dynamic-curriculum extension chooses a trajectory $\boldsymbol{p}(t)$ over training. The conceptual claim is that the optimal mix is not constant. Early in pretraining, when the model is still learning basic syntactic structure, lexical statistics, and broad-coverage facts, a wide and web-heavy mix is appropriate. As the model approaches convergence, the marginal nats-of-loss reduction is dominated by *hard* tokens — code, math, reasoning chains, well-formed multi-step prose. A curriculum that shifts toward those domains late in training extracts more downstream capability per compute hour than the same total token budget spent at fixed mix.
+
+The mechanics of *how* to schedule that shift — the learning-rate cooldown shape, the data-mix interpolation curve, the WSD-versus-cosine timing — are the subject of [annealing and stability](/textbook/01h-annealing-and-stability). This chapter introduces the *what* and the *why*. Four empirical exemplars give the shape.
+
+**Llama 3 (Grattafiori et al., Meta 2024, arXiv:2407.21783).** Static mix of approximately **50% general knowledge / 25% mathematical and reasoning / 17% code / 8% multilingual** for the bulk of pretraining (these are the proportions disclosed in the 2024-07 Llama-3 Herd paper; subsequent Llama-3.1 and Llama-4 releases do not update the table). Final 40M tokens (the [annealing](/textbook/01h-annealing-and-stability) phase) shifted to upsampled high-quality domain-specific data while the learning rate decayed linearly to zero. Effect: +24% GSM8K and +6.4% MATH on the 8B model, negligible on the 405B. Llama-3 explicitly screened the annealing mix against benchmark training sets to avoid contamination.
+
+**Qwen3 (Qwen Team 2025, arXiv:2505.09388).** A three-stage *explicit* curriculum, the most clearly disclosed in 2025. Stage 1: **30T+ tokens at 4,096-token context**, broad mix for general capability. Stage 2: **~5T higher-quality tokens at 4,096-token context with the share of STEM, code, reasoning, and synthetic data explicitly increased**. Stage 3: hundreds of B tokens at 32k context for [long-context](/textbook/01g-long-context#long-data) capability, with 75% of sequences in the 16k-32k range and 25% in 4k-16k. Total: 36T tokens, 119 languages. The Stage 1 → Stage 2 transition is the trajectory's main "high-quality tilt"; Stage 3 is a separate long-context curriculum that the chapter on long-context covers in detail.
+
+**OLMo 2 (AI2 2024, arXiv:2501.00656).** The cleanest open-source example. Stage 1 ("OLMo-Mix-1124"): **~3.9T tokens** from DCLM, Dolma, Starcoder, and Proof Pile II, covering more than 90% of the pretraining compute budget. Stage 2 ("Dolmino-Mix-1124"): **843B tokens** of curated high-quality material — academic, Q&A, instruction-style, math workbooks, both synthetic and human-generated — applied in three annealing mixes of 50B, 100B, and 300B tokens. Each Dolmino mix is 50% high-quality web plus 50% domain-specific high-quality. The 7B model trains three copies on the 50B mix with different shuffles and takes the model soup. OLMo-2 is the cleanest published recipe for "what does a Dolmino-style annealing-curriculum actually look like."
+
+**DeepSeek-V3 (DeepSeek-AI 2024, arXiv:2412.19437).** 14.8T tokens, *qualitative* disclosure only. The V3 mix was rebalanced relative to V2 to enhance the share of mathematical and programming samples and to expand multilingual coverage; specific per-domain percentages are not disclosed. The directional move — math and code upweighted, multilingual expanded — is the same as the Llama-3 / Qwen3 / OLMo-2 pattern. The lack of percentages prevents an apples-to-apples comparison.
+
+The disagreement across exemplars is on the *timing and breadth* of the high-quality tail, not on its shape. Llama-3's 40M-token annealing window is the narrowest; OLMo-2's 843B-token Dolmino phase is the widest; Qwen3's full Stage 2 at ~5T tokens is the broadest. None of the four exemplars is a static mix in the strict sense. The methodological lesson is that the static-mix optimisation methods of § [Static-mix methods](#static-mix) describe the *body* of the trajectory, and the curriculum decisions describe its *tail*. The body and the tail are tuned separately, and the tail's effect at the 8B-class scale can be larger than any single body decision — as the Llama-3 annealing +24% GSM8K result demonstrates.
+
+A separate, increasingly common pattern is *mid-training* — a phase that bridges pretraining and post-training, using curriculum-like data shifts at a lower learning rate. The continuation chapter on mid-training and continued pretraining covers it; the relevant fact for this chapter is that the boundary between "late pretraining curriculum" and "early mid-training" is now soft, and labs that disclose at all (OLMo-2, Qwen3) describe both in the same data-mix terms.
+
+---
+
+## Multilingual balance {#multilingual}
+
+Multilingual mixing is the single most-studied sub-problem of mix optimisation, because it has both a clean parametric form and decades of pre-LLM history in machine translation.
+
+### Temperature sampling
+
+Given per-language raw token counts $n_l$, the canonical sampling distribution is
+
+$$
+p_l = \frac{n_l^{1/T}}{\sum_j n_j^{1/T}}, \qquad T \geq 1.
+$$
+
+Equivalently, some papers use $\tau = 1/T \in [0, 1]$ and write $p_l \propto n_l^{\tau}$. The two conventions are interchangeable; this chapter uses $T$ for consistency with the Conneau & Lample (XLM, 2019) tradition, where $T = 1$ samples in proportion to raw counts (English dominates) and $T \to \infty$ samples uniformly across languages (the long tail is massively upsampled). Frontier practice since XLM has converged on $T \in [2, 3.3]$ — equivalently $\tau \in [0.3, 0.5]$ — with $\tau = 0.3$ as the high-coverage default for genuinely multilingual models.
+
+The intuition: $\tau = 1$ would give an English-dominated model that handles low-resource languages poorly; $\tau = 0$ would give a model that wastes capacity on languages with too little data to learn well. The $\tau \in [0.3, 0.5]$ range is the empirical compromise — enough English to anchor reasoning, enough tail upsampling to give every covered language at least a usable fertility curve.
+
+### Scaling-law results
+
+Two recent results sharpen the temperature-sampling tradition into testable claims.
+
+**Multilingual NMT scaling (Fernandes, Ghorbani, Garcia, Freitag & Firat 2023, arXiv:2302.09650).** Changing per-language-pair weights affects only the *multiplicative factor* of the scaling law — the prefactor of the loss curve — and not the scaling exponent. All mixing rates exhibit the same exponent on $N$; the mix only shifts the curve up or down. Language similarity has no detectable effect on the scaling exponent. Translation direction does: into-English models behave as if they have larger effective parameter counts than from-English models, suggesting the model devotes more capacity to the English side regardless of mix. Fernandes et al. derived a joint scaling law that predicts performance for any weighting at any scale, given a small-scale calibration.
+
+**Multilingual decoder-only LLMs (He et al. 2024, arXiv:2410.12883).** Extended the Fernandes story to decoder-only LMs. The key claim: per-family test cross-entropy is determined *solely* by the family's own sampling ratio, independent of other families. The authors organised 23 languages into 5 families to clean up the prediction. They derived a joint power-law in $(D, N, \text{sampling-ratio})$ and showed that optimal sampling ratios from 85M-parameter pilot runs transfer to 1.2B-parameter runs. The He et al. result is the strongest current statement that multilingual mix optimisation extrapolates well across scale — an important practical claim, since otherwise every model size would require its own pilot.
+
+### Long-tail handling
+
+Two practical strategies dominate May-2026 practice. The first is **temperature sampling at $\tau \in [0.3, 0.5]$**, which upsamples tail languages without going fully uniform. The second is **curriculum-style language expansion**: train phase 1 on a high-resource subset (the top 30 languages or so), then expand in phase 2 to the tail with a separately tuned sub-mix. Qwen3's expansion from 29 languages (Qwen2.5 era) to 119 languages (Qwen3) is the headline example of the curriculum approach; Llama 3's 8% multilingual share with explicit upsampling of non-English data toward the end of pretraining is closer to the pure-temperature approach.
+
+Per-language quality thresholds are now standard. A language whose corpus passes a fertility threshold (typically: median tokens-per-word below some cutoff after retraining the tokenizer) and a quality threshold (typically: a per-language perplexity-classifier filter) enters the multilingual mix. A language that fails either threshold is held back. The exclusion is rarely public — Llama 3's 8% multilingual covers an unspecified subset of languages — but the practice is documented in OLMo 2 and Qwen3 reports.
+
+The interaction with tokenization matters. A vocabulary trained on a high-resource-skewed sample will fragment low-resource scripts into many tokens, inflating their per-document compute cost and reducing the effective signal per training step. The [tokenizer-training](/textbook/01b-tokenizer-training#frontier-comparison) chapter quantifies this — Indic and CJK languages can pay a 3–10× fertility tax on an English-tuned vocabulary, and a multilingual mix that does not coordinate with tokenizer training is wasting upsampling on tokens the model cannot efficiently use. The two decisions are coupled, and the multilingual-mix literature increasingly treats them as a single optimisation.
+
+---
+
+## Granularity: domain weights vs token-level {#granularity}
+
+Mix optimisation operates at three granularities, each with a distinct methodological signature. The domain level — DoReMi, RegMix, the mixing-laws family, BiMix, CAMEL — works on the $K$-vector $\boldsymbol{\alpha}$. The document level — D4, perplexity-based pruning, LESS — works on a per-document inclusion or score. The token level — LESS-style gradient features extended to tokens — is currently research-grade and not in production use. The choice of granularity is mostly a function of the within-domain heterogeneity of the corpus.
+
+**Per-document quality scoring.** D4 (Tirumala, Simig, Aghajanyan & Morcos, NeurIPS 2023, arXiv:2308.12284) embeds each document with a small pretrained model (the paper used a 125M-parameter OPT and took the last-layer last-token embedding), clusters with K-means, and removes near-duplicates within each cluster. At 6.7B scale, D4 gives ~20% efficiency gains and up to +2 points on 16 downstream tasks. Marion et al. (2023, arXiv:2309.04564, "When Less Is More") give the cleanest companion finding: *simple perplexity-based pruning outperforms more elaborate Error-L2-Norm or memorisation-based scoring*, and a model trained on the *top-30%* of a corpus by perplexity beats the same model trained on the full corpus. The result is striking because it implies that a majority of web tokens contribute negative or zero marginal value: pruning them is not a sacrifice but an improvement. Per-document quality scoring is the chapter's strongest available evidence that within-domain heterogeneity matters as much as cross-domain balance.
+
+**Per-document influence-based selection.** LESS (Xia, Malladi, Gururangan, Arora & Chen, ICML 2024, arXiv:2402.04333) adapts an influence-function-style estimator to the Adam optimiser, computes low-rank gradient features for each candidate example, stores them in a reusable datastore, and ranks examples by gradient similarity to the few-shot demonstrations of a target capability. The headline result is for instruction tuning rather than pretraining: training on a LESS-selected 5% of the data often beats training on the full dataset. LESS is the methodological prototype for per-document gradient-based selection, and several 2025 follow-ups extend the technique to pretraining-scale selection. The chapter's reason for citing LESS is that it frames the per-document analogue of DoReMi's per-domain reweighting — both upweight examples that close the loss gap on a reference target, but at different granularities.
+
+**When to use which.** A reasonable rule of thumb:
+
+- Always start with domain-level mix optimisation. The simplex of $K \leq 20$ proportions is low-dimensional and tractable.
+- Add per-document quality scoring (D4, perplexity, or a quality classifier) when within-domain heterogeneity is large, which is *always* true for raw web. The Marion et al. 30%-of-corpus result implies this is almost always worth doing.
+- Add per-document influence-based selection (LESS-family) only when targeting a specific capability and a few-shot reference set is available. Not yet standard in frontier pretraining as of May 2026.
+
+The grand-unified picture would be a single joint optimisation over domain weights *and* per-document scores *and* per-token weights. No published method does this at frontier scale; the compute costs of computing influence features at trillion-token scale, even with low-rank tricks, are still prohibitive. Domain-level optimisation plus a perplexity-pruned corpus is the working compromise.
+
+---
+
+## Synthetic data at pretraining {#synthetic-data}
+
+Synthetic data is the most rapidly evolving sub-question in mix design. The Phi family's "textbooks are all you need" thesis (2023) was treated as a small-model curiosity at the time; the Phi-4 technical report (December 2024) made it a frontier-relevant claim. The 2025 scaling-laws study by Kang et al. provided the first systematic answer to "how much synthetic data" — and the answer differs from Phi-4's actual practice in informative ways.
+
+### The Phi trajectory
+
+**Phi-1 (Gunasekar et al. 2023, arXiv:2306.11644, "Textbooks Are All You Need").** 1.3B parameters; 7B tokens total: 6B "textbook-quality" filtered web plus **1B synthetic textbook/exercise tokens generated with GPT-3.5**. HumanEval pass@1 = 50.6%. The first demonstration that a small model trained on a small carefully synthesised corpus could match much larger code models.
+
+**Phi-1.5 (Li et al. 2023, arXiv:2309.05463).** 1.3B parameters trained primarily on synthetic textbook-quality data — *no web data at all*. The most aggressive synthetic-only experiment that has been published.
+
+**Phi-2 (Microsoft model card, late 2023).** 2.7B parameters trained on 1.4T tokens over 5.6 epochs of a 250B-token curated dataset combining GPT-3.5-generated synthetic, filtered Falcon RefinedWeb, and SlimPajama — with GPT-4 used as the quality filter. The shift back to *some* organic web data, after Phi-1.5's pure-synthetic run, reflects an internal recognition that pure synthetic underperformed on diverse knowledge tasks.
+
+**Phi-3 (Abdin et al. 2024, arXiv:2404.14219).** 3.8B–14B parameters, 3.3T–4.8T tokens. The mix is described as "a scaled-up version of phi-2's, composed of heavily filtered publicly available web data and synthetic data." Specific synthetic-share percentages are not disclosed.
+
+**Phi-4 (Abdin et al. 2024, arXiv:2412.08905).** 14B parameters. The Phi-4 tech report is the most explicit synthetic-mix disclosure to date.
+
+<ComparisonTable
+  caption="Phi-4 training-token shares (Abdin et al. 2024, Table 5)."
+  columns={["Component", "Share of training tokens", "Unique tokens", "Epochs"]}
+  rows={[
+    ["Web", "15%", "1.3T", "1.2"],
+    ["Web rewrites", "15%", "290B", "5.2"],
+    ["Synthetic", "40%", "290B", "13.8"],
+    ["Code", "20%", "820B", "2.4"],
+    ["Acquired sources", "10%", "580B", "1.7"],
+  ]}
+/>
+
+Synthetic is the single largest category. The 40% figure should be read with the qualification that "web rewrites" — 15% — is *also* synthetic in the strict sense (rephrased web), so the broader synthetic share is closer to 55%. Phi-4 is the strongest published evidence that a frontier-quality 14B model can derive a *plurality* of its pretraining signal from generated text.
+
+### Synthetic at non-Phi labs
+
+**Kimi K2 (Moonshot AI 2025, arXiv:2507.20534).** 15.5T tokens across "Web Text, Code, Mathematics, Knowledge." Specific percentages are not disclosed. Notable for explicit use of *rephrasing* — a synthetic technique — on the Knowledge and Mathematics buckets: "style- and perspective-diverse prompting" with chunk-wise autoregressive generation and fidelity verification produces "faithful rephrasings of the original texts in varied styles." Math documents are rewritten in a "learning-note" style and translated across languages to multiply diversity. The motivating intuition: more epochs over the same tokens overfit; rephrasing multiplies the effective high-quality token budget without raw repetition.
+
+**Qwen3 (Qwen Team 2025).** Uses Qwen2.5-Math and Qwen2.5-Coder as domain-specific generators to synthesise trillions of text tokens in textbook, Q&A, instruction, and code-snippet formats across dozens of domains. Stage 2 of the three-stage curriculum explicitly upsamples this synthetic plus STEM material.
+
+**Llama 3.** Reports of synthetic-data use are explicit for the post-training pipeline, but the pretraining mix (50/25/17/8 in the 2024-07 paper) does not break out synthetic and organic separately. Whatever synthetic share the Llama-3 pretraining used is folded into the per-domain percentages and is not separately quantified.
+
+### Scaling laws for synthetic — the Kang et al. result
+
+**Demystifying Synthetic Data in LLM Pre-training (Kang et al., EMNLP 2025, arXiv:2510.01631).** Empirical investigation across **more than 1,000 LLMs and more than 100,000 GPU hours** comparing natural web, rephrased synthetic, generated textbooks, and mixtures. Four findings anchor the chapter's recommendation.
+
+First, the *optimal synthetic share converges to roughly 30%* for rephrased synthetic data, broadly independent of model size and data budget. Phi-4's 40% synthetic (or ~55% when web rewrites are counted) is therefore an outlier, and Phi-4 is also a small-model, smaller-budget regime where outliers in this direction are expected.
+
+Second, *5–10× speedup* to reach a target validation loss when training on one-third rephrased synthetic plus two-thirds web, versus all-web, at large data budgets. The wall-clock effect at production scale is substantial.
+
+Third, *generator size does not need to scale with target model size*. An **~8B-parameter generator is sufficient**; larger generators do not produce better pretraining data on a per-token basis. The result decouples the cost of synthetic-data generation from the size of the model that will consume it.
+
+Fourth, *model-collapse risk is data-type-dependent*. Rephrased synthetic (Kimi-K2-style) shows no degradation at foreseeable scales. Textbook-style purely-generated synthetic (Phi-style) shows patterns consistent with model-collapse predictions — performance saturates or declines if pushed beyond a certain share. The implication: synthetic is not a single category, and rephrased synthetic is the safer bet.
+
+The reading the chapter recommends: treat ~30% rephrased synthetic as the quantitative anchor, treat Phi-4's higher share as a deliberate small-model bet (small models gain more from densified text because their compute budget is short), and hedge on "synthetic" by always specifying which kind — rephrased web, generated textbook, generated Q&A — is meant.
+
+### Contamination
+
+Synthetic data at pretraining introduces two contamination paths. *Direct contamination*: if the generator was trained on, or has seen, evaluation data, that data can re-emerge in synthetic outputs. The Phi-4 report and the Kang et al. study both describe screening pipelines that filter synthetic outputs against known benchmark sets, but no published frontier model can fully exclude leakage for closed-source generators (GPT-3.5/4-generated data has unknown training-set provenance). *Distributional collapse and mode-narrowing*: a generator with biased outputs — factual errors, stylistic regularities, refusal patterns — propagates those biases into the student model. The Kang et al. textbook-vs-rephrased finding is the empirical manifestation: pure textbook generation narrows the distribution; rephrasing preserves more of it.
+
+The post-training pipeline already relies heavily on synthetic. The question for pretraining is whether to *front-load* synthetic into the base model — as Phi-4 does aggressively, Kimi-K2 does selectively, and Qwen3 does explicitly — or to keep it post-hoc. The 2025 trend is toward front-loading, and the Front-Loading Reasoning paper (Akter et al. 2025) is the cleanest published argument that pretraining-side synthetic *unlocks* post-training gains that cannot be recovered by SFT alone.
+
+---
+
+## Worked example: four-domain mixing law {#worked-example}
+
+This section walks through a toy fit of the Data Mixing Law on four domains. The numbers are illustrative — chosen to make the worked example pedagogically clean, not from a real run. Treat the procedure as the lesson; treat the numbers as placeholders.
+
+**Setup.** Four domains: web (1), code (2), math (3), books (4). Pilot grid: twelve small-model runs at $N = 100$M and $D = 1$B tokens, with $\boldsymbol{\alpha}$ drawn from a Dirichlet distribution over the four-simplex. Validation: per-domain held-out cross-entropy on the same four domains, aggregated with uniform weights $v_i = 0.25$.
+
+A representative slice of the pilot data:
+
+<ComparisonTable
+  caption="Illustrative pilot-run data for a four-domain mixing-law fit. Numbers are pedagogical placeholders, not from a real run."
+  columns={["Run", "α_web", "α_code", "α_math", "α_books", "L (mean validation, nats)"]}
+  rows={[
+    ["1", "0.70", "0.10", "0.05", "0.15", "2.40"],
+    ["2", "0.50", "0.20", "0.15", "0.15", "2.31"],
+    ["3", "0.40", "0.30", "0.20", "0.10", "2.28"],
+    ["4", "0.30", "0.40", "0.20", "0.10", "2.32"],
+    ["5", "0.60", "0.10", "0.20", "0.10", "2.34"],
+    ["6", "0.45", "0.25", "0.15", "0.15", "2.29"],
+    ["7", "0.50", "0.15", "0.25", "0.10", "2.27"],
+  ]}
+/>
+
+The reader sees what the fit needs to capture. Web-dominant mixes (Run 1, Run 5) have higher validation loss; balanced mixes with substantial code and math (Run 3, Run 6, Run 7) have lower loss; over-balanced toward code (Run 4) starts to lose ground because code displaces math and web. The surface is non-monotonic in each $\alpha_j$, which is the structural reason an additive form does not fit and the exponential-of-linear form does.
+
+**Fit.** Apply
+
+$$
+L_i(\boldsymbol{\alpha}) = c_i + k_i \exp\!\left( \sum_{j=1}^{4} t_{ij}\,\alpha_j \right)
+$$
+
+separately for each of $i \in \{\text{web, code, math, books}\}$ by non-linear least squares. The aggregate validation loss is $L(\boldsymbol{\alpha}) = \sum_i v_i L_i(\boldsymbol{\alpha})$. With four domains and the off-diagonal interactions, the fit has $4 \times 4 + 4 + 4 = 24$ free parameters; twelve pilot runs is *just* enough with regularisation, and a realistic pilot would use 20–40 runs.
+
+**Optimisation.** Minimise $L(\boldsymbol{\alpha})$ over the simplex $\{\boldsymbol{\alpha} : \alpha_i \geq 0, \sum \alpha_i = 1\}$ with a projected-gradient or interior-point solver. For the illustrative numbers above, the resulting optimum lands near $\boldsymbol{\alpha}^* \approx (0.45, 0.25, 0.20, 0.10)$ — close to Run 6's mix, with slightly more math at the expense of books. The reduction in aggregate loss relative to the *uniform* mix $(0.25, 0.25, 0.25, 0.25)$ is roughly 0.04 nats; relative to a *data-proportional* mix drawn from raw token counts (likely web-dominant at, say, 0.80/0.05/0.05/0.10), the reduction is closer to 0.13 nats. The directional finding generalises across realistic fits: the data-proportional mix is rarely close to optimal because it overspends on the most-abundant domain.
+
+**Extrapolation.** Apply the nested-laws procedure to predict the target-scale loss at $\boldsymbol{\alpha}^*$. Fit a data-size scaling law on small-$D$ runs at $\boldsymbol{\alpha}^*$ to get $L(D \mid \boldsymbol{\alpha}^*, N = 100\text{M})$. Fit a model-size scaling law at $\boldsymbol{\alpha}^*$ on small-$N$ runs to get $L(N \mid \boldsymbol{\alpha}^*, D \text{ fixed})$. Compose to predict $L$ at the target $(N, D)$ — say, $N = 7$B and $D = 100$B. The headline empirical claim from Ye et al. — that the predicted optimum matches a baseline trained for ~48% more steps — sets the bar for what "a good fit" should produce. Predicted optima that promise less than 20% compute-equivalent improvement are usually inside the fit's noise; predicted optima that promise more than 100% are usually overfitting the pilot grid.
+
+**The compute economics.** The pilot grid costs $12 \times (\text{cost of one 100M / 1B-token run}) \approx 12 \times 6 \cdot 10^8 \cdot 10^9 = 7.2 \cdot 10^{18}$ FLOPs, plus a similarly-sized data-size and model-size sweep. That is a small fraction — typically under 1% — of the cost of the target-scale run for a 7B-class model trained on 1T tokens. The Ye et al., BiMix, and CAMEL papers all hit this regime: pilot-grid cost is in the small single-digit percentages of target-scale cost, and the predicted improvement is in the tens of percent. This is the economic reason mix optimisation is a standard part of the frontier-pretraining playbook in 2026.
+
+The reader who wants to reproduce a real fit should consult the RegMix reference implementation at `https://github.com/sail-sg/regmix` (LightGBM regression, 512 × 1M-parameter pilots) or the Data Mixing Laws reference experiments at the Ye et al. project page. The numbers in this section's table are designed to be pedagogically clean, not faithful to any single published fit.
+
+---
+
+## Frontier-lab landscape, May 2026 {#frontier-practice}
+
+Disclosure varies dramatically across labs. The table below quotes verbatim percentages where they are disclosed, names domains where only domains are disclosed, and marks the cell *not publicly disclosed* otherwise. No closed-lab mix is estimated.
+
+<ComparisonTable
+  caption="Frontier pretraining mixes, May 2026. Verbatim disclosures where possible; closed-lab rows marked. Percentages are not directly comparable across labs because 'domain' labels are not standardised."
+  columns={["Model", "Year", "Total tokens", "Disclosed mix", "Curriculum", "Source"]}
+  rows={[
+    ["GPT-3", "2020", "~300B", "CC 60% / WebText2 22% / Books1 8% / Books2 8% / Wiki 3% (sampling weights)", "Single-stage; weighted by editor", "https://arxiv.org/abs/2005.14165"],
+    ["PaLM", "2022", "780B", "Webpages, books, Wikipedia, news, source code, social media; per-source % not disclosed", "Single-stage; one epoch", "https://arxiv.org/abs/2204.02311"],
+    ["LLaMA 1", "2023", "1.4T", "CC 67% / C4 15% / GitHub 4.5% / Wiki 4.5% / Books 4.5% / arXiv 2.5% / StackExchange 2%", "Single-stage", "https://arxiv.org/abs/2302.13971"],
+    ["Llama 2", "2023", "2T", "89.7% English / 8.4% unknown-or-code / ~2% other-27-languages; domain mix not broken out", "Single-stage", "https://arxiv.org/abs/2307.09288"],
+    ["Llama 3 / 3.1 (2024-07 paper)", "2024", "15.6T", "50% general knowledge / 25% math+reasoning / 17% code / 8% multilingual; +40M-token annealing", "Body + 40M-token annealing tail", "https://arxiv.org/abs/2407.21783"],
+    ["Llama 4 (Scout / Maverick)", "2025", "~40T (announcement)", "not publicly disclosed in detail", "not publicly disclosed", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["DeepSeek-V3", "2024", "14.8T", "Domains named (web / code / math / multilingual); enhanced math+code ratio vs V2; % not disclosed", "Qualitative two-phase", "https://arxiv.org/abs/2412.19437"],
+    ["Qwen3", "2025", "36T", "Stage 1 30T+ broad / Stage 2 ~5T high-quality (STEM+code+reasoning+synthetic upsample) / Stage 3 long-context; 119 languages", "Three-stage explicit", "https://arxiv.org/abs/2505.09388"],
+    ["Phi-3", "2024", "3.3T–4.8T", "Heavily filtered web + synthetic; per-phase % not disclosed", "Two-phase", "https://arxiv.org/abs/2404.14219"],
+    ["Phi-4", "2024", "~9.8T exposure", "Web 15% / Web rewrites 15% / Synthetic 40% / Code 20% / Acquired 10% (training-token share)", "Curriculum with synthetic-tilt", "https://arxiv.org/abs/2412.08905"],
+    ["Kimi K2", "2025", "15.5T", "Web Text / Code / Mathematics / Knowledge; rephrasing on Knowledge and Math; % not disclosed", "Rephrasing-heavy", "https://arxiv.org/abs/2507.20534"],
+    ["Mistral 7B / Mixtral", "2023", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "https://arxiv.org/abs/2310.06825"],
+    ["Gemma 2", "2024", "13T (27B) / 8T (9B) / 2T (2B)", "Primarily English web + code + math; per-domain % not disclosed", "not publicly disclosed", "https://arxiv.org/abs/2408.00118"],
+    ["Gemma 3", "2025", "not publicly disclosed in detail", "not publicly disclosed", "not publicly disclosed", "https://arxiv.org/abs/2408.00118"],
+    ["OLMo 2", "2024", "5T (13B)", "Stage 1 3.9T OLMo-Mix-1124 (DCLM+Dolma+Starcoder+ProofPileII), >90% of budget; Stage 2 Dolmino-Mix-1124 50B/100B/300B (50% filtered web + 50% domain high-quality)", "Two-stage open recipe", "https://arxiv.org/abs/2501.00656"],
+    ["SmolLM3 (3B)", "2025", "11.2T", "Stage 1 (0→8T): web 85% / code 12% / math 3%. Stage 2 (8→10T): web 75% / code 15% / math 10%. Stage 3 decay (10→11.1T): web 63% / code 24% / math 13% (+ OpenMathReasoning)", "Three-stage explicit; cleanest 2025 open small-model disclosure", "https://huggingface.co/blog/smollm3"],
+    ["GPT-4 / GPT-4o / GPT-5", "2023–2025", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "https://openai.com/research"],
+    ["Claude family", "2023–2026", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "https://www.anthropic.com/research"],
+    ["Gemini family", "2023–2025", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "https://deepmind.google/technologies/gemini/"],
+  ]}
+/>
+
+Two cross-cutting observations are worth stating explicitly in prose.
+
+First, **disclosure is bimodal**, not graded. Llama 3, Phi-4, and OLMo 2 disclose quotable percentages; DeepSeek-V3, Kimi K2, and Qwen3 (at stage level) disclose domain lists and total tokens; Gemma 2 discloses qualitative composition only; Mistral and the three closed labs disclose nothing of substance. There is no middle ground. The reader who wants to compare frontier mixes is comparing artefacts from the high-disclosure column only.
+
+Second, **mix-design philosophy varies, but not by as much as the disclosure noise suggests**. Llama 3's 50/25/17/8 with a tiny annealing tail; Phi-4's 40% synthetic plurality; Qwen3's three-stage explicit curriculum; OLMo 2's 90%-then-10% Dolmino-Mix annealing; Kimi K2's rephrasing-heavy organic mix. All five represent the *same* directional pattern at different intensities: web-heavy body, high-quality-tilted tail, code and math overrepresented relative to raw web availability, multilingual upsampled relative to raw count. The differences are quantitative — how much synthetic, how long the annealing window, how steep the high-quality tilt — not qualitative. The chapter resists the temptation to declare a winner. No apples-to-apples comparison at frontier scale has been published, and the headline-benchmark differences between Llama-3.1-405B, DeepSeek-V3, and Qwen3-235B-A22B are small enough that mix choice is one of many variables that could explain them.
+
+The Llama-3 50/25/17/8 figures specifically deserve a caveat: they are from the 2024-07 Llama 3 Herd paper and were not updated in the Llama-3.1 (2024-11) or Llama-4 (2025) releases. Treat 50/25/17/8 as the Llama-3-era anchor for what a disclosed frontier mix looks like, not as a current Meta production figure. The Llama-4 announcement quotes a 40T-token training budget across 200 languages without a per-domain breakdown.
+
+---
+
+## Chapter summary {#summary}
+
+- **Mix matters quantitatively.** Aryabumi et al. (Cohere 2024) measured +8.2% NL reasoning, +4.2% world knowledge, +12× code from adding code data — *with positive transfer to non-code tasks*. Llama-3's annealing produced +24% GSM8K on 8B (negligible on 405B). Front-Loading Reasoning (Akter et al. 2025) gave +16% pretraining-stage improvement that unlocked an additional +4% SFT gain that no post-training data could replicate. Pretraining mix and post-training mix compound, not substitute.
+- **Static-mix optimisation has converged on a small family.** DoReMi (Xie et al. NeurIPS 2023) introduced Group-DRO mix updates; RegMix (Liu et al. ICLR 2025) reframed as regression and matched DoReMi at ~10% compute; Data Mixing Laws (Ye et al. ICLR 2025) fit the functional form $L_i(\boldsymbol{\alpha}) = c_i + k_i \exp(\sum_j t_{ij}\alpha_j)$ and predict optima at small cost; BiMix and CAMEL extend this to joint (mix, volume) and capacity-aware fits.
+- **Curriculum is the rule, not the exception.** Llama 3, Qwen3, OLMo 2, DeepSeek-V3, and Phi-4 all run a multi-stage trajectory with a high-quality tail. Llama 3's annealing is **40 million tokens** — *million, not billion* — and produced +24% GSM8K on the 8B model. The annealing literature's mechanics live in [annealing and stability](/textbook/01h-annealing-and-stability).
+- **Multilingual sampling uses $p_l \propto n_l^{\tau}$ with $\tau \in [0.3, 0.5]$** as the post-XLM frontier default. Multilingual NMT scaling (Fernandes et al. 2023) and decoder-only multilingual scaling (He et al. 2024) both find that mix shifts the *prefactor* of the loss curve, not the exponent — so optimal sampling ratios from small-model pilots transfer to large.
+- **Synthetic data has a quantitative anchor.** Kang et al. (EMNLP 2025) measured ~30% optimal share for rephrased synthetic, 5–10× speedup at fixed loss, ~8B-parameter generator sufficient, and *model collapse only for textbook-style purely generated content*. Phi-4's 40% (or ~55% with rewrites) is a deliberate small-model bet that exceeds the Kang et al. optimum.
+- **Granularity matters and is layered.** Domain-level mix optimisation is always step one. Per-document quality scoring — perplexity-pruning beats more elaborate methods (Marion et al. 2023) — adds within-domain selection. Per-document influence-based selection (LESS family) is research-grade for pretraining as of May 2026.
+- **Disclosure is highly uneven.** Llama 3 (50/25/17/8 from the 2024-07 paper), Phi-4 (15/15/40/20/10 from the Table 5 disclosure), and OLMo 2 (3.9T stage-1 plus 843B Dolmino-Mix) are quotable. DeepSeek-V3, Kimi K2, Qwen3 (at stage level) are partial. Closed labs (OpenAI, Anthropic, Google Gemini) disclose nothing of substance, and this chapter does not estimate.
+
+---
+
+<Sources items={[
+  {
+    authors: "Xie, S. M., Pham, H., Dong, X., Du, N., Liu, H., Lu, Y., Liang, P., Le, Q. V., Ma, T. & Yu, A. W.",
+    year: 2023,
+    title: "DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining",
+    venue: "NeurIPS 2023",
+    url: "https://arxiv.org/abs/2305.10429",
+    note: "S1. Proxy + reference + Group DRO; 280M proxy → 8B target; +6.5 pts few-shot; 2.6× step efficiency."
+  },
+  {
+    authors: "Liu, Q., Zheng, X., Muennighoff, N., Zeng, G., Dou, L., Pang, T., Jiang, J. & Lin, M.",
+    year: 2024,
+    title: "RegMix: Data Mixture as Regression for Language Model Pre-training",
+    venue: "ICLR 2025",
+    url: "https://arxiv.org/abs/2407.01492",
+    note: "S2. 512 × 1M-parameter pilots; LightGBM regression; matches DoReMi at ~10% cost; beats 63 candidates."
+  },
+  {
+    authors: "Ye, J., Liu, P., Sun, T., Zhou, Y., Zhan, J. & Qiu, X.",
+    year: 2024,
+    title: "Data Mixing Laws: Optimizing Data Mixtures by Predicting Language Modeling Performance",
+    venue: "ICLR 2025",
+    url: "https://arxiv.org/abs/2403.16952",
+    note: "S3. Functional form L_i = c_i + k_i exp(Σ_j t_ij α_j); nested-laws extrapolation; 1B/100B RedPajama validation."
+  },
+  {
+    authors: "Ge, C. et al.",
+    year: 2024,
+    title: "BiMix: A Bivariate Data Mixing Law for Language Model Pretraining",
+    venue: "arXiv:2405.14908",
+    url: "https://arxiv.org/abs/2405.14908",
+    note: "S4. Multiplicative joint (α, D) law; mean relative loss error &lt;0.2%; R² > 0.97."
+  },
+  {
+    authors: "Li, J., Gu, X. & Zhang, J.",
+    year: 2026,
+    title: "Capacity-Aware Mixture Law Enables Efficient LLM Data Optimization (CAMEL)",
+    venue: "arXiv:2603.08022",
+    url: "https://arxiv.org/abs/2603.08022",
+    note: "S5. Capacity-aware extension; 50% mix-optimisation cost reduction; +3% benchmark; validated to 55B-A1.2B MoE. Very recent — verify before relying on."
+  },
+  {
+    authors: "Held, W. et al.",
+    year: 2025,
+    title: "Optimizing Pretraining Data Mixtures with LLM-Estimated Utility",
+    venue: "arXiv:2501.11747",
+    url: "https://arxiv.org/abs/2501.11747",
+    note: "S6. UtiliMax (10.6× speedup over manual baselines); MEDU (~200× compute reduction); Meta affiliation."
+  },
+  {
+    authors: "Aryabumi, V., Su, Y., Zheng, R., Mokhtari, A. M., Ahmadian, A., Üstün, A. & Hooker, S.",
+    year: 2024,
+    title: "To Code, or Not To Code? Exploring Impact of Code in Pre-training",
+    venue: "arXiv:2408.10914 (Cohere)",
+    url: "https://arxiv.org/abs/2408.10914",
+    note: "S7. 470M–2.8B ablations; +8.2% NL reasoning; +4.2% world knowledge; +6.6% generative win-rate; +12× code."
+  },
+  {
+    authors: "Akter, S. N., Prabhumoye, S. et al.",
+    year: 2025,
+    title: "Front-Loading Reasoning: The Synergy between Pretraining and Post-Training Data",
+    venue: "arXiv:2510.03264 (NVIDIA + CMU)",
+    url: "https://arxiv.org/abs/2510.03264",
+    note: "S8. Pretraining reasoning data +16% avg; pretraining-quality reasoning unlocks +4% additional SFT gain that SFT-alone cannot reach."
+  },
+  {
+    authors: "Fernandes, P., Ghorbani, B., Garcia, X., Freitag, M. & Firat, O.",
+    year: 2023,
+    title: "Scaling Laws for Multilingual Neural Machine Translation",
+    venue: "arXiv:2302.09650",
+    url: "https://arxiv.org/abs/2302.09650",
+    note: "S9. Mix changes multiplicative factor not exponent; into-English has larger effective parameter count."
+  },
+  {
+    authors: "He, Y. et al.",
+    year: 2024,
+    title: "Scaling Laws for Multilingual Language Models",
+    venue: "arXiv:2410.12883",
+    url: "https://arxiv.org/abs/2410.12883",
+    note: "S10. Decoder-only multilingual scaling; per-family loss depends only on family sampling ratio; 23 languages, 5 families; 85M → 1.2B transfer."
+  },
+  {
+    authors: "Tirumala, K., Simig, D., Aghajanyan, A. & Morcos, A. S.",
+    year: 2023,
+    title: "D4: Improving LLM Pretraining via Document De-Duplication and Diversification",
+    venue: "NeurIPS 2023 D&B",
+    url: "https://arxiv.org/abs/2308.12284",
+    note: "S11. OPT-125M embedding + K-means + SemDeDup; ~20% efficiency, +2% on 16 tasks at 6.7B."
+  },
+  {
+    authors: "Marion, M. et al.",
+    year: 2023,
+    title: "When Less is More: Investigating Data Pruning for Pretraining LLMs at Scale",
+    venue: "arXiv:2309.04564 (Cohere)",
+    url: "https://arxiv.org/abs/2309.04564",
+    note: "S12. Perplexity-based pruning beats EL2N and memorisation; 30% of corpus beats full-data baseline."
+  },
+  {
+    authors: "Xia, M., Malladi, S., Gururangan, S., Arora, S. & Chen, D.",
+    year: 2024,
+    title: "LESS: Selecting Influential Data for Targeted Instruction Tuning",
+    venue: "ICML 2024",
+    url: "https://arxiv.org/abs/2402.04333",
+    note: "S13. Adam-aware influence with low-rank gradient datastore; 5% of data often beats full-data."
+  },
+  {
+    authors: "Gunasekar, S. et al.",
+    year: 2023,
+    title: "Textbooks Are All You Need (Phi-1)",
+    venue: "arXiv:2306.11644",
+    url: "https://arxiv.org/abs/2306.11644",
+    note: "S14. 1.3B parameters; 6B filtered web + 1B GPT-3.5-generated synthetic textbook tokens; HumanEval 50.6%."
+  },
+  {
+    authors: "Li, Y. et al.",
+    year: 2023,
+    title: "Textbooks Are All You Need II: phi-1.5 technical report",
+    venue: "arXiv:2309.05463",
+    url: "https://arxiv.org/abs/2309.05463",
+    note: "S15. Phi-1.5; 1.3B parameters; synthetic-only pretraining."
+  },
+  {
+    authors: "Microsoft",
+    year: 2023,
+    title: "Phi-2: The surprising power of small language models",
+    venue: "HuggingFace model card",
+    url: "https://huggingface.co/microsoft/phi-2",
+    note: "S16. 2.7B; 1.4T tokens / 5.6 epochs of 250B curated dataset; GPT-3.5 synthetic + filtered Falcon RefinedWeb + SlimPajama; GPT-4 quality filter."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-3 Technical Report",
+    venue: "arXiv:2404.14219",
+    url: "https://arxiv.org/abs/2404.14219",
+    note: "S17. 3.8B–14B; 3.3T–4.8T tokens; two-phase pretraining; synthetic share not quoted explicitly."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "S18. 14B; Table 5 mix: 15% web / 15% web-rewrites / 40% synthetic / 20% code / 10% acquired."
+  },
+  {
+    authors: "Kang, F. et al.",
+    year: 2025,
+    title: "Demystifying Synthetic Data in LLM Pre-training: A Systematic Study of Scaling Laws, Benefits, and Pitfalls",
+    venue: "EMNLP 2025 (arXiv:2510.01631)",
+    url: "https://arxiv.org/abs/2510.01631",
+    note: "S19. >1000 models / >100k GPU hours; ~30% rephrased synthetic optimum; 5–10× speedup; ~8B generator sufficient; collapse only for textbook-style purely generated."
+  },
+  {
+    authors: "Grattafiori, A. et al.",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783 (Meta)",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "S20. Mix 50/25/17/8; mini scaling-law experiments for mix; 40 million-token annealing phase; +24% GSM8K / +6.4% MATH for 8B, negligible for 405B."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "S21. 14.8T tokens; enhanced math+code ratio relative to V2; multilingual expanded; specific percentages not disclosed."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "S22. 36T tokens / 119 languages; three-stage curriculum (30T general → ~5T high-quality → long-context); Qwen2.5-Math + Qwen2.5-Coder synthetic generators."
+  },
+  {
+    authors: "Moonshot AI",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence Technical Report",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "S23. 15.5T tokens; Web Text / Code / Mathematics / Knowledge; rephrasing on Knowledge + Math with learning-note style and cross-lingual translation."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "S24. 2T tokens; 89.7% English; 8.4% unknown-or-code; 27 other languages."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "LLaMA: Open and Efficient Foundation Language Models",
+    venue: "arXiv:2302.13971",
+    url: "https://arxiv.org/abs/2302.13971",
+    note: "S25. 1.4T tokens; CC 67% / C4 15% / GitHub 4.5% / Wiki 4.5% / Books 4.5% / arXiv 2.5% / StackExchange 2%."
+  },
+  {
+    authors: "Brown, T. B. et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners (GPT-3)",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "S26. GPT-3; weighted sampling table for 5 sources; WebText2 upsampled ~5.5× over raw share; Books2 down-sampled."
+  },
+  {
+    authors: "Chowdhery, A. et al.",
+    year: 2022,
+    title: "PaLM: Scaling Language Modeling with Pathways",
+    venue: "arXiv:2204.02311 (Google)",
+    url: "https://arxiv.org/abs/2204.02311",
+    note: "S27. 780B tokens; one epoch; mix chosen to avoid sub-component repetition; per-source % not disclosed in detail."
+  },
+  {
+    authors: "OLMo Team (AI2)",
+    year: 2024,
+    title: "2 OLMo 2 Furious",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "S28. Open recipe; Stage 1 3.9T OLMo-Mix-1124 (DCLM + Dolma + Starcoder + Proof Pile II), >90% of budget; Stage 2 Dolmino-Mix-1124 50B/100B/300B (50% filtered web + 50% domain high-quality)."
+  },
+  {
+    authors: "Riviere, M. et al.",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv:2408.00118 (Google DeepMind)",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "S29. 13T / 8T / 2T tokens (27B / 9B / 2B); primarily English web + code + math; per-domain % not disclosed."
+  },
+  {
+    authors: "Jiang, A. Q. et al.",
+    year: 2023,
+    title: "Mistral 7B",
+    venue: "arXiv:2310.06825 (Mistral AI)",
+    url: "https://arxiv.org/abs/2310.06825",
+    note: "S30. Pretraining data composition not disclosed."
+  },
+  {
+    authors: "Conneau, A. & Lample, G.",
+    year: 2019,
+    title: "Cross-lingual Language Model Pretraining (XLM)",
+    venue: "NeurIPS 2019",
+    url: "https://arxiv.org/abs/1901.07291",
+    note: "S31. Canonical reference for p_l ∝ n_l^τ sampling-temperature formulation; τ ∈ [0.3, 0.7] practice."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 three-stage curriculum (Stage-1 85/12/3, Stage-2 75/15/10, Stage-3 decay 63/24/13)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "S32. Cleanest 2025 open three-step curriculum with explicit per-stage mix percentages; math share rises 3% → 10% → 13% across stages."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 reasoning mid-training (35B tokens, OpenThoughts3 + Llama-Nemotron R1 traces)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "S33. Concrete implementation of Akter et al.'s front-loaded-reasoning finding; 4 epochs over 35B tokens to unlock +SFT-gain ceiling."
+  }
+]} />

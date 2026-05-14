@@ -1,0 +1,158 @@
+---
+slug: 02-distributed
+title: Distributed training — orientation
+description: How to read this module, the dependency chain across chapters, the notation conventions, and what a frontier 4D-parallelism recipe looks like in 2026.
+order: 19
+chapter: 18
+module: 2
+module_title: Distributed training
+reading_minutes: 22
+depends_on: [01-pretraining]
+provides: []
+last_reviewed: 2026-05-14
+---
+
+## About this module {#about}
+
+This module is a self-contained textbook on the engineering of multi-thousand-GPU language-model training. It covers the eight clusters of decisions a frontier-lab systems team has to make once a model architecture, scaling-law target, and data recipe have been chosen: how to replicate the model across data-parallel ranks, how to shard a single layer across tensor-parallel ranks, how to stage layers along a pipeline, how to route MoE tokens across expert ranks, how to shard parameters and optimiser states with FSDP or ZeRO, how the NCCL collectives compose into the bandwidth bill of each step, how mixed-precision and gradient checkpointing trade memory for compute, and how all of these axes compose into the 3D / 4D / 5D parallelism recipes that real frontier runs use.
+
+After finishing the eight chapters, a reader should be able to read the *infrastructure* or *parallelism* section of any 2024–2026 tech report — Llama-3.1 405B, Llama-4, DeepSeek-V3, OLMo-2, Kimi-K2, Qwen-3, Phi-4, GPT-OSS — and reconstruct every engineering decision: which axis shards what, which collectives carry the per-step bandwidth bill, what the activation memory looks like under each configuration, and where the bubble-time, AlltoAll, and AllReduce traffic dominate.
+
+The module does **not** teach the architecture itself ([Module 0 — Prerequisites](/textbook/00-prerequisites)) or the pretraining recipe ([Module 1 — Pretraining at scale](/textbook/01-pretraining)). It treats them as fixed inputs. It also does not cover inference-time parallelism (KV-cache parallelism, paged attention, speculative decoding — future Inference & Serving module), hardware physics (NVLink electrical specs, fab variation, NIC firmware — black-boxed at the NCCL semantic level), or compiler-level engineering (XLA / Triton / TorchInductor kernel emission — also black-boxed).
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier-model practice as of May 14, 2026. The collective-bandwidth formulas, ZeRO memory math, GPipe bubble formula, and Korthikanti activation-memory equations are durable. The frontier-configuration tables — Llama-3.1's $(\text{TP}=8, \text{PP}=16, \text{CP}=16, \text{DP}=4)$, DeepSeek-V3's $(\text{TP}=1, \text{PP}=16, \text{EP}=64)$, PyTorch's FSDP-2 vs FSDP-1 transition status — age fastest. Recheck the comparison tables every 6–12 months against the next round of public reports.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+Eight chapters, each addressing one cluster of distributed-engineering decisions. The compute, memory, and communication arguments build cumulatively; the [reading-order recommendations](#reading-order) section gives shortcuts for readers who only need a subset.
+
+**[Chapter 19 — Data parallelism (DP, DDP) and the synchronous gradient](/textbook/02a-data-parallel)**
+The simplest parallelism strategy — replicate the model, shard the batch, AllReduce gradients. PyTorch DDP's gradient-bucketing implementation with the canonical 25 MiB bucket size. Gradient accumulation as a virtual batch-size multiplier, with the AdamW-momentum subtlety from Chapter 14. Weak vs strong scaling and why frontier labs care about the weak-scaling regime. The Patarasuk–Yuan ring AllReduce bound $2(W-1)/W \cdot |g|$, the NCCL double-binary-tree algorithm and its 180× speedup at 24K GPUs, and a worked example for a 7B model on 64 H100s with $|g| = 14$ GB BF16, 27.6 GB per-rank traffic, and a ~311 ms hierarchical AllReduce.
+
+**[Chapter 20 — Tensor parallelism](/textbook/02b-tensor-parallel)**
+Megatron-LM's intra-layer matrix split. Column-then-row MLP partition (no synchronisation between the two GEMMs because the GeLU/SiLU is elementwise). Per-head Q/K/V column split with the row W_O split — and the GQA divisibility constraint $t \mid H_{\text{kv}}$. The $f$ and $g$ operator pair that contributes four AllReduces per transformer block. Korthikanti et al.'s sequence-parallel optimisation that replaces those AllReduces with AllGather + ReduceScatter pairs and reduces activation memory from $sbh(10 + 24/t + 5as/(ht))$ to $sbh(34 + 5as/h)/t$. Context parallelism for very long sequences. The Llama-3.1 405B production config — TP=8, PP=16, CP=16, DP=4 on 16 384 H100s — analysed in full.
+
+**[Chapter 21 — Pipeline parallelism](/textbook/02c-pipeline-parallel)**
+GPipe and the synchronous all-forward-then-all-backward schedule with bubble time $b = (p-1)/(m + p - 1)$, giving a ~30% bubble at $p = 8, m = 16$. PipeDream's 1F1B steady state, which holds $p \cdot a_{\text{stage}}$ of activations instead of GPipe's $m \cdot a_{\text{stage}}$. Megatron's interleaved 1F1B, which shrinks the bubble by a factor of $v$ at the cost of $v\times$ more communication. DeepSeek-V3's DualPipe, a bidirectional pipeline with four-way chunk decomposition (attention / dispatch / MLP / combine) that hides cross-node expert AlltoAll inside the pipeline bubble. Zero-bubble pipeline variants (ZB-H1, ZB-H2, ZB-2p) achieving under 1% bubble at ~2× the memory.
+
+**[Chapter 22 — Expert parallelism (EP)](/textbook/02d-expert-parallel)**
+The MoE-specific axis: route tokens across ranks that hold disjoint expert subsets. The dispatch–compute–combine cycle and its two AlltoAll calls. Per-rank traffic $k \cdot T \cdot d \cdot s \cdot (D-1)/D$ for both directions, with the worked example showing 411 MB dispatch at EP=8 and 463 MB at EP=64 for a DeepSeek-V3-shaped MoE block. Node-limited routing, which caps tokens to $M = 4$ of 8 nodes and halves cross-node IB traffic. The EP+TP composition with Megatron-Core's MoE Parallel Folding. AlltoAll vs AllReduce bandwidth budgets at the same world size.
+
+**[Chapter 23 — FSDP and ZeRO](/textbook/02e-fsdp-and-zero)**
+Sharding optimiser state (ZeRO-1, memory $4\Psi + 12\Psi/N_d$), gradients (ZeRO-2, $2\Psi + 14\Psi/N_d$), and parameters (ZeRO-3, $16\Psi/N_d$). PyTorch's FSDP-1 (stable since 1.12, May 2022) vs FSDP-2 (prototype 2.4 July 2024, beta 2.5 October 2024, FSDP-1 deprecation in 2.11). Why ZeRO-3 communication is $1.5\times$ DDP, not the often-quoted $4\times$. The AllGather-on-forward, AllGather-on-backward, ReduceScatter-on-grad sequence. Hybrid sharding (HSDP) that shards within a node and replicates across nodes. The Llama-3 FSDP variant honestly hedged between ZeRO-1-equivalent and ZeRO-2-equivalent readings.
+
+**[Chapter 24 — NCCL primitives and communication overlap](/textbook/02f-collectives-and-overlap)**
+The five collectives: AllReduce, AllGather, ReduceScatter, Broadcast, AlltoAll. The AllReduce ≡ ReduceScatter + AllGather identity. NCCL's per-rank busBw arithmetic $2(W-1)/W$ for AllReduce vs $(W-1)/W$ for AllGather and ReduceScatter. Ring vs tree algorithm selection by NCCL based on message size — ring dominates above ~256 KB on H100 NVSwitch domains. SHARP and in-network aggregation, which lift the H100 NVSwitch ceiling. The arithmetic-intensity floor below which a transformer layer becomes communication-bound. The 64-H100 7B-gradient worked example: 730 ms flat ring → 97 ms hierarchical → 50–55 ms with SHARP.
+
+**[Chapter 25 — Mixed precision and gradient checkpointing](/textbook/02g-mixed-precision-and-recompute)**
+BF16 vs FP16 (the dynamic-range argument) and why loss scaling is needed for FP16 but not BF16. Micikevicius et al.'s mixed-precision recipe — FP32 master weights, FP16/BF16 forward, FP16/BF16 gradients, FP32 AdamW state — and how Llama-3 augments it with FP32 gradient accumulation across micro-batches and FP32 ReduceScatter on the gradient. FP8 in a distributed context with per-tensor scaling traffic and MXFP8 / NVFP4 block scaling. Chen et al.'s sqrt-N gradient-checkpointing trade-off. Korthikanti's selective recompute — recompute the attention block only — for 70% activation-memory savings at 2.7% FLOPs overhead. The 2025 surprise that FP16 returns for RL post-training (Liu et al. 2025).
+
+**[Chapter 26 — 3D / 4D parallelism composition](/textbook/02h-3d-4d-composition)**
+The synthesis chapter. The canonical 3D (DP × TP × PP), 4D (+ CP for long context), 5D (+ EP for MoE) compositions and the rank-assignment story (which axis is innermost in the NCCL communicator hierarchy). The Pareto frontier across communication, activation memory, and compute efficiency. Heuristics for picking the configuration given (model size, cluster size, network topology). A worked example deriving $(\text{TP}=8, \text{PP}=4, \text{DP}=16)$ for a 70B model on 512 H100s, with the full memory chain from 140 GB raw params to 4.4 GB after sharding. Verbatim configuration tuples for Llama-3 bulk and long-context, DeepSeek-V3, Kimi-K2, OLMo-2, PaLM, GPT-3, BLOOM, and Megatron-Turing 530B.
+
+---
+
+## Prerequisites for this module {#prereqs}
+
+The hard prerequisite is [Module 1 — Pretraining at scale](/textbook/01-pretraining), and through it [Module 0 — Prerequisites](/textbook/00-prerequisites). The module freely uses the transformer block, FLOPs-per-token $C \approx 6 N D$, AdamW state breakdown, batch-size and learning-rate notation from Chapter 14, FP8 framing from Chapter 17, and the MoE routing vocabulary from Chapter 8. Cross-references appear throughout for review, but the module is hard to follow without the foundation.
+
+Beyond Module 1, two extra background expectations help:
+
+**Systems-programming vocabulary at the glossary level.** Words like "rank", "world size", "communicator", "stream", "synchronisation primitive", and "barrier" appear without re-definition. A reader who has written one MPI program or one multi-threaded program will recognise the model. A reader who has never seen distributed systems will want a thirty-minute primer before Chapter 24.
+
+**Memory accounting in bytes, not parameters.** Activation memory dominates the 70B-on-64-H100 worked example. The chapter assumes the reader is comfortable converting between $N$ (parameter count) and bytes (typically $2N$ for BF16 weights, $12N$ for AdamW Adam state, plus the activation tax).
+
+**Reading a parallelism config.** Several chapters quote $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ tuples directly from tech reports. The reader does not need to memorise the tuples, only to be willing to read them carefully and trace which axis shards which tensor.
+
+---
+
+## The shape of a 2026 frontier run, in parallelism terms {#shape}
+
+Some scale to calibrate expectations across the module:
+
+- **Cluster scale.** Public frontier runs in 2026 use $10^3$–$10^5$ accelerators per run. Llama-3.1 405B used 16 384 H100s; DeepSeek-V3 used 2 048 H800s; OLMo-2 32B used 1 280 H100 Augustas; PaLM 540B used 6 144 TPU v4. Closed-frontier runs are inferred to use $5 \times 10^4$ or more accelerators per pretraining cycle.
+- **Parallel-tuple shape.** The product of axes equals world size. Llama-3.1's $(\text{TP}=8, \text{PP}=16, \text{CP}=16, \text{DP}=4) = 8 \cdot 16 \cdot 16 \cdot 4 = 8 \, 192$, doubled for replicas. DeepSeek-V3's $(\text{TP}=1, \text{PP}=16, \text{EP}=64, \text{DP}=\text{ZeRO-1})$ with EP spanning 8 nodes of 8 H800 each. The configurations sit at very different points on the comm–memory–compute Pareto frontier; Chapter 26 explains the trade-offs.
+- **Communication budget.** A single transformer-block step on Llama-3.1 405B includes four TP AllReduces (or AllGather + ReduceScatter pairs under SP), one PP send/recv at the layer boundary, one DP AllReduce or ReduceScatter on the gradient, and (for the 128K-context phase) a CP AllGather across the sequence dimension. On a 70B/64-H100 configuration the AllReduce step time is in the hundreds of milliseconds; with hierarchical algorithms and SHARP, it drops below the per-rank backward compute time. Chapter 24 quantifies the regime.
+- **MFU envelope.** Frontier 2024–2026 runs report MFU values between 35% and 50%. PaLM 540B reported 46.2%. Llama-3 405B bulk reported 43% at 8K context, dropping to 38% at 131K. OLMo-2 32B reported 38%. DeepSeek-V3 is back-calculated to ~45% from disclosed H800 hours. MFU below 30% is a sign of communication-bound stages; MFU above 55% is rare and almost always tied to a specific kernel optimisation.
+- **Wall-clock.** A typical 2024–2026 frontier pretraining run spans 60–120 days. Most of the wall-clock is dominated by network communication overheads, AllReduce inefficiencies, and pipeline bubbles — not raw matmul throughput.
+
+---
+
+## Notation conventions {#notation}
+
+The module uses the following symbols. Chapter-local overloads are explicitly flagged on first use.
+
+- $W$ — total world size (number of accelerators in the run).
+- $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ — parallel-tuple. The product equals $W$.
+- $t$ — tensor-parallel rank count (`02b` shorthand).
+- $p$ — pipeline depth.
+- $m$ — pipeline micro-batches per step.
+- $v$ — interleaved-1F1B chunks per stage.
+- $N_d$ — data-parallel sharding rank count under ZeRO / FSDP.
+- $E$ — total MoE experts; $k$ — top-k routing count.
+- $D$ — EP world size (rank count holding experts; overloads $D$ from Module 1 within Chapter 22).
+- $L$ — layer count (overloads $L$ from Module 1's loss; chapters disambiguate locally).
+- $s, b, h, a$ — sequence length, micro-batch, hidden dim, attention heads (Korthikanti notation).
+- $\Psi$ — total parameter bytes in mixed precision (`02e` shorthand).
+- $|g|$ — gradient size in bytes.
+- $\eta, B, T, C, N, D$ — inherited from Module 1.
+
+---
+
+## Reading order recommendations {#reading-order}
+
+### First time through
+
+Chapters 19 through 26 in order. Each chapter cleanly follows from its predecessor: Data parallel (Chapter 19) is the simplest configuration and grounds the AllReduce primitive. Tensor parallel (Chapter 20) is the next step — sharding within a single layer. Pipeline parallel (Chapter 21) shards across layers. Expert parallel (Chapter 22) sits on the MoE side and reuses the AlltoAll primitive. FSDP and ZeRO (Chapter 23) shard the optimiser state and parameters along the data-parallel axis. The Collectives chapter (Chapter 24) is the primitive-level reference that every other chapter implicitly uses. Mixed precision and recompute (Chapter 25) is the cross-cutting optimisation. The 3D / 4D composition chapter (Chapter 26) closes the module by showing how a real frontier recipe combines all eight axes. Total reading time is six to seven hours of attentive reading.
+
+### For a systems engineer at a small lab
+
+Chapters 23, 25, 19, 24, 26. FSDP gets you the most memory per dollar; mixed precision and selective recompute compound the win; DDP is the baseline you compare against; Collectives explains why your communication is slow when it is; the composition chapter is the reference for the rare day you need TP or PP.
+
+### For a research scientist studying frontier recipes
+
+Chapters 26, 20, 22, 21. Start with the composition story to see what frontier labs ship; then read the TP, EP, and PP chapters to understand the per-axis decisions. The DP, FSDP, Collectives, and mixed-precision chapters can be skimmed and returned to.
+
+### For a reader evaluating a frontier tech report
+
+Read [§Frontier-lab configs](/textbook/02h-3d-4d-composition#frontier-configs) in Chapter 26 first, then jump to whichever per-axis chapter the report's specific configuration prompts (TP for tensor-heavy Megatron-style recipes, EP for MoE-heavy DeepSeek-V3-style recipes, FSDP for memory-tight OLMo-style recipes). The other chapters fill in the *why* once a specific number from a report needs interpretation.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module, a reader should be able to do all of the following without consulting external references:
+
+1. **Read the parallelism section of any 2024–2026 frontier tech report** and identify the $(\text{TP}, \text{PP}, \text{DP}, \text{EP}, \text{CP})$ tuple, the rank-assignment order, the activation-memory configuration, and the mixed-precision recipe.
+2. **Compute the activation memory of one transformer block** under a given parallel configuration, using Korthikanti's formulas.
+3. **Predict whether a specific TP, PP, or EP rank is communication- or compute-bound** on a given interconnect, using the arithmetic-intensity floor from Chapter 24.
+4. **Distinguish FSDP-2 from FSDP-1 + ZeRO-3** in both engineering and memory semantics — and know which PyTorch versions support which.
+5. **Design a 3D or 4D parallel configuration** for a hypothetical model on a hypothetical cluster, using the heuristics and worked-example chain from Chapter 26.
+6. **Predict the AllReduce time** for a given gradient size and world size, using the Patarasuk–Yuan bound and an estimate of the per-rank busBw.
+7. **Argue from first principles for or against** a specific parallelism choice. The module's "no verdicts" voice gives the reader the evidence to form their own conclusions; the comparison tables and cross-referenced ablations are the raw material.
+
+The module does **not** claim to teach the operational craft — debugging a hang in a 16K-GPU run, tuning NCCL environment variables for a specific cluster, choosing between InfiniBand and RoCE for a specific deployment, or recovering from a hardware failure mid-run. Those are skills that require the runs themselves. The module teaches the *vocabulary* and the *published recipes* that make those skills learnable from experience instead of from scratch.
+
+---
+
+## What this module does not cover {#non-goals}
+
+- **Inference-time parallelism.** KV-cache parallelism, paged attention, speculative decoding, continuous batching — future Inference & Serving module.
+- **Hardware physics.** NVLink electrical specifications, NVSwitch silicon details, fab-level variation. Treated at the NCCL semantic level only.
+- **Compiler-level engineering.** XLA, Triton, TorchInductor kernel emission, fused-attention implementation. Black-boxed.
+- **Cluster orchestration.** Slurm, Kubernetes, Ray. Not covered.
+- **Post-training distributed strategies.** RLHF, RLVR, and o-series reasoning-RL all have specific distributed patterns (actor/learner separation, replay buffer sharding) that belong to the future Post-Training module.
+
+<Sources items={[
+  { authors: "Module 0 — Prerequisites", year: 2026, title: "Frontier-LLM textbook, Module 0", url: "/textbook/00-prerequisites" },
+  { authors: "Module 1 — Pretraining at scale", year: 2026, title: "Frontier-LLM textbook, Module 1", url: "/textbook/01-pretraining" },
+  { authors: "Shoeybi, M. et al.", year: 2019, title: "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", venue: "arXiv:1909.08053", url: "https://arxiv.org/abs/1909.08053" },
+  { authors: "Korthikanti, V. et al.", year: 2022, title: "Reducing Activation Recomputation in Large Transformer Models", venue: "arXiv:2205.05198", url: "https://arxiv.org/abs/2205.05198" },
+  { authors: "Rajbhandari, S. et al.", year: 2019, title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models", venue: "arXiv:1910.02054", url: "https://arxiv.org/abs/1910.02054" },
+  { authors: "Grattafiori, A. et al.", year: 2024, title: "The Llama 3 Herd of Models", venue: "arXiv:2407.21783", url: "https://arxiv.org/abs/2407.21783", note: "Anchor reference for the 4D parallelism configuration used as the worked-example skeleton throughout the module." },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V3 Technical Report", venue: "arXiv:2412.19437", url: "https://arxiv.org/abs/2412.19437", note: "Anchor reference for DualPipe, FP8 distributed training, EP=64 node-limited routing." },
+]} />

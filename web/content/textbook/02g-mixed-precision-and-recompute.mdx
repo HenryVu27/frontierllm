@@ -1,0 +1,521 @@
+---
+slug: 02g-mixed-precision-and-recompute
+title: Mixed precision and gradient checkpointing
+description: BF16 / FP16 / FP8 / NVFP4 in a distributed setting, FP32 master weights, the Chen 2016 sqrt-n checkpointing trick, and Korthikanti's selective-recompute frontier.
+order: 26
+chapter: 25
+module: 2
+module_title: Distributed training
+reading_minutes: 36
+depends_on: [01h-annealing-and-stability, 02b-tensor-parallel]
+provides: [bf16, fp16-loss-scaling, fp8-distributed, mxfp8, nvfp4, gradient-checkpointing, selective-recompute]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Two operationally entangled topics share this chapter, and the first thing to do is keep them clearly separated. **Numerical precision** is the bit-format question: what container holds each tensor in the training graph — parameters, activations, gradients, optimiser state, accumulators — and what scaling machinery keeps low-precision tensors numerically stable. **Activation recomputation** is the memory-versus-compute question: what is stored from the forward pass for use in the backward pass, and what is recomputed on demand to shrink memory.
+
+The two topics are taught together for three reasons. They are the two largest activation-memory levers in any frontier training run. Both shrink the per-layer bytes-per-token term in the activation-memory equation that Section 5 reproduces. And they interact: FP8 storage of recomputed activations is the DeepSeek-V3 idiom; BF16 plus sequence-parallel selective recompute is the Llama-3 idiom. Symbol convention for this chapter: $L$ denotes the layer count (the optimisation loss is written $\mathcal{L}$ where it appears at all); $s$ is the sequence length, $b$ the per-rank micro-batch size, $h$ the hidden dimension, $a$ the number of attention heads.
+
+This chapter assumes the [FP8 format taxonomy from the annealing chapter](/textbook/01h-annealing-and-stability#fp8) (E4M3 vs E5M2, per-tensor vs tile/block vs MX) and the [tensor-parallel sequence-recompute machinery](/textbook/02b-tensor-parallel) that supplies equation (4). It feeds forward into [3D/4D composition](/textbook/02h-3d-4d-composition), where precision and recompute are treated as orthogonal axes of the parallelism stack. The reader's takeaway should be a working understanding of why every frontier 2024–2026 recipe converges on either "BF16 with selective recompute" (Llama-3, OLMo-2, Qwen3) or "FP8 GEMMs on a BF16 master path with selective recompute" (DeepSeek-V3, Kimi K2 in places, NVIDIA Nemotron with MXFP8 / NVFP4).
+
+## BF16 vs FP16 {#bf16-vs-fp16}
+
+The two 16-bit formats look interchangeable on a slide and are emphatically not. IEEE 754 binary16 — colloquially "FP16" — uses one sign bit, **five** exponent bits, and **ten** mantissa bits. Its smallest positive normal value is about $6.10 \times 10^{-5}$, its largest finite value about $6.55 \times 10^{4}$. The exponent range covers approximately twelve orders of magnitude. Google's bfloat16 — "BF16" — uses one sign bit, **eight** exponent bits, and **seven** mantissa bits. Its smallest positive normal is about $1.18 \times 10^{-38}$, its largest finite value about $3.39 \times 10^{38}$. The exponent range is approximately seventy-eight orders of magnitude, identical to FP32 by construction. BF16 trades three mantissa bits for three exponent bits relative to FP16, so its relative precision is roughly $2^{-7} \approx 0.78\%$ versus FP16's $2^{-10} \approx 0.10\%$.
+
+The deep-learning issue is not relative precision; it is *underflow* of small gradients. Typical activation gradients in a deep language model fall into a distribution whose left tail extends well below $10^{-7}$. FP16's smallest positive normal is $6.1 \times 10^{-5}$; everything smaller either denormalises (and loses precision) or flushes to zero (and loses gradient signal entirely). Micikevicius et al. (arXiv:1710.03740) measured this directly on a workload mix of CNNs, ResNets, and RNNs: roughly **5%** of activation gradients fell below $2^{-24} \approx 6 \times 10^{-8}$, well below the FP16 representable band, when no remedy was applied.
+
+The remedy is *loss scaling*. Multiply the loss $\mathcal{L}$ by a scalar $S$ before back-propagation; by the chain rule every gradient is scaled by $S$, shifting the gradient distribution upward into the FP16 representable band. After backward, divide gradients by $S$ before feeding the FP32 optimiser. NVIDIA Apex's `FP16_Optimizer` and `torch.amp` both ship a *dynamic* loss-scale schedule that starts at a high value such as $2^{15}$, doubles every $N$ iterations without an `Inf`/`NaN`, and halves immediately on overflow. The standard "ride-the-edge" doubling window is 2000 successful iterations.
+
+BF16 needs no loss scaling because its smallest positive normal of $\sim 10^{-38}$ sits far below any gradient that would ever appear in training; the underflow regime is unreachable. The trade-off surfaces in the *update* step. Accumulating weight increments of order $\eta \cdot g \sim 10^{-3} \cdot 10^{-3} = 10^{-6}$ into a BF16 weight buffer with $\sim 1\%$ relative precision risks silent stalling — which is why every modern recipe keeps FP32 master weights even when forward and backward are BF16.
+
+Three forcing functions drove the field to BF16 around 2020. **Hardware:** A100 (2020), H100 (2022), MI300X (2023), and TPU v3 and later all natively execute BF16 matmuls at full throughput. Earlier accelerators such as V100 ran FP16 at full throughput but emulated BF16. **Stability folklore from the OPT-175B and GLM-130B runs:** both reported loss-scale instabilities under FP16. The Apex `O2` mode (FP16 weights with FP32 master) was the trickiest piece of OPT's training infrastructure. GLM-130B's published recipe (Zeng et al., arXiv:2210.02414) switched to BF16-style training explicitly and called it the "single most important stability decision." **No FP16-specific tuning needed:** dynamic loss scaling is mostly automatic in principle, but the *initial* loss scale, the doubling window, and the halving factor are all hyperparameters that, when misconfigured, silently zero gradients on tail-distribution layers — most painfully the LM head and the early embedding rows.
+
+By the GPT-3 era (mid-2020) the field had standardised on FP32 plus loss scaling for the FP16 path; by Chinchilla, PaLM, OPT, and LLaMA-1 in 2022–2023 the standard was BF16. **Frontier 2024–2026 pretraining runs treat BF16 as the default 16-bit format. FP16 with loss scaling is a legacy choice**, surviving mostly in pre-Ampere fine-tuning workflows.
+
+<Callout variant="warning" title="FP16 returns for RL post-training (Liu et al. 2025)">
+Liu et al. (arXiv:2510.26788, October 2025) argue that **FP16 outperforms BF16 for reinforcement-learning post-training**. The mechanism is the "training–inference mismatch": rollout sampling typically runs on a different kernel (vLLM, SGLang, TRT-LLM) than the trainer, and BF16's seven mantissa bits mean rounding error accumulates across the discrepancy in a way that biases reward estimates. FP16's ten-bit mantissa narrows the mismatch enough that, for short RL runs at moderate scale, the FP16 underflow regime never bites.
+
+**For pretraining the BF16 consensus still holds.** The FP16-for-RL finding is post-training-specific and is flagged here as an exception, not a reversal. The chapter's working assumption — BF16 master path, FP32 master weights, FP32 grad accumulation, FP32 Adam $v_t$ — is the right default for any run measured in trillions of tokens.
+</Callout>
+
+## The Micikevicius mixed-precision recipe {#mixed-precision}
+
+The Micikevicius et al. 2017/2018 recipe is the foundation every later recipe is layered on. Most blog-post versions elide one or two pieces; the canonical recipe has three coupled techniques.
+
+**First, an FP32 master copy of weights.** Forward and backward run in FP16 or BF16, but a separate FP32 buffer holds the authoritative parameter values. The optimiser — AdamW and friends — updates the FP32 master; a 16-bit cast of the master is written back into the low-precision weight buffer before the next forward pass. Without this, repeated weight updates of order $\eta \cdot g \sim 10^{-3} g$ underflow the relative precision of FP16 ($\sim 10^{-4}$) and the weights silently stop moving.
+
+**Second, loss scaling** (FP16 only; not needed for BF16, as Section 2 established).
+
+**Third, FP32 accumulation inside the matmul.** Each FP16 or BF16 multiply produces a low-precision product, but the dot-product accumulator must be FP32 to avoid mantissa-rounding error from summing over $h$ or $d_{\text{model}}$ summands. Hopper Tensor Cores — and earlier Ampere and Volta — implement this in hardware: FP16 or BF16 inputs, FP32 accumulator, optional output cast back to 16 bits. On H100 the FP8 tensor-core kernels offer two accumulation modes; DeepSeek-V3 §4.5 famously discovered that the native Hopper FP8 accumulator "only uses the highest 14 bits" of its FP32 representation, requiring manual promotion to CUDA-core FP32 accumulation to keep a 14.8T-token pretrain stable. The annealing chapter covers the FP8 numerical recipe in detail; [the FP8 cross-reference](/textbook/01h-annealing-and-stability#fp8) gives the full DeepSeek-V3 numerical machinery.
+
+The 2024–2026 frontier default, applied to BF16 mixed precision, places buffers as follows. **Model weights (in-place)** live in BF16 for compute throughput, with the same exponent range as FP32 so no scaling is needed. **FP32 master weights** sit alongside the BF16 copy and absorb small updates without underflow. **Forward activations** live in BF16, stored for backward or discarded if recomputed. **Backward gradients per tensor** are BF16 on the compute path. The **gradient accumulator** across micro-batches is FP32 — Llama-3's recipe explicitly says "use FP32 gradient accumulation during backward computation over multiple micro-batches and also reduce-scatter gradients in FP32 across data parallel workers in FSDP." The **AdamW first moment** $m_t$ is FP32 (small biases accumulate; BF16 has been used but is risky). The **AdamW second moment** $v_t$ is FP32 — squaring underflows in 16-bit, so FP32 is mandatory in practice. **Loss, softmax, and LayerNorm internals** run in FP32 by the standard NVIDIA Apex and Transformer Engine rule. **Embedding gradients** are often kept in FP32 as a GLM-130B-style shrink mitigation; OLMo-2 additionally excludes embeddings from weight decay.
+
+<Callout variant="note" title="DeepSeek-V3 stores Adam moments in BF16">
+DeepSeek-V3 §4.5 places both AdamW $m_t$ and $v_t$ in **BF16** to halve optimiser-state memory. At 671B parameters this is the difference between 2.7 TB and 5.4 TB of optimiser-state bytes. The choice is aggressive but the published run completed without irrecoverable spikes; most other open frontier labs (Llama-3, Qwen3, OLMo-2) still keep moments in FP32. The BF16-moments path requires the rest of the precision stack — particularly the FP32 master and the FP32 grad accumulator — to be in place; pulling out FP32 moments without those buffers in FP32 invites silent stalling.
+</Callout>
+
+The arithmetic of the master-weights cost deserves an explicit line. At $N$ parameters with FP32 master plus FP32 Adam moments, optimiser memory is $4 \cdot 4 \cdot N = 16N$ bytes — master plus grad plus $m_t$ plus $v_t$, four bytes each. For a 70B model this is approximately $1.1$ TB of optimiser state per replica. Mixed precision in the forward and backward graph gives no help against this number; ZeRO and FSDP partitioning, parameter sharding, and optimiser-state sharding are the levers that bring the per-rank memory down. The activation-memory equation in Section 5 is the *complementary* lever — it shrinks the activations, not the optimiser state.
+
+## FP8 and below in a distributed context {#fp8-distributed}
+
+The FP8 format taxonomy and per-tensor scaling history live in [the FP8 cross-reference](/textbook/01h-annealing-and-stability#fp8). This section concentrates on the *distributed* consequences — scale-factor synchronisation traffic, communication-volume effects, and how recompute interacts with FP8 storage.
+
+Per-tensor FP8 introduces scale-factor traffic on the critical path. The H100 Tensor Core executes FP8 GEMMs of the form $C = A \cdot B$ where $A$ and $B$ each carry an FP32 scale and the output is dequantised to FP32 or BF16 using $s_A \cdot s_B$. To keep scales in a stable range, NVIDIA Transformer Engine maintains, per tensor and per call site, a history of recent `amax` values (the per-tensor maximum absolute value) and computes the next step's scale from the history (`fp8_recipe="delayed"`) or from the current step (`fp8_recipe="tensorwise"`). In a multi-GPU run, the `amax` of a tensor sharded across data-parallel or tensor-parallel ranks must be reduced across the relevant group so that every rank uses the same scale. The Transformer Engine documentation states that "if `torch.distributed` is initialized, the amax value for FP8 tensors is reduced across the `amax_reduction_group` ... which keeps the amaxes and scaling factors synced across the given distributed group." This is one additional small all-reduce per tensor per step — typically four FP32 scalars per FP8 GEMM, hundreds of GEMMs per layer. The traffic is small but non-zero and on the critical path. Setting `amax_reduction_group=False` skips the synchronisation cost and is the choice some labs make in practice, but it introduces a small per-rank divergence between scaling factors that can manifest as extra noise around loss-spike events.
+
+MXFP8 is the OCP Microscaling specification's Blackwell-native answer to the per-tensor-amax problem. The Open Compute Project's Microscaling Formats Specification v1.0 (September 2023) defines a hardware-native block-floating-point family. MXFP8 uses a **block size of 32 elements** along the contraction dimension, with one **E8M0** scaling factor per block — a power-of-two-only 8-bit exponent with zero mantissa bits — and an element format of E4M3 or E5M2 per element (E4M3 is the recommended choice since dynamic range is supplied by the per-block scale). On NVIDIA Blackwell (B100, B200, GB200) MXFP8 is hardware-native: the tensor cores dequantise the E8M0 block scale during the GEMM itself. NVIDIA's published Nemotron 8B and 12B internal runs show MXFP8 matching BF16 validation loss curves to within 1%; the recipe ships as `fp8_recipe="mxfp8"` in Transformer Engine 2.x. Reported throughput on B200: **1.28×–1.37× BF16 across a 1B–22B sweep** in the NVIDIA NeMo MXFP8 disclosure. The distributed consequence is striking: the per-tensor scale-factor traffic almost vanishes. Each 32-element block carries its own scale; there is no per-tensor amax to all-reduce. The trade-off is that each tensor now carries an extra $1/32$ overhead in bytes — one byte of scale per 32 bytes of payload — but the overall flow is meaningfully simpler than per-tensor amax-history machinery.
+
+DeepSeek-V3's tile-and-block recipe sits at a different point on the same axis. DeepSeek-V3 §4.5 (December 2024) uses **per-tile** scaling (1×128 along the activation channel dimension, per token) for activations, and **per-block** scaling (128×128) for weights, both in E4M3. Each tile or block carries its own FP32 scale, and amax is computed online per tile. Compared to MX's 32-element blocks, DeepSeek's 128-wide tiles are larger but the resulting recipe predates MXFP8 hardware and runs on H800 — where MXFP8 is not natively supported. The two recipes occupy adjacent points on the granularity axis: MXFP8 at 32-element blocks with hardware-native E8M0 scales, DeepSeek's tile/block at 128-element blocks with software-managed FP32 scales.
+
+<Sidenote>There is, as of May 2026, **no published head-to-head pretraining comparison between MXFP8 and DeepSeek 1×128/128×128 tile/block at frontier scale**. NVIDIA's Nemotron MXFP8 internal runs are at 2B–22B; DeepSeek's tile/block is at 671B. The community does not yet have an apples-to-apples comparison at $\geq 30$B scale.</Sidenote>
+
+Distributed FP8 storage of activations is the V3 idiom that materially affects communication volume. DeepSeek-V3 §3.2.3 stores the *inputs* to most linear layers in FP8 for use in the weight-gradient backward pass, and recomputes any activations that are too dynamic-range-sensitive for FP8 storage. The MoE dispatch and combine path is also FP8-quantised before the all-to-all: "activations before MoE up-projections are quantized into FP8 and then apply dispatch components." This is the single biggest communication-volume win in the V3 recipe — the MoE all-to-all carries roughly half the bytes of a BF16 baseline.
+
+What stays high-precision is consistent across labs. The frontier consensus, visible in V3, Kimi K2, and the NVIDIA NVFP4 paper, holds that the following layers stay BF16 or higher even in an FP8 or FP4 run. **Embedding layers** carry large dynamic range across the vocabulary; underflow on rare tokens is unrecoverable. **The LM head and output projection** drive the softmax, and quantisation noise scales with the temperature. **Normalisation layers** (RMSNorm, LayerNorm) keep their internal statistics in FP32 regardless of the surrounding precision. **MoE gating logits** form a small layer with disproportionate impact on routing; quantising the gate is the route to expert collapse. **Attention QK and softmax** are high-dynamic-range; FlashAttention-3 supports FP8 attention but DeepSeek-V3 keeps these BF16. The rule of thumb is concise: quantise GEMMs; keep high-dynamic-range operations in BF16 or FP32.
+
+NVFP4 is the May-2026-current 4-bit frontier. NVIDIA's "Pretraining Large Language Models with NVFP4" (arXiv:2509.25149) runs a 12B-parameter model on 10T tokens with NVFP4 GEMMs in the middle layers, keeping the first two and last eight transformer layers, plus the embedding, LM head, and attention QK and softmax, at BF16. The format quarters the GEMM compute relative to BF16 (after accounting for the per-block FP32 outer scale and the per-tensor amax channel). As of May 14, 2026 this is the longest 4-bit pretraining published; the recipe is recipe-fragile and frontier-current rather than recipe-stable.
+
+## Gradient checkpointing {#checkpointing}
+
+Chen, Xu, Zhang, and Guestrin's "Training Deep Nets with Sublinear Memory Cost" (arXiv:1604.06174, April 2016) is the foundational result. For an $n$-layer feed-forward network whose forward activations form a chain, naive training stores all $n$ activations and uses memory $\Theta(n)$. Chen et al. propose marking every $\sqrt{n}$-th node as a *checkpoint*, storing only those, and recomputing the intermediate activations on demand during the backward pass. Both the number of checkpoints and the number of activations between checkpoints are $\Theta(\sqrt{n})$, so memory drops from $\Theta(n)$ to $\Theta(\sqrt{n})$. Each intermediate activation is recomputed at most once across the whole backward pass, so total compute overhead is exactly **one extra forward pass** through the network. A more aggressive variant achieves $O(\log n)$ memory at $O(n \log n)$ extra compute by recursively subdividing.
+
+For a depth-$L$ transformer, "every $\sqrt{L}$-th node" is not literally what gets used in practice. Two simpler regimes dominate. **Full layer-wise checkpointing** treats each transformer layer as a single block: store only its input, and recompute everything inside the layer during backward. Memory drops to $\Theta(L)$ checkpoints of size $\Theta(sbh)$ each, giving total activation memory $2sbhL$ bytes in BF16 (the Korthikanti equation reproduced in Section 5). Compute overhead: exactly **one extra forward pass through the layer** per backward step. The forward pass is one-third of the standard forward-plus-backward-plus-optimiser FLOPs in a transformer, so adding one extra forward equals adding approximately **33%** to total training FLOPs. **Block-wise checkpointing** groups $K$ consecutive layers and checkpoints at block boundaries; same asymptotic story, with more recompute inside each block and fewer activations checkpointed.
+
+The PyTorch default is `torch.utils.checkpoint.checkpoint`, applied per transformer layer. As of PyTorch 2.5 the `use_reentrant=False` mode is the recommended default; it stores autograd-saved-variable hooks rather than the full activation tensor, lowering per-checkpoint Python overhead. The old `use_reentrant=True` will eventually be deprecated. Operationally, the choice between reentrant and non-reentrant is invisible to the training loss but visible in Python overhead for very deep models and small micro-batches.
+
+A 30% wall-clock overhead is empirically what Llama-2, Llama-1, and GPT-NeoX-era full-recompute runs reported. Korthikanti et al. measured per-layer overhead at **11%** for selective recomputation on the attention block alone, versus **38%** for full layer-wise recomputation — the gap that selective recompute closes is from approximately 38% to approximately 3% wall-clock overhead while preserving most of the memory savings.
+
+## Selective recompute {#selective-recompute}
+
+Korthikanti, Casper, Lym, McAfee, Andersch, Shoeybi, and Catanzaro (arXiv:2205.05198, May 2022; MLSys 2023): "Reducing Activation Recomputation in Large Transformer Models." This is the canonical reference for *how much memory* each strategy costs and saves, and the source of the activation-memory equation that Section 8 uses for the worked example. The chapter's headline number — Korthikanti reports **~70% activation-memory savings at 2.7% extra FLOPs** for selective recompute on GPT-3-scale models — is the reason every frontier 2024–2026 lab runs *selective* recompute rather than full recompute or no recompute.
+
+The key idea is to recompute only the **attention-softmax block**: the operations whose stored activations carry the quadratic-in-sequence-length $s^2$ buffers, and whose arithmetic intensity is low enough that recomputation is cheap relative to what is reclaimed. Specifically, the four operations recomputed are: the $QK^T$ matmul, the softmax, the softmax dropout, and the attention-over-$V$ matmul (Korthikanti §4.1). The rest of the layer's activations — the Q/K/V projections, the output projection, the MLP intermediate, the LayerNorm and dropout buffers — stay stored. The 5×-scale memory reduction relative to full storage at long context comes from removing the $5as/h$ term in equation (1) and keeping only the $34sbh$ baseline. The 2.7% FLOPs overhead, rather than the ~33% of full recompute, comes from the fact that the four recomputed operations together account for only a small fraction of the layer's total FLOPs (the bulk of the FLOPs live in the four large GEMMs — Q/K/V, output, and the two MLP projections — which are *not* recomputed under selective recompute).
+
+DeepSeek-V3 uses a *different* selective-recompute boundary, which deserves its own paragraph because the two policies share a name but cut at different places. The V3 recipe (DeepSeek-AI 2024 §3.2.3) "recomputes all RMSNorm operations and MLA up-projections during back-propagation," and on the SwiGLU MLP "caches the SwiGLU input and recomputes the SwiGLU output." Compared to Korthikanti, the V3 cut targets RMSNorm (very cheap to recompute, modest memory) and the MLA up-projections (DeepSeek-specific structure not present in plain Multi-Head Attention) rather than the softmax block. The MoE dispatch path is FP8-quantised before the all-to-all, so the activations recomputed during backward are also FP8 in many places. The two policies are not directly comparable — Korthikanti targets the $s^2$ softmax buffers, V3 targets the per-layer normalisation and MLA up-projection buffers — and the published literature contains **no head-to-head comparison** of the two at matched scale.
+
+<Callout variant="note" title="Korthikanti-selective ≠ DeepSeek-selective">
+Two distinct selective-recompute policies share the name. **Korthikanti-selective** targets the attention-softmax block — the $5as/h$ quadratic-in-sequence-length buffers in equation (1) — and is the right cut for any plain Multi-Head Attention transformer at long context. **DeepSeek-selective** targets RMSNorm operations and MLA up-projections, and caches SwiGLU inputs while recomputing SwiGLU outputs; it is the right cut for MLA-based MoE models at moderate context. Both are valid "selective recompute" policies. No published study directly compares them at matched scale, and the field treats the choice as architecture-specific rather than empirically resolved.
+</Callout>
+
+The headline overhead number deserves a range rather than a point estimate. Korthikanti measures 2.7% extra FLOPs for GPT-3-scale models, scaling slightly with sequence length. The DeepSeek-style RMSNorm-plus-MLA-plus-SwiGLU policy pays a different overhead — somewhere between 3% and 5% on the V3 architecture, by the back-of-the-envelope arithmetic in the paper, though the V3 report itself does not publish a clean overhead number. The chapter's working range is **2–5% extra FLOPs** for selective recompute in either policy, with the lower end credited to Korthikanti-attention-only on plain MHA and the higher end to broader selective policies.
+
+## SP + recompute interaction {#sp-recompute}
+
+Sequence parallelism is the indispensable companion of tensor parallelism for activation memory; its full derivation lives in the [tensor-parallel chapter](/textbook/02b-tensor-parallel). Three points are worth fixing here.
+
+**First, sequence parallelism eliminates the activation-replication tax of pure tensor parallelism.** Pure TP of degree $t$ partitions the attention heads and the MLP intermediate dimension across $t$ ranks. It duplicates activations across $t$ ranks at the regions *between* attention and MLP — the LayerNorm and dropout regions — because those operations do not admit head-wise or intermediate-wise partitioning. SP partitions those activations along the sequence dimension instead, paying an extra reduce-scatter plus all-gather per layer in exchange for the $t$-fold memory drop on the replicated regions. The coefficient $24/t$ in equation (4) below is the SP contribution; without SP the $24$ is undivided and sits as pure replication tax.
+
+**Second, selective recompute composes additively with SP.** SP scales the *stored* activations down by $1/t$; selective recompute removes the $5as/h$ softmax-block buffer entirely. The two are orthogonal levers and stack cleanly. The 70B worked example in Section 8 exhibits both effects on the same activation budget.
+
+**Third, the combined regime — BF16 plus TP plus SP plus selective recompute — is what every disclosed 2024–2026 frontier pretraining run actually runs.** Llama-3's 4D parallelism (FSDP plus TP plus PP plus CP) uses SP inside the TP region; selective recompute is applied inside each transformer layer where memory pressure demands it. DeepSeek-V3's parallelism stack is differently structured (TP=1, EP=64, PP=16 in its main configuration) but the memory-saving role of selective recompute on the per-layer activation budget is the same.
+
+A subtle interaction is worth flagging at long context. At sequence lengths past about 32K, **context parallelism** (CP) becomes the dominant memory lever, not selective recompute. CP partitions activations along the sequence dimension across a *new* parallel group — different from SP, which lives inside the TP group. At 128K tokens the $5as/h$ piece is so large that even after CP-partitioning across 8–16 ranks, recomputing it during backward is often still worthwhile. The [context-parallel chapter](/textbook/02h-3d-4d-composition) treats the CP-plus-recompute interaction in detail.
+
+## Activation-memory math {#activation-memory}
+
+The Korthikanti formulas are the operational tool. Reproducing them verbatim, with attention to which buffers are counted and in what units. All formulas are in **bytes**, assuming BF16 storage (two bytes per element).
+
+Per transformer layer, with no recompute and no tensor parallelism, the total stored-activation memory is
+
+$$M_{\text{act}}^{\text{layer}} = sbh \cdot \big(34 + 5 \cdot \tfrac{as}{h}\big) \quad \text{(bytes)}. \tag{1}$$
+
+The coefficient $34$ decomposes as $11sbh$ for the attention block buffers (Q, K, V projections, output projection, dropout mask, attention output, residual), $19sbh$ for the MLP block (input, intermediate $4h$, GELU or SwiGLU outputs, dropout, residual), and $4sbh$ for the two LayerNorms (input plus saved mean and variance). The $5as/h$ term is the attention-softmax block: the $s \times s$ attention probabilities matrix, the post-softmax dropout mask, and the $QK^T$ result. This is the quadratic-in-sequence-length term that dominates at long context.
+
+A concrete check. For a 70B Llama-shape model with $h = 8192$ and $a = 64$ at $s = 8192$: the $5as/h$ piece equals $5 \cdot 64 \cdot 8192 / 8192 = 320$, so the total coefficient is $34 + 320 = 354$ — the quadratic-in-$s$ piece dominates by approximately tenfold already at 8K context. For a 22B GPT-3-style model at $s = 2048$, $h = 6144$, $a = 64$, the $5as/h$ term equals $5 \cdot 64 \cdot 2048 / 6144 \approx 107$, so the coefficient is $34 + 107 = 141$. Selective recompute eliminates 107 of these 141, i.e. about **76% of activation memory**. At $s = 4096$ the eliminated fraction climbs to **~86%**. The "approximately 70% memory savings" Korthikanti headline is the across-models average; for long-sequence configurations the win is substantially larger.
+
+Full recomputation (the Chen 2016 idiom, applied per transformer layer) gives, *total across the stack*:
+
+$$M_{\text{act}}^{\text{full-recompute}} = 2sbhL \quad \text{(bytes)}. \tag{2}$$
+
+This is the "store only the input to each layer; recompute everything else" regime. Memory is linear in depth $L$ and *independent of attention-head count or sequence length beyond the $sbh$ prefactor*, because the $s^2$ buffers live only inside the layer currently recomputing and are reclaimed before the next layer. Compute overhead: approximately 33% of training FLOPs, as derived in Section 4.
+
+Selective recompute (Korthikanti 2022, attention-block only) gives:
+
+$$M_{\text{act}}^{\text{selective}} = 34 \cdot sbhL \quad \text{(bytes, total across the stack)}. \tag{3}$$
+
+The quadratic-in-$s$ piece is gone, and what remains is the $34sbh$ baseline. Compute overhead: approximately 2.7% extra FLOPs at GPT-3 scale.
+
+With tensor parallelism of degree $t$ plus sequence parallelism, equation (1) becomes:
+
+$$M_{\text{act}}^{\text{TP+SP}} = \frac{sbh}{t}\Big(10 + \tfrac{24}{t} + 5 \cdot \tfrac{as}{ht}\Big) \quad \text{per layer, bytes}. \tag{4}$$
+
+When $t = 1$ this reduces to equation (1). When SP is added on top of TP, the previously-replicated $24sbh$ piece (LayerNorm plus dropout regions) becomes divided by $t$. The $5as/h$ piece becomes $5as/(ht)$ because attention heads are partitioned across the $t$ TP ranks.
+
+Combining selective recompute with TP plus SP yields the paper's headline number: **5× lower activation memory, 90%+ lower recomputation overhead** relative to full recomputation. The 530B GPT-style model trained on 2240 A100s in Korthikanti's experiments achieved Model FLOPs Utilization of **54.2%** with the combined recipe versus **42.1%** with naive full recomputation — a **29% throughput gain** purely from the recompute-policy change.
+
+## Worked example: 70B BF16 on H100 {#worked-example}
+
+The running example matches a plausible Llama-3.1-70B configuration. The Llama-3 herd report (Dubey et al. 2024, Table 4) sets the 70B MFU at approximately 40% in BF16, which is consistent with the activation-memory accounting below.
+
+**Model.** Parameters $N = 70$B; layers $L = 80$; hidden $h = 8192$; attention heads $a = 64$ (GQA: 64 Q-heads, 8 KV-heads — for memory accounting the $a = 64$ Q-head count is what enters the $5as/h$ term); MLP intermediate $4h = 32{,}768$ (SwiGLU); sequence length $s = 8192$; per-rank micro-batch $b = 1$.
+
+**Hardware and parallelism.** Cluster of 1024 H100 80GB. Parallelism: FSDP-2 (data parallel of 64) plus TP $= 8$ plus SP enabled plus PP $= 2$. This mirrors a plausible 70B Llama-3 configuration, with 40 layers per PP stage.
+
+**Policy A — full storage, no recompute (TP + SP, equation 4).** Setting $s = 8192$, $b = 1$, $h = 8192$, $t = 8$, $a = 64$:
+
+- $sbh/t = 8192 \cdot 1 \cdot 8192 / 8 = 8{,}388{,}608 = 8.39$ M.
+- Coefficient: $10 + 24/8 + 5 \cdot 64 \cdot 8192 / (8192 \cdot 8) = 10 + 3 + 40 = 53$.
+- Per-layer memory: $M^{\text{A}}_{\text{per layer}} = 8.39\,\text{M} \cdot 53 \cdot 2$ bytes $\approx 889$ MB.
+- Across 40 layers per PP stage: $\approx 35.6$ GB. With parameters (sharded), gradients, and optimiser state added on top, this exceeds the 80 GB H100 budget — Policy A is out-of-memory in this configuration.
+
+**Policy B — selective recompute (attention-only, Korthikanti).** The coefficient drops to $10 + 24/8 = 13$ (the $5as/(ht) = 40$ piece is removed):
+
+- Per-layer memory: $M^{\text{B}}_{\text{per layer}} = 8.39\,\text{M} \cdot 13 \cdot 2 \approx 218$ MB.
+- Across 40 layers per PP stage: $\approx 8.7$ GB. This fits comfortably, leaving approximately 71 GB of headroom for parameters, gradients, optimiser state, and workspace.
+- Compute overhead versus Policy A: **~2.7% extra FLOPs**.
+
+**Policy C — full recompute (Chen 2016).** Per-layer storage is reduced to a single $sbh/t$-sized input buffer:
+
+- Per-layer memory: $2 \cdot 8192 \cdot 1 \cdot 8192 / 8 = 2 \cdot 8.39\,\text{M} \approx 16.78$ MB (in BF16).
+- Across 40 layers: $\approx 0.67$ GB stored, with the per-layer recomputed activations transiently allocated during backward.
+- Compute overhead versus Policy A: **~33% extra FLOPs**.
+
+**The verdict.** Policy B is the frontier choice: roughly 4× less memory than Policy A at 2.7% compute overhead, fitting comfortably inside the 80 GB H100 budget. Policy C uses approximately 13× less memory than Policy B but pays 30% more compute. At 70B-on-H100 the policy choice is determined by whether the budget can absorb the 30% wall-clock penalty of full recompute — at a training run of order $10^7$ GPU-hours, that penalty translates to about $3 \times 10^6$ extra GPU-hours, a multimillion-dollar decision. Every disclosed frontier lab answers this the same way: take Policy B.
+
+Layering FP8 on top, DeepSeek-V3 style, compounds the win. If the GEMMs run in FP8 (1×128 / 128×128 tile/block, E4M3), the stored-activation byte count for the linear-layer inputs halves. Per-layer memory under Policy B plus FP8-activation-storage drops from approximately 218 MB to approximately 140 MB. The FP8 storage savings compose *multiplicatively* with selective recompute, not additively — both shrink the same $sbh \cdot \text{coefficient}$ term.
+
+## Frontier-lab landscape, May 2026 {#frontier-landscape}
+
+The disclosure landscape is uneven. Open labs publish enough to reproduce; closed labs publish nothing about precision or recompute. The table below is exhaustive within the disclosure boundary; "not publicly disclosed" rows are marked as such rather than inferred.
+
+<ComparisonTable
+  caption="Frontier-lab precision and recompute recipes, May 14, 2026. Closed-lab rows (Claude, GPT, Gemini) carry 'not publicly disclosed' to make the disclosure boundary explicit. Llama-3 row is hedged: Meta states '8K tokens without activation checkpointing' but does not explicitly state whether selective recompute is on in the 8K stage."
+  columns={["Model", "Precision recipe", "Recompute policy", "Source"]}
+  rows={[
+    [
+      "Llama 3 / 3.1 (70B, 405B)",
+      "BF16 forward/backward; FP32 grad accumulation; FP32 reduce-scatter in FSDP",
+      "Partial disclosure: '8K tokens without activation checkpointing'; activation checkpointing used at 128K context-parallel phase. Selective recompute inferred but not explicitly confirmed.",
+      <a href="https://arxiv.org/abs/2407.21783">Dubey et al. 2024 §3.3</a>
+    ],
+    [
+      "Llama 4 (Scout, Maverick)",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">Meta release blog 2025</a>
+    ],
+    [
+      "DeepSeek-V3 (671B MoE)",
+      "FP8 (E4M3) GEMMs + 1×128 act tile / 128×128 weight block; BF16 attention/embed/head/gate/norm; BF16 AdamW moments; FP32 master",
+      "Selective: 'recompute all RMSNorm operations and MLA up-projections during back-propagation'; SwiGLU input cached, output recomputed; MoE dispatch FP8-quantised before all-to-all",
+      <a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI 2024 §3.2.3, §4.5</a>
+    ],
+    [
+      "DeepSeek-V2 (236B MoE)",
+      "BF16",
+      "Selective (not detailed in paper)",
+      <a href="https://arxiv.org/abs/2405.04434">DeepSeek-AI 2024 §3.1.2</a>
+    ],
+    [
+      "Qwen3 (235B-A22B, 32B dense)",
+      "Not publicly disclosed in paper text (community: BF16)",
+      "Not publicly disclosed",
+      <a href="https://arxiv.org/abs/2505.09388">Yang et al. 2025</a>
+    ],
+    [
+      "Qwen2.5 (72B)",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://arxiv.org/abs/2412.15115">Yang et al. 2024</a>
+    ],
+    [
+      "Kimi K2 (1T MoE)",
+      "BF16 params + FP32 grad accumulation; FP8-E4M3 activations in specific places (§2.4.3)",
+      "Selective (implied; not detailed)",
+      <a href="https://arxiv.org/abs/2507.20534">Moonshot AI 2025</a>
+    ],
+    [
+      "OLMo-2 (7B, 13B, 32B)",
+      "BF16",
+      "Selective (Megatron-Bridge default)",
+      <a href="https://arxiv.org/abs/2501.00656">Walsh et al. 2025</a>
+    ],
+    [
+      "Phi-4 (14B)",
+      "Not publicly disclosed (community: BF16)",
+      "Not publicly disclosed",
+      <a href="https://arxiv.org/abs/2412.08905">Abdin et al. 2024</a>
+    ],
+    [
+      "Gemma 2 (27B)",
+      "BF16 (TPU bf16)",
+      "Not publicly disclosed",
+      <a href="https://arxiv.org/abs/2408.00118">Riviere et al. 2024</a>
+    ],
+    [
+      "Mistral / Mixtral",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://mistral.ai/news/">Mistral release notes</a>
+    ],
+    [
+      "Claude (Anthropic)",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://www.anthropic.com/news">Anthropic system cards</a>
+    ],
+    [
+      "GPT (OpenAI)",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://openai.com/research">OpenAI system cards</a>
+    ],
+    [
+      "Gemini (Google DeepMind)",
+      "Not publicly disclosed",
+      "Not publicly disclosed",
+      <a href="https://blog.google/technology/google-deepmind/">DeepMind blog and tech reports</a>
+    ],
+    [
+      "Nemotron-2B/8B/12B (NVIDIA internal)",
+      "MXFP8 (E4M3 element + E8M0 block scale, 32-element block)",
+      "Selective",
+      <a href="https://developer.nvidia.com/blog/faster-training-throughput-in-fp8-precision-with-nvidia-nemo/">NVIDIA NeMo MXFP8 blog 2024</a>
+    ],
+    [
+      "NVIDIA NVFP4 12B (internal, 10T tokens)",
+      "NVFP4 GEMMs in middle layers; BF16 first 2 + last 8 + embed + head + attention",
+      "Selective",
+      <a href="https://arxiv.org/abs/2509.25149">NVIDIA 2025 arXiv:2509.25149</a>
+    ]
+  ]}
+/>
+
+Five observations close the landscape. **First, every disclosed frontier 2024–2026 pretraining run uses selective recompute** — not full recompute, not no-recompute. The unanimous default is selective. **Second, BF16 mixed precision is the consensus for the master path.** FP8 (DeepSeek-V3, NVIDIA Nemotron) and FP4 (NVIDIA NVFP4 12B) are additive on top of the BF16 backbone, not replacements. **Third, the "what's quantised in FP8" boundary is consistent across labs.** Dense GEMMs in the FFN and MoE expert FFNs are quantised; attention QK and V projections sometimes; embedding, head, gating, and norm layers always stay BF16 or FP32. **Fourth, closed labs disclose nothing.** Anthropic, OpenAI, and DeepMind publish system cards that name post-training and RLHF but say nothing about pretraining precision, recompute policy, or activation-memory management. Inferring is unsafe. **Fifth, recompute and precision are orthogonal axes.** A lab can sit at any cell of the (precision × recompute) grid; the frontier choice converges on (BF16-or-FP8) × selective.
+
+The Llama-3 disclosure deserves an explicit hedge. Meta states in Dubey et al. 2024 §3.3 that "we use FP32 gradient accumulation during backward computation over multiple micro-batches and also reduce-scatter gradients in FP32 across data parallel workers in FSDP." It also states that the 8K-context stage runs "without activation checkpointing." It does **not** state explicitly whether selective recompute is on or off in the 8K stage, nor what specifically is recomputed in the 128K context-parallel stage. Community implementations (TorchTitan, Megatron-LM defaults) apply selective recompute by default, and the table above infers Llama-3 does the same, but Meta does not say so. The cell is marked as a partial disclosure rather than confirmed selective.
+
+The frontier-recipe ageing rate is worth a closing note. Between mid-2024 (DeepSeek-V3 tile/block) and early 2026 (NVFP4) the format-of-choice has shifted twice. A May 2026 chapter should treat any quoted recipe as a snapshot, not a destination. The biggest open question is whether the BF16 backbone survives past 2027. DeepSeek-V3's FP8 recipe halves memory and almost halves communication volume on the MoE all-to-all; NVFP4 quarters GEMM compute. If a future frontier run validates "FP4 everywhere except embeddings plus head plus norms" at $\geq 100$B parameters and $\geq 10$T tokens with no quality regression, BF16 becomes a checkpoint-storage format rather than a training format. As of May 14, 2026, that validation has not appeared at the size and scale needed to displace BF16. The honest position: BF16 mixed precision is the durable consensus; FP8 and FP4 are rapidly improving but are still recipe-fragile and frontier-current rather than recipe-stable.
+
+## Chapter summary {#summary}
+
+Mixed precision and gradient checkpointing are the two largest activation-memory levers in any frontier pretraining run. They are orthogonal: precision shrinks the bytes-per-element of stored tensors; recompute shrinks the number of tensors stored. The 2024–2026 frontier converges on a small region of the joint design space.
+
+- **BF16 is the default 16-bit format for pretraining.** FP16 with loss scaling is a legacy choice; the dynamic-range argument (FP16's $\sim 10^{-5}$ floor versus BF16's $\sim 10^{-38}$ floor) plus the GLM-130B and OPT-175B stability folklore moved the field decisively. The Liu et al. 2025 finding that FP16 outperforms BF16 for *RL post-training* is a post-training-specific exception, not a pretraining reversal.
+- **FP32 master weights, FP32 gradient accumulation, FP32 Adam $v_t$ are non-negotiable** on the BF16 master path. DeepSeek-V3's BF16 Adam moments are the aggressive frontier; most labs keep moments in FP32.
+- **FP8 is additive on top of BF16, not a replacement.** Per-tensor FP8 (with amax synchronisation across distributed groups) is the legacy path; MXFP8 (32-element blocks, E8M0 scale, Blackwell-native) is the OCP-standard Blackwell path; DeepSeek's 1×128 / 128×128 tile/block is the H100/H800 path. The "what stays BF16" boundary — embeddings, LM head, norms, MoE gates, attention QK and softmax — is universal across labs.
+- **Selective recompute is the unanimous frontier default.** Korthikanti's attention-only recipe trades approximately 2.7% extra FLOPs for approximately 70% activation-memory savings, eliminating the $5as/h$ quadratic-in-sequence-length term. DeepSeek-V3 uses a different selective-recompute boundary (RMSNorm plus MLA up-projections plus SwiGLU outputs); the two policies share a name but cut at different places and have no published head-to-head comparison.
+- **The activation-memory equation must be reproduced before any run.** Per layer with no recompute: $sbh(34 + 5as/h)$. Full recompute total: $2sbhL$. Selective recompute total: $34sbhL$. With TP plus SP: $(sbh/t)(10 + 24/t + 5as/(ht))$ per layer. The Korthikanti combined recipe gives a 5× memory reduction and a 29% MFU lift on a 530B GPT-style model.
+- **Closed-lab recipes (Claude, GPT, Gemini) are not publicly disclosed.** The frontier landscape table marks them as such rather than inferring. The disclosure boundary is itself one of the most important facts about the May 2026 frontier.
+
+The operational distillation is short. Use BF16 master path with FP32 master weights, FP32 grad accumulation, and FP32 Adam $v_t$. Use selective activation recomputation in any 2D-or-higher parallelism configuration above 7B parameters at $s \geq 4096$. Enable sequence parallelism whenever tensor parallelism is enabled. For FP8, start with MXFP8 on Blackwell or 1×128 / 128×128 tile/block on H100/H800; avoid per-tensor FP8 on continued-pretraining workloads. Keep embeddings, LM head, norms, and gating in BF16 or FP32 even in an FP8 run. Use `use_reentrant=False` in PyTorch checkpoint. Reproduce equations (1) and (4) for your model and parallelism configuration before starting a run; out-of-memory failures 80% of the way through a multi-trillion-token pretrain are the single most expensive class of preventable error.
+
+<Sources items={[
+  {
+    authors: "Micikevicius, P. et al.",
+    year: 2018,
+    title: "Mixed Precision Training",
+    venue: "ICLR 2018; arXiv:1710.03740",
+    url: "https://arxiv.org/abs/1710.03740",
+    note: "Foundational recipe: FP32 master weights, FP16 forward/backward with loss scaling, FP32 tensor-core accumulation. Measured ~5% of activation gradients below 2⁻²⁴ on CNN/ResNet/RNN workloads."
+  },
+  {
+    authors: "Chen, T., Xu, B., Zhang, C., Guestrin, C.",
+    year: 2016,
+    title: "Training Deep Nets with Sublinear Memory Cost",
+    venue: "arXiv:1604.06174",
+    url: "https://arxiv.org/abs/1604.06174",
+    note: "Foundational gradient-checkpointing result: O(√n) memory at +1 forward pass overhead; O(log n) memory at O(n log n) extra compute."
+  },
+  {
+    authors: "Korthikanti, V., Casper, J., Lym, S., McAfee, L., Andersch, M., Shoeybi, M., Catanzaro, B.",
+    year: 2023,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "MLSys 2023; arXiv:2205.05198",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Canonical selective-recompute reference. Activation-memory equation sbh(34 + 5as/h) per layer. Selective recompute on softmax block: ~70% memory savings at 2.7% FLOPs overhead. 530B GPT MFU 54.2% vs 42.1% full recompute."
+  },
+  {
+    authors: "Dubey, A. et al. (Meta Llama Team)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "§3.3: 'use FP32 gradient accumulation during backward computation over multiple micro-batches and also reduce-scatter gradients in FP32 across data parallel workers in FSDP.' 8K stage runs 'without activation checkpointing'; recompute policy at 128K not explicitly stated."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "§3.2.3 selective recompute: 'recompute all RMSNorm operations and MLA up-projections during back-propagation'; SwiGLU input cached, output recomputed; MoE dispatch FP8-quantised. §4.5 FP8 recipe: 1×128 act tile, 128×128 wt block, E4M3, BF16 Adam moments, FP32 master."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures",
+    venue: "ISCA 2025; arXiv:2505.09343",
+    url: "https://arxiv.org/abs/2505.09343",
+    note: "Hardware perspective on V3: Hopper FP8 Tensor Core 14-bit accumulator limitation and the manual FP32-promotion fix."
+  },
+  {
+    authors: "Moonshot AI (Kimi K2 Team)",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "§2.4.3: BF16 params + FP32 grad accumulation; FP8-E4M3 activations in specific places. Selective recompute implied."
+  },
+  {
+    authors: "Walsh, P. et al. (Ai2 OLMo Team)",
+    year: 2025,
+    title: "2 OLMo 2 Furious",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "OLMo-2 7B/13B/32B: BF16 mixed precision; selective recompute via Megatron-Bridge default; embeddings excluded from weight decay."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Three-stage S1/S2/S3 pretraining. Precision recipe not disclosed in paper text; QK-norm reported as key stability intervention."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "18T-token staged pretraining; precision recipe not disclosed in paper text."
+  },
+  {
+    authors: "Abdin, M. et al. (Microsoft Phi Team)",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "Phi-4 14B; precision and recompute not disclosed in paper text."
+  },
+  {
+    authors: "Riviere, M. et al. (Google DeepMind Gemma Team)",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv:2408.00118",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "Gemma 2 27B on TPU bf16; recompute policy not disclosed."
+  },
+  {
+    authors: "Zeng, A. et al.",
+    year: 2023,
+    title: "GLM-130B: An Open Bilingual Pre-trained Model",
+    venue: "ICLR 2023; arXiv:2210.02414",
+    url: "https://arxiv.org/abs/2210.02414",
+    note: "Switch to BF16-style training reported as 'single most important stability decision' after FP16 loss-scale instabilities."
+  },
+  {
+    authors: "Fujii, S. et al.",
+    year: 2024,
+    title: "Balancing Speed and Stability: The Trade-offs of FP8 vs. BF16 Training in LLMs",
+    venue: "arXiv:2411.08719",
+    url: "https://arxiv.org/abs/2411.08719",
+    note: "Per-tensor FP8 instabilities on continued-pretraining workloads; argues for fine-grained scaling rather than per-tensor."
+  },
+  {
+    authors: "Liu, P. et al.",
+    year: 2025,
+    title: "Defeating the Training–Inference Mismatch via FP16",
+    venue: "arXiv:2510.26788",
+    url: "https://arxiv.org/abs/2510.26788",
+    note: "FP16 outperforms BF16 for RL post-training due to training–inference kernel mismatch. Post-training-specific finding; does not affect the pretraining BF16 consensus."
+  },
+  {
+    authors: "NVIDIA Research",
+    year: 2025,
+    title: "Pretraining Large Language Models with NVFP4",
+    venue: "arXiv:2509.25149",
+    url: "https://arxiv.org/abs/2509.25149",
+    note: "12B-parameter model on 10T tokens with NVFP4 GEMMs in middle layers; BF16 first 2 + last 8 + embed + head + attention. Longest 4-bit pretraining published as of May 2026."
+  },
+  {
+    authors: "Rouhani, B. et al. (MX Alliance)",
+    year: 2023,
+    title: "Microscaling Data Formats for Deep Learning",
+    venue: "arXiv:2310.10537",
+    url: "https://arxiv.org/abs/2310.10537",
+    note: "MX format family: 32-element blocks with E8M0 shared scale and per-element E4M3/E5M2. Hardware-native on NVIDIA Blackwell."
+  },
+  {
+    authors: "Open Compute Project",
+    year: 2023,
+    title: "OCP Microscaling Formats (MX) Specification v1.0",
+    venue: "OCP",
+    url: "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf",
+    note: "Specification for MXFP8 (block 32, E8M0 scale) and related microscaling formats."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2017,
+    title: "Mixed-Precision Training of Deep Neural Networks",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/mixed-precision-training-deep-neural-networks/",
+    note: "Original NVIDIA explanation of the Micikevicius recipe and tensor-core FP32-accumulation behaviour."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Using FP8 and FP4 with Transformer Engine (TE 2.15 docs)",
+    venue: "NVIDIA documentation",
+    url: "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html",
+    note: "Per-tensor amax synchronisation across torch.distributed groups; delayed vs tensorwise recipes."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "MXFP8 — Transformer Engine 2.14 docs",
+    venue: "NVIDIA documentation",
+    url: "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/features/low_precision_training/mxfp8/mxfp8.html",
+    note: "MXFP8 recipe spec for Blackwell tensor cores."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Faster Training Throughput in FP8 Precision with NVIDIA NeMo",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/faster-training-throughput-in-fp8-precision-with-nvidia-nemo/",
+    note: "Nemotron MXFP8 internal runs: 1.28×–1.37× BF16 throughput across 1B–22B sweep on B200."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Megatron-Bridge Activation Recomputation docs",
+    venue: "NVIDIA NeMo documentation",
+    url: "https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/training/activation-recomputation.html",
+    note: "Megatron-Bridge selective and full recompute policies; fine-grained activation recomputation and swapping."
+  },
+  {
+    authors: "NVIDIA Apex",
+    year: 2023,
+    title: "Apex fp16_utils documentation",
+    venue: "NVIDIA Apex docs",
+    url: "https://nvidia.github.io/apex/fp16_utils.html",
+    note: "FP16_Optimizer dynamic loss-scale schedule: initial 2^15, doubling window 2000, halving on overflow."
+  },
+  {
+    authors: "PyTorch",
+    year: 2024,
+    title: "torch.utils.checkpoint documentation (PyTorch 2.x)",
+    venue: "PyTorch documentation",
+    url: "https://docs.pytorch.org/docs/stable/checkpoint.html",
+    note: "use_reentrant=False default recommendation as of PyTorch 2.5; lower Python overhead."
+  },
+  {
+    authors: "PyTorch",
+    year: 2024,
+    title: "Current and New Activation Checkpointing Techniques in PyTorch",
+    venue: "PyTorch blog",
+    url: "https://pytorch.org/blog/activation-checkpointing-techniques/",
+    note: "Modern activation-checkpointing implementations: SAC (selective activation checkpointing), memory-budget API, autograd-saved-variable hooks."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2023,
+    title: "Transformer Math 101",
+    venue: "EleutherAI blog",
+    url: "https://blog.eleuther.ai/transformer-math/",
+    note: "Reference compilation of transformer activation-memory and compute formulas; cross-checks Korthikanti equation 1."
+  }
+]} />

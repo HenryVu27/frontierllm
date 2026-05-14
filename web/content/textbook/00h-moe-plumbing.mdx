@@ -60,6 +60,10 @@ Each expert is an MLP block — typically a SwiGLU two-gate projection in modern
 
 The simplest and most widely deployed routing strategy is **token-choice top-k gating**: for each token, a lightweight router selects the $k$ experts with the highest affinity score and sends the token to those experts. The final layer output is a weighted sum of the $k$ expert outputs, using the (renormalised) gate values as weights.
 
+<Figure caption="Top-2 token-choice routing. Each token is dispatched to its two highest-scoring experts via the router; one expert is at capacity and drops the overflow token (the dashed arrow), which is the load-balance failure mode the auxiliary losses control.">
+  <MoeRoutingDiagram />
+</Figure>
+
 ### Mechanism
 
 Let $\mathbf{x} \in \mathbb{R}^{d_\text{model}}$ be a token's representation and $\mathbf{W}_r \in \mathbb{R}^{E \times d_\text{model}}$ be the router weight matrix. The forward pass proceeds as:

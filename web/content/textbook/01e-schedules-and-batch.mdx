@@ -1,0 +1,819 @@
+---
+slug: 01e-schedules-and-batch
+title: Learning-rate schedules and batch size
+description: Warmup-cosine vs WSD vs schedule-free; critical batch size; LR / batch interactions; 2024–2026 frontier hyperparameter recipes.
+order: 15
+chapter: 14
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 40
+depends_on: [00f-optimizers, 00d-normalization-and-init]
+provides: [warmup, cosine, wsd-schedule, schedule-free, critical-batch-size, batch-ramp, lr-batch-scaling]
+last_reviewed: 2026-05-11
+---
+
+## Orientation {#orientation}
+
+Two scalars dominate the macroscopic behaviour of a pretraining run: the learning rate $\eta$ and the batch size $B$. Together with the optimizer (covered in [optimizers](/textbook/00f-optimizers#adamw)) and the data mix, they determine whether a 15-trillion-token run converges to a competitive loss or spends weeks of GPU time wandering through a poorly conditioned region of weight space. The prerequisite chapter on optimizers introduced learning-rate schedules briefly, as a thread parallel to the choice of update rule; this chapter develops them in full and pairs them with the batch-size story that the optimizer chapter deferred.
+
+The treatment proceeds in three layers. Sections on warmup, cosine decay, and Warmup-Stable-Decay (WSD) cover the schedule shapes used in 2024-2026 frontier pretraining, with the verbatim formulations from MiniCPM (Hu et al. 2024), DeepSeek-V2/V3 (DeepSeek-AI 2024), Kimi-K2 (Moonshot 2025), and Llama-3 (Grattafiori et al. 2024). A section on schedule-free optimization (Defazio et al. 2024) covers the leading academic alternative and is careful to note that no public frontier lab has shipped a schedule-free pretrain at 70B-plus parameters. The middle layer is the McCandlish (2018) critical-batch-size theory, the Zhang et al. (2024) and Merrill et al. (2025) updates that recalibrate it for trillion-token pretraining, and the linear-versus-square-root LR-batch scaling rules of Goyal et al. (2017) and Malladi et al. (2022). The last layer is operational: gradient accumulation, a worked schedule for a 13B-parameter 3-trillion-token run, and a table of seven frontier-lab recipes with the disclosed numbers reproduced exactly. Where labs do not disclose pretraining hyperparameters — Mistral 7B is the canonical case — the chapter says so.
+
+<Callout variant="note" title="Notation and prerequisites">
+Throughout this chapter: $\eta$ denotes the learning rate, with $\eta_{\max}$ for the peak value reached after warmup and $\eta_{\min}$ for the floor at the end of decay. $B$ denotes batch size, in tokens unless explicitly stated in sequences. $B_{\text{crit}}$ is the critical batch size in the McCandlish sense. $T$ denotes total training duration, in tokens or in optimizer steps depending on context; $T_w$ is the warmup duration and $T_s$ the end of the stable phase in WSD. $\beta_1, \beta_2, \epsilon$ retain their AdamW meaning from the [optimizers chapter](/textbook/00f-optimizers#adamw). The McCandlish symbols $S, S_{\min}, E, E_{\min}$ are preserved verbatim from McCandlish et al. (2018). This chapter assumes familiarity with [AdamW](/textbook/00f-optimizers#adamw) and [Muon / MuonClip](/textbook/00f-optimizers#muon), and forward-references [μP transfer](/textbook/01d-mup-and-transfer) for the question of how $\eta_{\max}$ is actually chosen at frontier scale.
+</Callout>
+
+---
+
+## Warmup {#warmup}
+
+Linear warmup ramps the learning rate from a small initial value, typically zero, up to the peak value $\eta_{\max}$ over $T_w$ optimizer steps:
+
+$$\eta(t) = \frac{t}{T_w} \, \eta_{\max} \quad \text{for } 0 \le t \le T_w.$$
+
+After step $T_w$, the warmup hands off to whichever long-run schedule is in use — cosine decay, WSD's stable phase, or inverse-square-root. The duration $T_w$ is typically 0.05% to 2% of total training steps. Some labs measure warmup in tokens rather than steps; the conversion is trivial given the per-step batch size, but published numbers are easier to compare in steps.
+
+### Why pretraining needs warmup
+
+Three mechanisms make a non-trivial warmup essentially mandatory for transformer pretraining with adaptive optimizers.
+
+The first is **Adam bias-correction insufficiency at early steps**. The Adam second moment $v_t$ is initialised at zero; even with the bias correction $\hat{v}_t = v_t / (1 - \beta_2^t)$, the early estimates rest on a tiny number of noisy mini-batches and are unreliable. The effective per-coordinate step is $\eta \cdot \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)$, and a $\hat{v}_t$ that underestimates the true variance can produce enormous initial updates. The bias-correction formula corrects the *expected* magnitude of the moving averages, not the *uncertainty* in the estimate; with the warmup ramp, the first updates are damped while $\hat{v}_t$ accumulates enough samples to settle.
+
+The second is **cold-start attention degeneracy**. Soft-max attention at initialization is approximately uniform, since $W_Q$ and $W_K$ are typically initialised with variance scaled so that $Q K^\top / \sqrt{d}$ has unit scale. Large gradients flow through this near-degenerate regime and can push the attention pattern into pathological configurations — a single key absorbing all the attention mass, or a layer collapsing to identity. Liu et al. (2020) document this effect carefully for Post-LN transformers, showing that Post-LN architectures essentially require warmup to remain stable, while the now-standard Pre-LN configuration is more forgiving but still benefits substantially.
+
+The third is **embedding-table sparsity**. The token embedding table receives gradient only for tokens that appear in the current minibatch. With a vocabulary of 100k–250k tokens and a per-step batch of order 10M tokens, most embedding rows see no gradient on any individual step; rare tokens may see a gradient once per several thousand steps. At full learning rate, the sparse updates to these rare-token rows are large and destabilising — the embedding norm of a rare token can drift far from the bulk of the table on its first update, producing pathological logits when the token next appears. The warmup damps these initial large updates.
+
+### Typical warmup lengths in disclosed runs
+
+Across the recent public record, warmup is a few thousand steps or a fraction of a percent of total training:
+
+- GPT-3 175B (Brown et al. 2020) warms up over the first 375M tokens, roughly 0.125% of its 300B-token training.
+- Llama-2 70B (Touvron et al. 2023) uses a 2,000-step warmup, about 0.4% of total steps.
+- Llama-3 405B (Grattafiori et al. 2024) uses an 8,000-step warmup, around 0.7% of its roughly 1.2M optimizer steps.
+- DeepSeek-V2 and DeepSeek-V3 (DeepSeek-AI 2024) both use a 2,000-step warmup.
+- Kimi-K2 (Moonshot 2025) uses an unusually short 500-step warmup; the report attributes this to the MuonClip optimizer's spike-prevention mechanism, which removes one of the failure modes warmup classically defends against.
+- MiniCPM (Hu et al. 2024) uses warmup of 0.5%–1% of total training.
+
+<Callout variant="note" title="Adam bias correction is not a substitute for warmup">
+The Adam bias correction $1/(1-\beta_2^t)$ is exactly 1 in the limit but only $\approx 0.05$ at $t=1$ for $\beta_2 = 0.95$. The correction *rescales* the moving average to compensate for the zero-initialisation, but it does not reduce the *variance* of $\hat{v}_t$ as an estimator of $\mathbb{E}[g_t^2]$. At early steps that variance is large, so the per-coordinate effective LR is unstable from one step to the next. Warmup is the operational fix.
+</Callout>
+
+---
+
+## Cosine decay {#cosine}
+
+After warmup, the cosine schedule decays the learning rate following a half-cosine wave from $\eta_{\max}$ down to a floor $\eta_{\min}$ over the remaining $T - T_w$ steps:
+
+$$\eta(t) = \eta_{\min} + \frac{1}{2} \left( \eta_{\max} - \eta_{\min} \right) \left[ 1 + \cos\!\left( \pi \cdot \frac{t - T_w}{T - T_w} \right) \right] \quad \text{for } T_w \le t \le T.$$
+
+At $t = T_w$ the cosine argument is $0$ and $\eta = \eta_{\max}$; at $t = T$ the argument is $\pi$ and $\eta = \eta_{\min}$. The shape was originally proposed by Loshchilov & Hutter (2017) for SGDR's warm-restart schedule; the GPT-era practice fixed it to a single half-cycle without restarts and dropped the restart machinery.
+
+### The floor value: cosine-to-zero versus cosine-to-10%
+
+The cosine schedule has one parameter beyond $T_w$ and $T$: the floor $\eta_{\min}$. Two conventions are widely used.
+
+**Cosine-to-zero** sets $\eta_{\min} = 0$. The model continues to take steps until the very last one but with vanishing magnitude; the loss curve flattens cleanly at the end. This is the convention in many academic studies and at small scale.
+
+**Cosine-to-10%** sets $\eta_{\min} = 0.1 \, \eta_{\max}$, so the last optimizer step is at one tenth of the peak rate. This is the LLM-pretraining standard, used by GPT-3 (Brown et al. 2020), Llama-1, and Llama-2 (Touvron et al. 2023). The rationale is that the model continues to make meaningful adjustments through the final stretch — small but non-zero — which matters for downstream-task plasticity. Cosine-to-zero produces a flatter local minimum on the training loss but tends to generalise worse on downstream benchmarks at fixed compute.
+
+Llama-3 405B uses a more aggressive floor: its disclosed peak of $8 \times 10^{-5}$ decays to a final $8 \times 10^{-7}$, which is exactly 1% of peak. The terminology in the Llama-3 herd paper is "cosine to 1%"; the older "cosine to 10%" wording from the GPT-3 era has not survived as a literal convention, only as a rough qualitative anchor.
+
+### The fixed-budget problem
+
+The cosine schedule has one structural limitation: it requires committing to the total number of steps $T$ before training begins. Stopping early leaves the model partway through the decay, with a learning rate that is still above the floor; training is suboptimal. Continuing past the planned $T$ leaves the model stuck at $\eta_{\min}$, which is too low to recover from any data-mix change or to absorb additional tokens efficiently. The schedule is a contract between the trainer and a fixed compute budget that must be honoured in advance.
+
+Hägele et al. (2024) make this argument quantitatively for scaling-law sweeps. A scaling-law study that trains one model to its cosine end at each compute budget produces one (compute, loss) data point per run. With WSD-style cooldowns (described in the next section), the same constant-LR run can be branched at multiple points to produce multiple data points; they report roughly 50% compute savings on the typical sweep. The Hägele et al. result formalises an objection that practitioners had voiced for years: the cosine commitment to a fixed $T$ is wasteful whenever the right $T$ is itself the object of study.
+
+<Sidenote>The Llama-2 paper uses the phrase "cosine with 10% of the peak learning rate" verbatim (Touvron et al. 2023, §2.2). The Llama-3 herd report drops the floor by another decade to 1% but does not use the older terminology, instead reporting the absolute values $8\times 10^{-5}$ and $8\times 10^{-7}$. The trajectory of the floor downward over three Llama generations is consistent with a separately documented finding: at frontier-scale data (10T+ tokens), the model continues to improve at very low learning rates, and the cosine-to-10% convention was leaving capability on the table.</Sidenote>
+
+### Sources cited so far
+
+The cosine schedule and the fixed-budget critique originate in Loshchilov & Hutter (2017) and Hägele et al. (2024) respectively; their concrete pretraining instantiations appear in Brown et al. (2020), Touvron et al. (2023), and Grattafiori et al. (2024).
+
+---
+
+## WSD (Warmup-Stable-Decay) {#wsd}
+
+<Figure caption="Three schedules overlaid. WSD spends most of training at the peak LR, then drops fast in a short cooldown tail; cosine starts decaying immediately and never returns to peak; constant + decay is the limiting case as the decay tail shrinks. Drag the warmup and decay-tail sliders to see how the schedules deform.">
+  <ScheduleOverlay />
+</Figure>
+
+WSD addresses the fixed-budget limitation of cosine directly. The schedule has three phases: linear warmup, then a constant-LR plateau (the "stable" phase), then a short decay tail (the "cooldown" or "annealing" phase):
+
+$$\eta(t) = \begin{cases}
+\eta_{\max} \cdot \dfrac{t}{T_w} & 0 \le t < T_w \\[4pt]
+\eta_{\max} & T_w \le t < T_s \\[4pt]
+\eta_{\max} \cdot f\!\left( \dfrac{t - T_s}{T - T_s} \right) & T_s \le t \le T
+\end{cases}$$
+
+where $T_s$ is the end of the stable phase and $f: [0, 1] \to [\eta_{\min}/\eta_{\max}, 1]$ is a monotone-decreasing function with $f(0) = 1$ and $f(1) = \eta_{\min}/\eta_{\max}$.
+
+The MiniCPM paper (Hu et al. 2024) writes the same schedule with $s$ for step index and $T$ for the end of the stable phase:
+
+$$\mathrm{WSD}(T; s) = \begin{cases} \dfrac{s}{W} \cdot \eta & s < W \\[4pt] \eta & W < s < T \\[4pt] f(s - T) \cdot \eta & T < s \end{cases}$$
+
+MiniCPM's specific choice of decay function was exponential, $f(s - T) = 0.5^{(s-S)/T}$, where $S$ is the original total-step count and the exponent uses $T$ as a scale parameter for the cooldown.
+
+### Decay shapes inside WSD
+
+The cooldown function $f$ has several common choices. Cosine, $f(\tau) = \tfrac{1}{2}(1 + \cos(\pi \tau))$, is the smoothest and the standard fallback. Linear, $f(\tau) = 1 - \tau$, is simple and also widely used. Exponential, $f(\tau) = (\eta_{\min}/\eta_{\max})^{\tau}$, is MiniCPM's choice. The 1-sqrt shape, $f(\tau) = 1 - \sqrt{\tau}$, drops fast at the start of the cooldown and slows toward the end; Hägele et al. (2024) report that it "consistently outperforms linear decay" on their scaling-law benchmarks. Wu et al. (2024) propose an inverse shape $\eta_k = \eta / (2 + (k - k_s) \eta \gamma)$, derived from a local-quadratic argument aimed at maximising loss decrease over the decay phase.
+
+### Why the stable phase enables continued pretraining
+
+The constant-LR stable phase has two operational consequences that the cosine schedule cannot match.
+
+First, **the checkpoint at the end of the stable phase is a valid starting point for further training**. From a single pre-decay checkpoint, one can branch off and decay over $D_1$ steps for one compute budget, or continue the stable phase further and then decay over $D_2$ steps for a longer budget, or chain multiple decay tails for different downstream specialisations. The cosine schedule has no analogous branch point: by the time the LR has decayed meaningfully, the model has committed to one specific endpoint.
+
+Second, **the data mix can be switched at the start of the decay phase**. The high-LR stable phase uses the bulk pretraining mix; the decay phase uses a higher-quality curated mix — typically more math, code, instruction-like formatting, and high-quality web — to push the model into a better basin during the final commitment. MiniCPM and DeepSeek-V3 both exploit this. The decay tail is exactly where the model commits the parameter changes that will be permanent at inference time, so giving it the best data there is leverage. This connects forward to [annealing and stability](/textbook/01h-annealing-and-stability), where the "annealing phase" of frontier pretraining and the WSD decay tail are the same object viewed from two angles.
+
+### Decay-phase fraction
+
+How long should the decay phase be? MiniCPM (Hu et al. 2024) finds that 10% of the total tokens "is sufficient to achieve the best results" and that 2.5% "falls short". Hägele et al. (2024) echo this: a 20% cooldown matches cosine on final loss, and only longer fractions outperform; for very long training, "just 10k cooldown steps almost perfectly match cosine". The frontier-lab practice is at the higher end of this range. DeepSeek-V3 effectively uses 4.3T tokens of cosine decay out of 14.8T total, roughly 29% — somewhat longer than the MiniCPM optimum, partly because they continue with a constant-LR tail after the cosine. Kimi-K2 uses 5.5T tokens of decay out of 15.5T, roughly 35%.
+
+### The river-valley conjecture
+
+Wu et al. (2024) propose a geometric account of why WSD's loss curve looks "flat-then-cliff" — a long stretch of slow loss decrease during the stable phase, then a sharp drop during the cooldown. Their picture is a "river valley" loss landscape: a deep, narrow valley with a river along its floor. During the stable phase, the high learning rate keeps the iterate oscillating across the valley walls, producing a large "hill component" of the loss that masks the underlying progress along the floor. The model travels down the river during the stable phase; the cooldown collapses the hill component to zero, revealing the accumulated river-level progress as a sharp drop.
+
+The conjecture has empirical support at the 0.1B–1.2B scale; whether it generalises cleanly to 70B-plus is not yet established. The same paper proposes a variant called **WSD-S**, in which the post-decay checkpoint is reused as the next stable-phase initialization (with a brief re-warmup) rather than rolling back to the pre-decay branch point. WSD-S, they report, "empirically outperforms WSD and Cyclic-Cosine in obtaining multiple pretrained language model checkpoints across various compute budgets in a single run", at the same scales tested.
+
+### Frontier WSD instantiations
+
+MiniCPM-2.4B (Hu et al. 2024) is the canonical academic WSD run: exponential decay over the final 10% of tokens, peak LR $1 \times 10^{-2}$, batch 4M tokens, 1.1T total tokens. The match or beats cosine at the same total token budget motivates the rest of this section's discussion.
+
+DeepSeek-V2 (DeepSeek-AI 2024, arXiv:2405.04434) uses a step-decay variant of WSD: constant LR through the first 60% of tokens, then multiplied by $\sqrt{0.1} \approx 0.316$, again by the same factor at 90%. The two-step descent is operationally equivalent to a coarse cooldown.
+
+DeepSeek-V3 (DeepSeek-AI 2024, arXiv:2412.19437) uses a four-phase recipe that is best understood as WSD with an explicit constant tail: warmup over 2,000 steps from zero to $\eta_{\max} = 2.2 \times 10^{-4}$, constant at $\eta_{\max}$ until roughly 10T tokens, cosine decay from $2.2 \times 10^{-4}$ down to $2.2 \times 10^{-5}$ over the next 4.3T tokens, and a final constant tail at $7.3 \times 10^{-6}$ for the remaining tokens. The four-phase shape is documented in the V3 report's §4.2.
+
+Kimi-K2 (Moonshot 2025, arXiv:2507.20534) is explicit WSD with cosine decay: 500-step warmup to $\eta_{\max} = 2 \times 10^{-4}$, constant LR through 10T tokens, cosine decay to $\eta_{\min} = 2 \times 10^{-5}$ over the final 5.5T tokens. The short warmup is enabled by MuonClip's QK-clip mechanism, which makes the optimizer robust to the initial transients that warmup classically suppresses.
+
+The Power Scheduler (Shen et al. 2024) packages a WSD-shaped schedule with a closed-form formula for $\eta_{\max}$ that transfers across batch sizes and token counts; it is discussed in §[LR / batch-size interactions](#lr-batch-interactions).
+
+<Callout variant="info" title="Continual pretraining and the infinite schedule">
+Ibrahim et al. (2024) and Singh et al. (2025) push the WSD logic to its limit: drop the cooldown entirely and keep the LR constant forever, decaying only when one wants to deploy a specific checkpoint. The "infinite schedule" is the modern incarnation of the principle behind inverse-square-root, with a different motivation — continual pretraining on a growing corpus without committing to a fixed end. Singh et al. (2025) "Beyond Cosine Decay" validates this for continual pretraining across multiple stages.
+</Callout>
+
+---
+
+## Other schedules {#other-schedules}
+
+Two older schedule families remain in occasional use and deserve mention as historical context for why cosine and WSD won.
+
+### Inverse-square-root
+
+The original Transformer (Vaswani et al. 2017) used a schedule that was linear during warmup and inverse-square-root thereafter:
+
+$$\eta(t) = d_{\text{model}}^{-1/2} \cdot \min\!\left( t^{-1/2}, \, t \cdot T_w^{-3/2} \right).$$
+
+For $t < T_w$, the second term inside the minimum dominates and is linear in $t$; for $t > T_w$, the first term dominates and decays as $1/\sqrt{t}$. T5 (Raffel et al. 2020) uses the same family with a cleaner statement: linear warmup for $T_w$ steps, then $\eta(t) = \eta_{\max} / \sqrt{t / T_w}$. Adafactor with inverse-square-root was the canonical T5 recipe.
+
+The inverse-square-root schedule is principled in the convex-optimization sense. The Robbins-Monro conditions $\sum \eta_t = \infty$ and $\sum \eta_t^2 < \infty$ are satisfied by $\eta_t \propto 1/\sqrt{t}$, and for SGD with iterate averaging on a convex loss, this is the asymptotically optimal rate. The cosine and WSD schedules violate Robbins-Monro: cosine ends at a non-zero floor and WSD has a constant plateau.
+
+The reason inverse-square-root lost to cosine in LLM pretraining is operational. Fixed-budget training cares about the loss at the end, not about asymptotic averaging behaviour as $t \to \infty$. Cosine and WSD reach lower final loss for the same fixed compute, because they spend more of the budget at high learning rate and concentrate the decay where it matters. The Robbins-Monro guarantee is irrelevant when the training horizon is shorter than the convergence rate the theory governs.
+
+### Constant LR with end-decay
+
+Gopher 280B (Rae et al. 2021) used cosine decay; it is not an inverse-square-root instance but is often listed alongside it for historical completeness. The modern incarnation of the "constant LR" idea is the infinite schedule of Ibrahim et al. (2024), which is essentially WSD with the cooldown deferred indefinitely. The two are functionally identical from the perspective of any given checkpoint, differing only in whether and when one chooses to apply the decay.
+
+---
+
+## Schedule-free optimization {#schedule-free}
+
+The schedule-free approach of Defazio et al. (2024) — "The Road Less Scheduled," NeurIPS 2024 — removes the decay schedule entirely. Instead of decaying $\eta$ near the end of training, the method maintains two parameter sequences and reports a running average of them as the deployed model; the averaging itself plays the role that decay played in cosine and WSD.
+
+### The algorithm
+
+Schedule-Free AdamW maintains three sequences: a *base* sequence $z_t$ analogous to the standard AdamW iterate, an *evaluation* sequence $x_t$ that is a weighted average of $z$, and a *gradient-evaluation point* $y_t$ that is an interpolation between $z_t$ and $x_t$. The full update, reproducing Defazio et al.'s notation:
+
+```
+y_t   = (1 - β₁) z_t + β₁ x_t                          # gradient evaluated here
+g_t   ∈ ∂f(y_t, ζ_t)                                   # stochastic subgradient
+v_t   = β₂ v_{t-1} + (1 - β₂) g_t²                     # second moment (with bias correction)
+γ_t   = γ · min(1, t / T_warmup)                       # only schedule is warmup
+z_{t+1} = z_t − γ_t · g_t / (√v̂_t + ε) − γ_t · λ · y_t # base update; decay applied at y
+c_{t+1} = γ_t² / Σ_{i=1}^t γ_i²                        # online averaging weight
+x_{t+1} = (1 − c_{t+1}) x_t + c_{t+1} z_{t+1}          # Polyak-Ruppert-style average
+```
+
+The deployed model at the end of training is $x_{T+1}$, not $z_{T+1}$.
+
+### Why it works without a decay schedule
+
+When $\beta_1 = 0$, the gradient is evaluated at $y_t = z_t$ and the $x$ sequence is an exact equal-weighted average of the $z$ sequence — standard Polyak-Ruppert averaging. For $\beta_1 > 0$, gradients are evaluated at $y_t$, an interpolation between the latest base point and the long-running average; this is what gives the method momentum-like behaviour while keeping the average $x_t$ as the reported model. The averaging implicitly cools the model in the same sense that a decay schedule would: late-training steps are added to an average with a denominator that grows over time, so each new step has progressively less effect on the reported parameters.
+
+The compensation factor $c_{t+1} = \gamma_t^2 / \sum_{i=1}^t \gamma_i^2$ handles warmup: early steps with low $\gamma_t$ are down-weighted in the average, so the early high-noise gradients do not contaminate the eventual evaluation point.
+
+### Where schedule-free works, where it has not been validated
+
+Schedule-Free AdamW won the MLCommons 2024 AlgoPerf Self-Tuning track, outperforming cosine on WMT, ViT, FastMRI, and OGBG, and tying on Conformer and Criteo. On image classification and translation tasks it has reproduced cosine-level performance with no schedule tuning.
+
+For language modelling, the picture is less complete. Defazio et al. report that LM tasks require $\beta_1 = 0.98$ rather than the default $0.9$ — at $\beta_1 = 0.9$, "the loss started to increase rapidly" on NanoGPT-scale runs. BatchNorm-based architectures (Conformer, DeepSpeech) underperformed in their evaluation, since batch-norm running statistics cannot be cleanly updated on the averaged $x$ sequence during AlgoPerf evaluation; this issue does not arise for LayerNorm/RMSNorm transformers but is a reminder that the averaging interacts non-trivially with stateful normalization. The paper reports training curves on NanoGPT but does not include final validation-loss numbers comparable to a fully tuned cosine baseline.
+
+As of May 2026, **no major frontier lab has shipped a 70B-plus parameter schedule-free pretrain in a public technical report**. The approach has clear theoretical appeal — it removes the fixed-budget commitment of cosine, and unlike WSD it removes any cooldown at all — but transfer from the AlgoPerf benchmark scale (where the largest model is roughly 80M parameters) to frontier scale is unvalidated publicly. The chapter takes the position that schedule-free is the leading academic alternative as of May 2026 but is not yet a frontier-tested production recipe.
+
+<Callout variant="warning" title="Status of schedule-free at frontier scale">
+Schedule-Free AdamW is a strong academic result on benchmarks up to roughly 100M parameters and on non-LLM tasks at larger scale (AlgoPerf). It has not been reported by any frontier lab as the optimizer for a 70B-plus LLM pretrain as of May 2026. The transfer is open. The LM-specific need for $\beta_1 = 0.98$ rather than the AdamW-typical $0.9$ is itself evidence that the method does not transfer cleanly from non-LM benchmarks; the question of whether further tuning is needed at frontier scale remains unanswered in public.
+</Callout>
+
+---
+
+## Critical batch size {#critical-batch-size}
+
+The McCandlish et al. (2018) framework, "An Empirical Model of Large-Batch Training" (arXiv:1812.06162), gives the standard theoretical account of how batch size trades off against training duration. Two batch-size definitions and a hyperbola of efficiency are the central objects.
+
+### Gradient noise scale
+
+Let $g$ be the per-example gradient, $G = \mathbb{E}[g]$ the true gradient, and $\Sigma$ the per-example covariance. McCandlish defines the **simple noise scale**
+
+$$B_{\text{simple}} = \frac{\operatorname{tr}(\Sigma)}{|G|^2}$$
+
+and the **Hessian-weighted noise scale**
+
+$$B_{\text{noise}} = \frac{\operatorname{tr}(H \Sigma)}{G^\top H G}$$
+
+where $H$ is the Hessian at the current parameter. $B_{\text{simple}}$ is the dimensionless ratio of total per-coordinate gradient variance to gradient signal squared; $B_{\text{noise}}$ is the same ratio in the natural metric defined by the local quadratic, and reduces to $B_{\text{simple}}$ when $H \propto I$. Both quantities depend on the current parameter value $\theta$ — they are properties of the optimization landscape at the current point, not constants of the task.
+
+### The Pareto hyperbola
+
+Let $S(B)$ be the number of optimizer steps needed to reach a target loss with batch size $B$, and $E(B) = S(B) \cdot B$ the corresponding examples processed. McCandlish derives the joint behaviour:
+
+$$\frac{S(B)}{S_{\min}} = 1 + \frac{B_{\text{crit}}}{B}, \qquad \frac{E(B)}{E_{\min}} = 1 + \frac{B}{B_{\text{crit}}}$$
+
+where $B_{\text{crit}}$ is the critical batch size, $S_{\min}$ is the minimum steps achievable in the large-batch limit, and $E_{\min}$ is the minimum examples in the small-batch limit. Eliminating $B_{\text{crit}}$ between the two equations gives the compact form:
+
+$$\left( \frac{S}{S_{\min}} - 1 \right) \left( \frac{E}{E_{\min}} - 1 \right) = 1.$$
+
+This is the central equation of the McCandlish analysis. Three regimes follow.
+
+For $B \ll B_{\text{crit}}$, doubling the batch approximately halves the steps — linear strong scaling — and the examples processed is approximately unchanged. This is the regime where data parallelism is "free" in the sense that each extra GPU contributes a proportional speedup with no extra compute cost.
+
+For $B \gg B_{\text{crit}}$, doubling the batch processes twice as many examples without speeding up the wall-clock — pure waste. The optimizer is in the regime where the additional gradient samples are redundant; the gradient estimate is already accurate enough that more samples do not improve the next step.
+
+At $B = B_{\text{crit}}$, the two curves cross at the Pareto-optimal trade-off: paying a factor of 2 in compute (examples) for a factor of 2 in speed (steps). This is the operational definition of the critical batch size and is intentionally a softer notion than a hard threshold.
+
+### Empirical critical batch sizes (McCandlish 2018, Table 1)
+
+McCandlish report the following critical batch sizes across tasks (per their Table 1):
+
+<ComparisonTable
+  caption="Empirical critical batch sizes from McCandlish et al. (2018), Table 1. Units are examples (images, sentences, tokens, or frames depending on task)."
+  columns={["Task", "B_crit", "Unit"]}
+  rows={[
+    ["MNIST", "200", "images"],
+    ["SVHN", "500", "images"],
+    ["CIFAR-10", "900", "images"],
+    ["ImageNet", "15,000", "images"],
+    ["Billion Word LM", "100,000", "tokens"],
+    ["Atari", "400–8,000", "frames"],
+    ["Dota 1v1", "3,000,000", "frames"],
+    ["Dota 5v5", ">8,000,000", "frames"],
+  ]}
+/>
+
+The critical batch size varies by roughly five orders of magnitude across these tasks. Empirically, $B_{\text{crit}}$ is a property of the task and the optimization landscape at the current point, not a universal constant of the optimizer.
+
+### The 2024–2025 updates
+
+Zhang et al. (2024) "How Does Critical Batch Size Scale in Pre-training?" (arXiv:2410.21676) fit scaling laws to $B^*$ — the critical batch size operationalised as the inflection point on a per-step loss curve — across pretraining runs varying in model size and data:
+
+$$B^*(D) \approx 22.91 \cdot D^{0.47}$$
+
+with $D$ in billions of tokens, and
+
+$$B^*(N) \approx 93.20 \cdot N^{0.47}$$
+
+with $N$ in millions of parameters at the Chinchilla-optimal $D \approx 20 N$. When $D$ is held fixed instead of varying with $N$, the model-size exponent drops to roughly $0.087$ — critical batch size is *nearly invariant in $N$ when $D$ is fixed*. The practical implication is that **frontier CBS growth is driven by data scaling, not by model scaling**. A 70B-parameter model trained on 15T tokens has nearly the same CBS as a 70B model trained on 3T, but a substantially different CBS than the same model trained on 30T.
+
+Merrill et al. (2025) "Critical Batch Size Revisited" (arXiv:2505.23971), from Allen AI, provide a different and more pessimistic update from direct branched-training measurements on OLMo. Their findings:
+
+- CBS starts near zero at initialization.
+- CBS grows rapidly during the first roughly 50k tokens of training.
+- CBS plateaus around batch size 4,096 sequences at long horizons.
+- The McCandlish $B_{\text{simple}}$ proxy "underestimates CBS by several orders of magnitude" on LLM pretraining and is "unreliable as a CBS proxy". The SGD-era theory that produced $B_{\text{simple}}$ does not transfer cleanly to AdamW pretraining.
+- Using CBS-aware batch-warmup, they trained OLMo 1B to "the same (in fact, slightly better) loss with 43% fewer gradient steps".
+
+The Merrill et al. finding has two consequences. First, the McCandlish hyperbola survives as the right qualitative framework, but the $B_{\text{simple}}$ formula based on per-example gradient variance is not the right operational predictor for AdamW pretraining at scale. Second, the time-dependence of CBS — near zero at initialization, plateauing later — is the empirical basis for the batch-size ramps that all major frontier labs use, which the next section documents.
+
+<Sidenote>The McCandlish framework was developed in 2018 for SGD-trained vision and reinforcement-learning workloads. Its quantitative predictions for AdamW LLM pretraining are off by orders of magnitude in the Merrill et al. (2025) measurement; the hyperbola shape and the Pareto interpretation survive, the formula does not. The Zhang et al. (2024) empirical fit $B^* \propto D^{0.47}$ is more useful as a planning tool for setting frontier batch sizes than the $B_{\text{simple}}$ proxy.</Sidenote>
+
+---
+
+## Frontier batch-size practice and ramping {#batch-ramp}
+
+Public reports from 2023–2026 disclose effective per-step batch sizes — the product of sequence length, micro-batch per data-parallel replica, gradient accumulation, and data-parallel width — in the following ranges. Per-step batch is reported in tokens to enable cross-model comparison, with the unit (sequences or tokens) carefully tracked in the conversion.
+
+### The ladder
+
+- **7B-class dense.** Approximately 4M tokens per step. Llama-2 7B, MiniCPM-2.4B, and most academic 7B runs converge on this.
+- **13B-class dense.** Also approximately 4M tokens per step. Llama-2 13B uses 4M; some labs go higher, but 4M is the published median.
+- **70B-class dense.** 4M to 16M tokens. Llama-2 70B uses a constant 4M. Llama-3 70B reaches 16M via the same ramp used for the 405B model.
+- **Frontier dense.** Llama-3 405B reaches 16M tokens after its ramp.
+- **Frontier MoE.** 30M-plus tokens. DeepSeek-V3 reaches roughly 63M tokens per step at the end of its ramp (15,360 sequences of 4K each). Kimi-K2 trains at a constant 67M tokens. Sparse-expert models tolerate larger total batches because each expert sees roughly $B / E_{\text{active}}$, and the effective per-expert batch is the relevant quantity for expert-level CBS arguments — see the cross-reference to [MoE plumbing](/textbook/00h-moe-plumbing).
+
+### Why frontier labs ramp the batch size
+
+Two reasons. The first is the time-dependence of CBS that Merrill et al. (2025) document directly: critical batch size starts near zero at initialization, grows rapidly in the first roughly 50 billion tokens, and plateaus later. A constant large batch from step 1 wastes compute, because the model is in a regime where each gradient sample is highly informative and the optimizer would prefer many small steps. The second reason is engineering availability: nodes are sometimes added to a training cluster part-way through a run, and a stepwise increase in data parallelism corresponds naturally to a stepwise increase in batch size.
+
+### Specific disclosed ramps
+
+**Llama-3 405B (Grattafiori et al. 2024, §3.4.1)**. The Llama-3 herd paper documents the ramp verbatim: "initial batch size of 4M tokens and sequences of length 4,096 [...] doubled to a batch size of 8M sequences of 8,192 tokens after pre-training 252M tokens. We doubled batch size again to 16M after pre-training on 2.87T tokens." Three regimes: 4M tokens for the first 252M tokens of training, 8M for the next roughly 2.6T tokens, and 16M for the remaining roughly 12.7T tokens. The wording "8M sequences of 8,192 tokens" is the source of one easy source of confusion: 8M is the *token* batch, not the *sequence* batch.
+
+**DeepSeek-V2 (DeepSeek-AI 2024, §2.2)**. "Batch size is gradually increased from 2,304 to 9,216 in the training of the first 225B tokens, and then keeps 9,216 in the remaining training." The unit is sequences of length 4K, so the token batch ramps from approximately 9.4M to 37.7M tokens. The ramp factor is 4×.
+
+**DeepSeek-V3 (DeepSeek-AI 2024, §4.2)**. "Batch size is gradually increased from 3,072 to 15,360 in the training of the first 469B tokens, and then keeps 15,360 in the remaining training." Again sequences of 4K, so token batch ramps from approximately 12.6M to 62.9M tokens. The unit ambiguity (sequences vs. tokens) in the DeepSeek reports is worth flagging: the report does not explicitly state the units; they are inferred from the V2 architecture's sequence length and from the consistency of the compute budgets stated elsewhere in the report.
+
+**Kimi-K2 (Moonshot 2025)**. Constant 67M tokens per step throughout 15.5T tokens of training, with no ramp.
+
+**Llama-2 70B (Touvron et al. 2023)**. Constant 4M tokens per step, no ramp.
+
+**GPT-3 175B (Brown et al. 2020)**. Ramped from 32K tokens to 3.2M tokens over the first 4–12B tokens of training (the exact ramp profile is in Brown et al. Appendix B).
+
+**Qwen-3 (Yang et al. 2025)**. "A dynamic batch size strategy progressively scales the batch size at intervals of 125B tokens, following the sequence: 2M, 4M, 5M, and 6M". This is specific to one of their training stages; the full multi-stage Qwen-3 recipe is more complex and not fully disclosed.
+
+<Callout variant="warning" title="Batch units in tech reports">
+Frontier-lab tech reports inconsistently disclose batch sizes in tokens or in sequences, and sometimes ambiguously. DeepSeek-V2 and V3 use sequences of 4K; Llama-3 explicitly says "8M tokens" at one point and "sequences of 8,192" at another; Phi-4 reports "5,760" without disclosing whether it is sequences or tokens. When citing a batch size from a tech report, the unit should be carried explicitly. The chapter's comparison table at the end converts everything to tokens, with sequence-length assumptions noted.
+</Callout>
+
+---
+
+## LR / batch-size interactions {#lr-batch-interactions}
+
+When the batch size changes — either across runs at different scales or within a single run during a ramp — how should the learning rate change to preserve training dynamics? Two scaling rules dominate the literature, one for SGD and one for adaptive methods.
+
+### Linear scaling for SGD (Goyal et al. 2017)
+
+Goyal et al. (2017) "Accurate, Large Minibatch SGD" (arXiv:1706.02677) propose the linear scaling rule:
+
+> When the minibatch size is multiplied by $k$, multiply the learning rate by $k$.
+
+The justification is local linearity. If the parameters do not change much across $k$ small SGD steps at batch $B$ with learning rate $\eta$, the expected total update over those $k$ steps approximately equals one step of batch $kB$ at learning rate $k\eta$. The "if the parameters do not change much" assumption is doing the work; it is essentially a no-curvature assumption over the trajectory swept by the $k$ small steps.
+
+Goyal et al. validate this empirically on ResNet-50 ImageNet, scaling from batch 256 at LR 0.1 to batch 8,192 at LR 3.2. Linear scaling holds up to roughly batch 8K; "beyond 64k training diverges when using the linear learning rate scaling rule," which is the upper edge of the regime where the assumption holds. The rule is for SGD with momentum, not for Adam.
+
+### Square-root scaling for Adam (Malladi et al. 2022)
+
+Malladi et al. (2022) "On the SDEs and Scaling Rules for Adaptive Gradient Algorithms" (arXiv:2205.10287) derive the analogous rule for Adam by taking the SDE limit of the Adam update. From their **Definition 5.2**, the Adam scaling rule is: when $B \to \kappa B$, simultaneously update
+
+$$\eta \to \eta \sqrt{\kappa}, \quad \beta_1 \to 1 - \kappa(1 - \beta_1), \quad \beta_2 \to 1 - \kappa(1 - \beta_2), \quad \epsilon \to \epsilon / \sqrt{\kappa}.$$
+
+**Theorem 5.3** of the same paper shows that the trajectories under $(B, \eta, \beta_1, \beta_2, \epsilon)$ and $(\kappa B, \eta\sqrt{\kappa}, 1 - \kappa(1-\beta_1), 1 - \kappa(1-\beta_2), \epsilon/\sqrt{\kappa})$ are approximately equal, with error bounded by $O((1 + \kappa) \eta^2)$. The regime of validity is the noise-dominated regime $\sigma \gg |\nabla f|$, on a smooth loss with bounded-moment and low-skewness gradient noise.
+
+The intuition for $\sqrt{\kappa}$ rather than $\kappa$: Adam normalises by $\sqrt{\hat v_t}$, an EMA of squared gradients. Under a batch-size change by $\kappa$, the gradient noise variance scales as $1/\kappa$, so the gradient *standard deviation* scales as $1/\sqrt{\kappa}$. Adam's step magnitude in the noise-dominated regime is essentially $\eta$ times a normalised quantity whose typical size tracks the gradient SD. To preserve trajectory, $\eta$ must scale as $\sqrt{\kappa}$. For SGD the per-step variance reduction $1/\kappa$ is fully absorbed into a linear $\eta \to \kappa \eta$, because SGD does not normalise.
+
+The $\beta_1, \beta_2$ corrections preserve the *time horizon* of the EMA in wall-clock terms. When the batch grows by $\kappa$, each step covers $\kappa$ times as much data, so the EMA window measured in data — rather than in steps — should be $\kappa$ times shorter in step count. The transformation $\beta \to 1 - \kappa(1 - \beta)$ does exactly this in the SDE limit.
+
+### What frontier labs actually do
+
+The Malladi rule is the correct correction when porting a known-good hyperparameter set from one batch size to another. It is not what determines the headline learning rate of a frontier pretrain. Across Llama-2, Llama-3, DeepSeek-V2/V3, and Kimi-K2, the disclosed peak LRs do not show a clean $\sqrt{B}$ scaling — peak LR is set by stability constraints (the largest LR at which the model does not spike), and that ceiling is influenced more by model width, optimizer, and normalization choices than by batch size.
+
+Practically, frontier labs use the Malladi rule (or its variants) to *port* a hyperparameter sweep run at a small proxy batch up to the production batch, and use [μP](/textbook/01d-mup-and-transfer) to port across model widths. The combination gives a two-step transfer: tune at small width and small batch, port across widths via μP, port across batches via Malladi. The final $\eta_{\max}$ is then verified at production scale with a brief calibration run.
+
+The Power Scheduler (Shen et al. 2024, arXiv:2408.13359) packages this two-step transfer into a single closed-form rule:
+
+$$\eta_{\text{power}}(n) = \min\!\left( \eta_{\max}, \beta \cdot a \, n^b \right)$$
+
+with $b \approx -0.51$, so the LR decays as $1/\sqrt{n}$ in token count and scales linearly with batch via the $\beta$ multiplier. Combined with μP, the rule transfers across model sizes without sweeping.
+
+### Why $\sqrt{B}$ rather than $B$ for Adam: another angle
+
+Earlier work — Hoffer et al. (2017), Krizhevsky (2014) — argued for square-root SGD scaling on the basis of generalization arguments. Goyal et al.'s 2017 result that linear scaling works for SGD in the moderate-batch regime overturned this view for SGD specifically. The Malladi et al. derivation for adaptive methods recovers a $\sqrt{\kappa}$ rule by a different route: the normalisation in Adam absorbs one factor of $\sqrt{\kappa}$ that SGD does not.
+
+Granziol et al. (2022) give a random-matrix-theoretic account of the same phenomenon, arriving at the same $\sqrt{\kappa}$ conclusion for adaptive methods. The agreement across SDE-limit and random-matrix arguments is strong evidence that $\sqrt{\kappa}$ is the right scaling for Adam family methods in the noise-dominated regime.
+
+---
+
+## Gradient accumulation {#grad-accum}
+
+Gradient accumulation is the operational technique for training with effective batch size $kb$ when memory permits only $b$ per step. Compute $k$ forward-backward passes at micro-batch $b$, sum (or average) the gradients, and apply one optimizer step. The gradient passed to the optimizer is
+
+$$g_{\text{eff}} = \frac{1}{k} \sum_{i=1}^k g^{(i)}$$
+
+where $g^{(i)}$ is the mean gradient over micro-batch $i$.
+
+### The equivalence claim
+
+Training with $(b, k)$ accumulated gradients is statistically identical to training with batch $kb$ and one gradient computation, provided three conditions hold.
+
+First, no layer mixes statistics across micro-batches differently from how it would mix them across a single large batch. Transformer LLMs use LayerNorm or RMSNorm, both of which compute statistics within a single example along the channel dimension, so the condition is automatically satisfied. The condition would fail for BatchNorm — which is one reason vision-era discussions of gradient accumulation were more careful.
+
+Second, the loss is averaged across the batch, not summed. If the loss is summed, the gradient scaling is wrong by a factor of $k$ when accumulating; this is a common source of bugs in custom training loops. Most modern frameworks (PyTorch's `nn.CrossEntropyLoss` with default `reduction="mean"`, HuggingFace `Trainer` with the default settings) average by default, but custom losses should be checked.
+
+Third, numerical precision is sufficient. Accumulating $k$ gradients in BF16 can lose precision through repeated rounding; the standard fix is to accumulate into an FP32 master buffer and cast to BF16 only when applying the optimizer step. The PyTorch `mixed_precision` recipe and DeepSpeed/Megatron implementations all use FP32 accumulation by default for this reason.
+
+### The AdamW subtlety
+
+The equivalence holds for the gradient passed to the optimizer. The optimizer state updates once per accumulation cycle, not once per micro-batch, and this distinction creates several consequences worth tracking explicitly.
+
+**Momentum.** The first moment $m_t$ accumulates the averaged gradient $g_{\text{eff}}$, not $k$ separate updates. This is correct — it matches what a single big-batch step would do.
+
+**Bias correction.** Adam's bias correction $\hat{m}_t = m_t / (1 - \beta_1^t)$ uses $t$ as the number of optimizer steps, not the number of micro-batches. Correct.
+
+**Weight decay.** AdamW applies weight decay as $\theta \leftarrow \theta - \eta \lambda \theta$ once per optimizer step. With accumulation factor $k$, this happens $k$ times less often than per-micro-batch. To match a non-accumulated *big-batch* run with the same $\eta, \lambda$, this is correct. To match a non-accumulated *small-batch* run with the same $\eta, \lambda$, the effective weight decay is weaker by a factor of $k$. Usually one wants the former — the goal of gradient accumulation is to emulate large-batch behaviour — but the distinction is worth tracking when comparing runs at different accumulation factors.
+
+**Gradient clipping.** Global-norm gradient clipping should be applied to the accumulated gradient $g_{\text{eff}}$, not to each per-micro-batch gradient. The reason: under independence, per-micro-batch gradient norms shrink as $1/\sqrt{k}$ relative to the accumulated norm, so a uniform clip threshold applied per-micro-batch is roughly $\sqrt{k}$ too tight for the averaged gradient that the optimizer actually uses. Implementations that clip per-micro-batch silently apply a much more aggressive clip than the user intended.
+
+The status of these statements is "folklore correct": they are widely understood by practitioners and appear consistently in production training loops at HuggingFace, DeepSpeed, and the major frontier labs. A formal proof of the AdamW-with-momentum-with-weight-decay-with-accumulation equivalence does not appear in the published literature, but the operational equivalence with the conditions listed is the empirical consensus.
+
+### Pitfalls
+
+The two operational pitfalls that derail accumulated training most often are easy to state.
+
+**DDP gradient synchronization.** In PyTorch's `DistributedDataParallel`, gradients are all-reduced on each `.backward()` call. With $k$-step accumulation, the all-reduce should happen only on the last micro-step; for the first $k - 1$ micro-steps, the model's `no_sync()` context manager should suppress the reduction. Forgetting `no_sync()` multiplies inter-node communication by $k$, which can dominate wall-clock at large $k$ even though the gradients themselves are correct.
+
+**Activation checkpointing × accumulation.** Activation checkpointing recomputes the forward pass during backward; gradient accumulation does $k$ forward-backward passes per optimizer step. The two compose multiplicatively: $k$-step accumulation with activation checkpointing does each micro-step's forward pass twice. For the same effective batch size, total wall-clock is approximately $2k$ times a non-accumulated, non-checkpointed run. The trade-off is between memory (which checkpointing reduces) and wall-clock (which it expands); at frontier scale the trade is usually worth it, but the multiplicative interaction with accumulation needs to be priced in.
+
+---
+
+## Worked example: schedule for a 13B run {#worked-example}
+
+Concrete numbers tie the preceding sections together. The example: a 13B-parameter dense transformer, target loss matching Llama-2 13B, hardware of 512 H100 GPUs (80GB each) with NVLink-3 within each 8-GPU node and InfiniBand HDR across nodes, sequence length 8K, total token budget 3T.
+
+### Step 1 — Effective batch from memory
+
+At 13B parameters and 8K sequence length, the memory budget per H100 supports approximately micro-batch 4 with tensor-parallel degree 1. Per-step token count is then $4 \times 8{,}192 \times 512 = 16{,}777{,}216 \approx 16.8\text{M}$ tokens. Round to 16M tokens per step. Total optimizer steps without a ramp are $T = 3 \times 10^{12} / (16 \times 10^6) \approx 187{,}500$.
+
+### Step 2 — Batch ramp
+
+At end of training the Zhang et al. (2024) fit predicts $B^* \approx 22.91 \cdot 3000^{0.47} \approx 23 \cdot 41 \approx 940{,}000$ tokens, so the chosen batch of 16M tokens is roughly $17\times$ critical. This is far above the Pareto-efficient point — but for a frontier-style run wall-clock matters more than per-token compute efficiency, so going above $B_{\text{crit}}$ is the standard trade.
+
+The Ai2 (Merrill et al. 2025) finding that CBS starts near zero motivates a two-phase ramp. Use 4M tokens per step for the first 250B tokens (about 62,500 steps at the smaller batch), then 16M tokens per step for the remaining 2.75T tokens (about 172,000 steps). Total optimizer steps $T \approx 234{,}500$. The choice not to ramp through an intermediate 8M phase is operational: the additional phase boundary adds engineering complexity, and the Llama-3 evidence suggests two phases are sufficient when the small-batch phase is short.
+
+### Step 3 — Warmup
+
+Choose 2,000 steps of linear warmup, matching the Llama-2 and DeepSeek-V2/V3 convention. This is approximately 0.85% of total steps, well within the 0.05%–2% band. The warmup runs entirely within the 4M-token phase (which has 62,500 steps), so all the warmup-related cold-start instabilities are absorbed at the smaller batch where the per-step gradient is noisier and the smaller learning rate is easier to absorb.
+
+### Step 4 — Peak LR
+
+Three priors anchor the choice:
+
+- Llama-2 13B used $\eta_{\max} = 3 \times 10^{-4}$ at batch 4M.
+- DeepSeek-V2 (236B MoE with 21B active parameters; MoE typically tolerates a slightly larger LR) used $2.4 \times 10^{-4}$ at batch approximately 9M.
+- A Power Scheduler / μP extrapolation: if the small-batch tuning at 100B tokens and batch 4M gave $\eta = 3 \times 10^{-4}$, then at $3000\text{B}$ tokens and batch 16M the rule $\eta \propto T^{-1/2} \cdot B$ gives a scaling of $(3000/100)^{-1/2} \cdot (16/4) = (1/\sqrt{30}) \cdot 4 \approx 0.73$, suggesting $\eta_{\max} \approx 2.2 \times 10^{-4}$.
+
+Choose $\eta_{\max} = 2.5 \times 10^{-4}$, between the Llama-2 and DeepSeek-V2 anchors. Hold the peak LR constant through the batch ramp; the Malladi rule would suggest raising LR by $\sqrt{4} = 2\times$ when batch goes from 4M to 16M, but in frontier practice the warmup transient absorbs the change and labs typically hold the peak LR constant through ramps.
+
+### Step 5 — Schedule shape
+
+Use WSD with cosine decay, decay fraction 10%:
+
+- Warmup: steps 0 to 2,000, linear from 0 to $2.5 \times 10^{-4}$.
+- Stable: steps 2,000 to about 211,000, constant at $2.5 \times 10^{-4}$.
+- Cosine decay: steps 211,000 to 234,500, from $2.5 \times 10^{-4}$ down to $2.5 \times 10^{-5}$. This is a 10× drop, matching the "cosine to 10% of peak" convention historically used by GPT-3 and Llama-2 but with the more flexible WSD framing.
+
+During the decay phase, swap the data mix to the curated annealing mix. The decay tail is where the model commits the data-mix-dependent capabilities; this connects forward to [data and curriculum](/textbook/01a-data-pipeline) and [annealing and stability](/textbook/01h-annealing-and-stability).
+
+### Step 6 — Optimizer hyperparameters
+
+AdamW with $\beta_1 = 0.9$, $\beta_2 = 0.95$, $\epsilon = 10^{-8}$, weight decay $\lambda = 0.1$. These are the Llama-2 / Llama-3 / DeepSeek-V3 consensus values from the [optimizers chapter](/textbook/00f-optimizers#adamw). Gradient clipping at global norm 1.0. If using Muon for hidden weight matrices (Moonlight-style), the matrix LR should be approximately $10\times$ the embedding/head LR, with AdamW retained for the embedding and LM head.
+
+### Step 7 — Gradient accumulation
+
+At micro-batch 4 and 16M effective batch on 512 GPUs, the accumulation factor is $k = 16{,}777{,}216 / (4 \times 8{,}192 \times 512) = 1$. No accumulation is needed at full scale. If the run were halved to 256 GPUs, $k$ would be 2; at 128 GPUs, $k$ would be 4. The choice of 512 GPUs was designed in part to keep $k = 1$, avoiding the activation-checkpointing-times-accumulation cost discussed in §[gradient accumulation](#grad-accum).
+
+### Sanity checks
+
+The chosen batch of 16M tokens versus $B^* \approx 940$k gives a ratio of about $17\times$ — well above critical batch size, paying approximately $17\times$ the per-step compute over the Pareto-efficient point. That is the right trade for a wall-clock-constrained frontier run. The tokens-per-parameter ratio is $3 \times 10^{12} / 1.3 \times 10^{10} \approx 230$, consistent with the modern frontier practice of 100–200 tokens per parameter (well above the original Chinchilla 20:1). The LR-times-batch product $2.5 \times 10^{-4} \cdot 16 \times 10^6 = 4{,}000$ is within $2\times$ of Llama-3 70B's $1.5 \times 10^{-4} \cdot 16 \times 10^6 = 2{,}400$ — a reasonable consistency check.
+
+---
+
+## Frontier-lab recipes, May 2026 {#frontier-recipes}
+
+The following table reproduces the disclosed schedule and batch hyperparameters for the major public pretraining runs of 2020–2025, with every cell pulled verbatim from the respective tech report. Where a lab does not disclose a number, the cell reads "not disclosed". The batch column is normalised to tokens, with the sequence-length assumption used for the conversion stated in the notes column when needed.
+
+<ComparisonTable
+  caption="Frontier-lab pretraining schedules and batch sizes, 2020–2025. Numbers reproduced verbatim from each technical report. Batch normalised to tokens; sequence-length assumptions in notes column."
+  columns={["Model", "Year", "Schedule", "Max LR", "Warmup", "Batch (tokens)", "Batch ramp", "Decay shape", "Source"]}
+  rows={[
+    ["GPT-3 175B", "2020", "Cosine to 10%", "6e-5", "375M tokens", "3.2M", "32K → 3.2M over first 4–12B tokens", "Cosine", "Brown et al. 2020, arXiv:2005.14165, §B"],
+    ["Gopher 280B", "2021", "Cosine", "4e-5", "1,500 steps", "6M", "none", "Cosine to floor", "Rae et al. 2021, arXiv:2112.11446, §C"],
+    ["Llama-2 7B / 13B", "2023", "Cosine to 10%", "3e-4", "2,000 steps", "4M", "none", "Cosine to 10% floor", "Touvron et al. 2023, arXiv:2307.09288, §2.2"],
+    ["Llama-2 70B", "2023", "Cosine to 10%", "1.5e-4", "2,000 steps", "4M", "none", "Cosine to 10% floor", "Touvron et al. 2023, arXiv:2307.09288, §2.2"],
+    ["Mistral 7B", "2023", "not disclosed", "not disclosed", "not disclosed", "not disclosed", "not disclosed", "not disclosed", "Jiang et al. 2023, arXiv:2310.06825 (sparse disclosure)"],
+    ["MiniCPM-2.4B", "2024", "WSD (exp decay, 10% of tokens)", "1e-2", "implicit", "4M", "none", "Exponential 0.5^((s−S)/T)", "Hu et al. 2024, arXiv:2404.06395, §4"],
+    ["Llama-3 8B / 70B", "2024", "Cosine", "not fully disclosed", "8,000 steps", "up to 16M", "yes (similar to 405B)", "Cosine", "Grattafiori et al. 2024, arXiv:2407.21783, §3.4.1"],
+    ["Llama-3 405B", "2024", "Cosine to 1%", "8e-5 → 8e-7", "8,000 steps", "16M (after ramp)", "4M → 8M at 252M tok → 16M at 2.87T tok", "Cosine to 1% of peak", "Grattafiori et al. 2024, arXiv:2407.21783, §3.4.1"],
+    ["DeepSeek-V2 236B (21B active)", "2024", "WSD step-decay (×0.316 at 60% and 90%)", "2.4e-4", "2,000 steps", "≈9.4M → 37.7M (sequences × 4K)", "2,304 → 9,216 sequences over first 225B tok", "Two-step ×0.316 multipliers", "DeepSeek-AI 2024, arXiv:2405.04434, §2.2"],
+    ["Qwen 2.5 72B", "2024", "Cosine", "≈1.2e-4", "≈5% of steps", "≈1M (constant baseline; full ramp not fully disclosed)", "not fully disclosed in tech report", "Cosine", "Qwen team 2024, arXiv:2412.15115, §3.2"],
+    ["Phi-4 14B", "2024", "Linear warmup + linear decay", "3e-4", "not specified", "5,760 sequences ≈ 23.6M @ 4K", "not disclosed", "Linear", "Abdin et al. 2024, arXiv:2412.08905, §A"],
+    ["DeepSeek-V3 671B (37B active)", "2024", "Warmup → constant → cosine → constant tail", "2.2e-4 → 2.2e-5 → 7.3e-6", "2,000 steps", "≈12.6M → 62.9M (sequences × 4K)", "3,072 → 15,360 sequences over first 469B tok", "Cosine then constant tail", "DeepSeek-AI 2024, arXiv:2412.19437, §4.2"],
+    ["Kimi K2 (1T MoE, 32B active)", "2025", "WSD with cosine decay", "2e-4 → 2e-5", "500 steps", "67M (constant)", "none", "Cosine (last 5.5T of 15.5T)", "Moonshot 2025, arXiv:2507.20534"],
+    ["Qwen 3 235B-A22B", "2025", "Cosine (stage 1) + WSD-like (later stages)", "3.2e-4 (stage 1)", "linear over 500B tokens", "up to 6M (dynamic)", "2M → 4M → 5M → 6M every 125B tok", "Multi-stage", "Yang et al. 2025, arXiv:2505.09388"],
+  ]}
+/>
+
+Three observations from the table.
+
+The peak learning rates cluster in a narrow band — $1 \times 10^{-4}$ to $3 \times 10^{-4}$ for dense models, with MoE models a little lower at the active-parameter level. The variation is much smaller than batch sizes (which span $10\times$) or total token budgets (which span $50\times$). This is the empirical reflection of the observation in §[LR / batch interactions](#lr-batch-interactions) that peak LR is bounded by stability, and the stability ceiling has converged across labs.
+
+The schedule shape moves systematically over time: cosine through 2023, WSD or WSD-flavoured from 2024 onward. DeepSeek-V2 introduces step-decay WSD; MiniCPM popularises the standard form; DeepSeek-V3 and Kimi-K2 ship variations on cosine-decay WSD; Qwen-3 uses a multi-stage hybrid. By May 2026, cosine-without-WSD has effectively retired as a frontier choice.
+
+Batch sizes ramp upward and across labs concentrate in the 10M–70M token range. Llama-3 405B at 16M and Kimi-K2 at 67M bracket the range for dense and MoE respectively. The DeepSeek-V3 figure of approximately 63M tokens at peak (15,360 sequences of 4K each) is the largest disclosed batch for a dense-equivalent run, although the MoE structure makes the per-expert batch much smaller.
+
+Mistral 7B (Jiang et al. 2023) does not disclose its pretraining hyperparameters in its arXiv release, and the chapter does not invent numbers for that row. The sparse disclosure practice persists at Mistral through 2024; Qwen's tech reports are more complete but stop short of the per-step batch profile that DeepSeek and Llama-3 provide. The frontier landscape in May 2026 has roughly six labs that disclose pretraining schedules at the level of detail the chapter relies on (Meta, DeepSeek, Moonshot, Alibaba Qwen, Microsoft Phi, OpenBMB MiniCPM); the other half of the field — Anthropic, OpenAI, Google's flagship LLMs — does not.
+
+<Callout variant="note" title="MoE batch sizing and per-expert math">
+The largest batch sizes in the table belong to MoE models — Kimi-K2 at 67M tokens, DeepSeek-V3 at 63M tokens. The justification is that sparse-expert models route each token to a small subset of experts (typically 8 of 256 or similar), so each expert sees only $B / E_{\text{active}}$ of the total tokens. With $E_{\text{active}} = 8$, Kimi-K2's per-expert batch is roughly 8M tokens, comparable to a dense 70B's headline batch. The per-expert batch is the relevant quantity for the McCandlish CBS argument as applied to expert-level gradient noise. See [MoE plumbing](/textbook/00h-moe-plumbing) for the routing mechanics.
+</Callout>
+
+---
+
+## Chapter summary {#summary}
+
+- **Warmup is mandatory.** Linear warmup over 0.05%–2% of total steps damps the Adam-bias-correction insufficiency at $t=1$, cold-start attention degeneracy, and embedding-table sparsity. Frontier runs use 500 to 8,000 steps.
+- **Cosine to 10% (or to 1%) was the 2020–2023 standard; WSD is the 2024–2026 standard.** WSD's stable phase enables continued pretraining and data-mix switches at the start of the decay tail, and matches or beats cosine on final loss with 10%–35% of training spent in cooldown.
+- **Schedule-free optimization is academically validated but not yet shown at frontier scale.** Defazio et al. (2024) won the AlgoPerf self-tuning track, but no 70B-plus public pretrain has shipped a schedule-free configuration as of May 2026.
+- **Critical batch size is a property of the optimization landscape at the current point, not a constant of the task.** The McCandlish (2018) hyperbola $(S/S_{\min} - 1)(E/E_{\min} - 1) = 1$ is the right qualitative framework, but the $B_{\text{simple}}$ formula is unreliable as a quantitative predictor for AdamW pretraining — the Merrill et al. (2025) update finds it underestimates CBS by orders of magnitude.
+- **CBS grows with training data, not with model size.** The Zhang et al. (2024) fit $B^* \approx 22.91 \cdot D^{0.47}$ is the cleanest scaling law for batch size in pretraining. CBS is nearly invariant in $N$ when $D$ is fixed.
+- **Frontier labs ramp batch sizes upward.** Llama-3 405B ramps 4M → 8M → 16M; DeepSeek-V3 ramps 3,072 → 15,360 sequences. Kimi-K2 is the exception, with a constant 67M-token batch enabled by MuonClip's spike-prevention.
+- **LR scales with $\kappa$ for SGD (Goyal et al. 2017), with $\sqrt{\kappa}$ for Adam (Malladi et al. 2022 Definition 5.2).** The Adam rule is the correct correction when porting a tuned hyperparameter set across batch sizes; it is not what sets the headline peak LR, which is bounded by stability.
+
+---
+
+<Sources items={[
+  {
+    authors: "McCandlish, S., Kaplan, J., Amodei, D., OpenAI Dota Team",
+    year: 2018,
+    title: "An Empirical Model of Large-Batch Training",
+    venue: "arXiv:1812.06162",
+    url: "https://arxiv.org/abs/1812.06162",
+    note: "Critical batch size theory. Pareto hyperbola (S/S_min − 1)(E/E_min − 1) = 1. Simple noise scale B_simple = tr(Σ)/|G|². Empirical CBS table across tasks."
+  },
+  {
+    authors: "Shallue, C. J., Lee, J., Antognini, J. et al.",
+    year: 2019,
+    title: "Measuring the Effects of Data Parallelism on Neural Network Training",
+    venue: "JMLR 20:112",
+    url: "https://arxiv.org/abs/1811.03600",
+    note: "Pre-McCandlish empirical study of batch-size effects across model and dataset combinations. Establishes the convex-to-saturation curve."
+  },
+  {
+    authors: "Goyal, P., Dollár, P., Girshick, R. et al.",
+    year: 2017,
+    title: "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour",
+    venue: "arXiv:1706.02677",
+    url: "https://arxiv.org/abs/1706.02677",
+    note: "Linear scaling rule for SGD: LR ∝ B. Gradual warmup. ResNet-50 ImageNet validation up to batch 8K."
+  },
+  {
+    authors: "Krizhevsky, A.",
+    year: 2014,
+    title: "One Weird Trick for Parallelizing Convolutional Neural Networks",
+    venue: "arXiv:1404.5997",
+    url: "https://arxiv.org/abs/1404.5997",
+    note: "Original √B scaling proposal for SGD. Later overturned by Goyal et al. 2017 for SGD with momentum in the moderate-batch regime."
+  },
+  {
+    authors: "Hoffer, E., Hubara, I., Soudry, D.",
+    year: 2017,
+    title: "Train Longer, Generalize Better: Closing the Generalization Gap in Large Batch Training",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1705.08741",
+    note: "Argues for √κ for SGD on generalization grounds. Predates the Goyal et al. linear-rule result."
+  },
+  {
+    authors: "Malladi, S., Lyu, K., Panigrahi, A., Arora, S.",
+    year: 2022,
+    title: "On the SDEs and Scaling Rules for Adaptive Gradient Algorithms",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2205.10287",
+    note: "Adam scaling rule, Definition 5.2: η → η√κ, β₁ → 1 − κ(1−β₁), β₂ → 1 − κ(1−β₂), ε → ε/√κ. Theorem 5.3 trajectory equivalence."
+  },
+  {
+    authors: "Granziol, D., Zohren, S., Roberts, S.",
+    year: 2022,
+    title: "Learning Rates as a Function of Batch Size: A Random Matrix Theory Approach",
+    venue: "JMLR 23:173",
+    url: "https://arxiv.org/abs/2006.09092",
+    note: "Random-matrix-theoretic derivation of √κ scaling for adaptive methods. Independent route to the Malladi result."
+  },
+  {
+    authors: "Smith, S. L., Le, Q. V.",
+    year: 2018,
+    title: "A Bayesian Perspective on Generalization and Stochastic Gradient Descent",
+    venue: "ICLR 2018",
+    url: "https://arxiv.org/abs/1710.06451",
+    note: "Careful treatment of gradient noise from batch averaging. Foundation for the gradient-accumulation equivalence argument."
+  },
+  {
+    authors: "Vaswani, A. et al.",
+    year: 2017,
+    title: "Attention Is All You Need",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03762",
+    note: "Original Transformer. §5.3 introduces the inverse-square-root learning rate schedule with linear warmup."
+  },
+  {
+    authors: "Loshchilov, I., Hutter, F.",
+    year: 2017,
+    title: "SGDR: Stochastic Gradient Descent with Warm Restarts",
+    venue: "ICLR 2017",
+    url: "https://arxiv.org/abs/1608.03983",
+    note: "Original cosine annealing schedule. Warm-restart formulation; GPT-era practice keeps the half-cosine and drops the restarts."
+  },
+  {
+    authors: "Raffel, C. et al.",
+    year: 2020,
+    title: "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer",
+    venue: "JMLR 21:140",
+    url: "https://arxiv.org/abs/1910.10683",
+    note: "T5 paper. Uses inverse-square-root LR schedule with Adafactor. Canonical pre-2023 pretraining recipe."
+  },
+  {
+    authors: "Shazeer, N., Stern, M.",
+    year: 2018,
+    title: "Adafactor: Adaptive Learning Rates with Sublinear Memory Cost",
+    venue: "ICML 2018",
+    url: "https://arxiv.org/abs/1804.04235",
+    note: "Adafactor optimizer. Often paired with inverse-square-root schedule in T5-style training."
+  },
+  {
+    authors: "Liu, L., Liu, X., Gao, J., Chen, W., Han, J.",
+    year: 2020,
+    title: "On Layer Normalization in the Transformer Architecture",
+    venue: "ICML 2020",
+    url: "https://arxiv.org/abs/2002.04745",
+    note: "Documents why Post-LN transformers require warmup and Pre-LN can do without. Pre-LN/Post-LN cold-start instability analysis."
+  },
+  {
+    authors: "Hu, S., Tu, Y., Han, X. et al.",
+    year: 2024,
+    title: "MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies",
+    venue: "arXiv:2404.06395",
+    url: "https://arxiv.org/abs/2404.06395",
+    note: "WSD schedule proposal. Exponential decay 0.5^((s−S)/T). 10%-of-tokens decay phase finding. Match-or-beat cosine result."
+  },
+  {
+    authors: "Hägele, A., Bach, F., Pagliardini, M., Jaggi, M.",
+    year: 2024,
+    title: "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations",
+    venue: "NeurIPS 2024 (Spotlight)",
+    url: "https://arxiv.org/abs/2405.18392",
+    note: "Quantitative case against cosine for scaling-law sweeps. 50% compute savings with WSD branching. 1-sqrt decay shape recommendation."
+  },
+  {
+    authors: "Wu, Y., Owen, A., Belilovsky, E., Rish, I.",
+    year: 2024,
+    title: "Understanding Warmup-Stable-Decay Learning Rates: A River Valley Loss Landscape Perspective",
+    venue: "arXiv:2410.05192",
+    url: "https://arxiv.org/abs/2410.05192",
+    note: "River-valley conjecture for WSD's flat-then-cliff loss curve. WSD-S variant proposal. 0.1B–1.2B scale validation."
+  },
+  {
+    authors: "Defazio, A., Yang, X. A., Mehta, H., Mishchenko, K., Khaled, A., Cutkosky, A.",
+    year: 2024,
+    title: "The Road Less Scheduled",
+    venue: "NeurIPS 2024",
+    url: "https://arxiv.org/abs/2405.15682",
+    note: "Schedule-Free AdamW. Three-sequence interpolation (y, z, x). Won MLCommons 2024 AlgoPerf Self-Tuning track. LM tasks require β₁ = 0.98."
+  },
+  {
+    authors: "Ibrahim, A. et al.",
+    year: 2024,
+    title: "Simple and Scalable Strategies to Continually Pre-train Large Language Models",
+    venue: "TMLR 2024",
+    url: "https://openreview.net/forum?id=DimPeeCxKO",
+    note: "Infinite/constant LR schedule for continual pretraining. Replay strategy. Flatter minima vs cosine."
+  },
+  {
+    authors: "Singh, A., Janson, P., Mehrbod, S. et al.",
+    year: 2025,
+    title: "Beyond Cosine Decay: On the Effectiveness of Infinite Learning Rate Schedule for Continual Pre-Training",
+    venue: "CoLLAs 2025",
+    url: "https://arxiv.org/abs/2503.02844",
+    note: "Validation of infinite schedule for multi-stage continual pretraining."
+  },
+  {
+    authors: "Shen, Y., Wang, S., Tan, S. et al.",
+    year: 2024,
+    title: "Power Scheduler: A Batch-Size and Token-Number Agnostic Learning Rate Scheduler",
+    venue: "arXiv:2408.13359",
+    url: "https://arxiv.org/abs/2408.13359",
+    note: "IBM Power Scheduler. Closed-form WSD-shaped η_power(n) = min(η_max, β·a·n^b) with b ≈ −0.51. Transfers across batch sizes and token counts when combined with μP."
+  },
+  {
+    authors: "Zhang, H. et al.",
+    year: 2024,
+    title: "How Does Critical Batch Size Scale in Pre-training?",
+    venue: "arXiv:2410.21676",
+    url: "https://arxiv.org/abs/2410.21676",
+    note: "Scaling-law fit B* ≈ 22.91·D^0.47 in billions of tokens. CBS nearly invariant in N when D fixed. Frontier CBS growth driven by data scaling."
+  },
+  {
+    authors: "Merrill, W. et al. (Allen AI)",
+    year: 2025,
+    title: "Critical Batch Size Revisited",
+    venue: "arXiv:2505.23971",
+    url: "https://arxiv.org/abs/2505.23971",
+    note: "Direct branched-training CBS measurement on OLMo. CBS plateaus around 4,096 sequences. B_simple underestimates by orders of magnitude. 43% step reduction via CBS-aware batch warmup."
+  },
+  {
+    authors: "Brown, T. et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "GPT-3 175B. Cosine to 10% of peak, peak LR 6e-5, warmup over 375M tokens. Batch ramps from 32K to 3.2M tokens over the first 4–12B tokens."
+  },
+  {
+    authors: "Rae, J. W. et al.",
+    year: 2021,
+    title: "Scaling Language Models: Methods, Analysis & Insights from Training Gopher",
+    venue: "arXiv:2112.11446",
+    url: "https://arxiv.org/abs/2112.11446",
+    note: "Gopher 280B. Cosine schedule, peak LR 4e-5, 1,500-step warmup, batch 6M tokens, 300B total tokens."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "Llama-2 7B/13B at peak LR 3e-4; 70B at 1.5e-4. AdamW β=(0.9, 0.95), λ=0.1. Cosine to 10% of peak. 2,000-step warmup. 4M-token batch."
+  },
+  {
+    authors: "Grattafiori, A. et al. (Meta Llama Team)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3 405B. Peak LR 8e-5, cosine to 1% (8e-7 floor), 8,000-step warmup. Batch ramp 4M → 8M @ 252M tokens → 16M @ 2.87T tokens."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "DeepSeek-V2 236B/21B MoE. WSD step-decay (×0.316 at 60% and again at 90% of training). Peak LR 2.4e-4. Batch ramp 2,304 → 9,216 sequences over first 225B tokens."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "DeepSeek-V3 671B/37B MoE. 4-phase schedule: warmup 2,000 steps → constant 2.2e-4 → cosine to 2.2e-5 over 4.3T tokens → constant tail at 7.3e-6. Batch ramp 3,072 → 15,360 sequences over first 469B tokens. 14.8T total tokens."
+  },
+  {
+    authors: "Moonshot AI",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "Kimi K2 1T MoE / 32B active. WSD with cosine decay. Peak LR 2e-4, floor 2e-5. 500-step warmup (enabled by MuonClip). Constant 67M-token batch through 15.5T total tokens."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "Qwen 2.5 72B. Cosine schedule. Peak LR and batch profile not fully disclosed in tech report; secondary sources suggest peak ≈1.2e-4 and 1M-token baseline batch."
+  },
+  {
+    authors: "Yang, A. et al.",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Qwen 3 235B-A22B. Multi-stage schedule with cosine stage 1 (peak 3.2e-4) and WSD-like later stages. Dynamic batch ramp 2M → 4M → 5M → 6M every 125B tokens. 36T total tokens across stages."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "Phi-4 14B. Linear warmup + linear decay. Peak LR 3e-4. Batch 5,760 sequences (≈23.6M tokens at 4K seq-len). Approximately 10T total tokens."
+  },
+  {
+    authors: "Jiang, A. Q. et al.",
+    year: 2023,
+    title: "Mistral 7B",
+    venue: "arXiv:2310.06825",
+    url: "https://arxiv.org/abs/2310.06825",
+    note: "Mistral 7B. Pretraining hyperparameters not disclosed in the arXiv release. Cited as the canonical example of sparse-disclosure practice in 2023–2024."
+  },
+  {
+    authors: "Liu, J. et al.",
+    year: 2025,
+    title: "Muon is Scalable for LLM Training (Moonlight)",
+    venue: "arXiv:2502.16982",
+    url: "https://arxiv.org/abs/2502.16982",
+    note: "Moonlight 16B MoE (3B active) on 5.7T tokens. First public production-scale validation of Muon. Matrix LR ≈10× embedding LR; AdamW retained for embedding and LM head."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 WSD recipe (3B / 11.2T / WSD-10%-linear)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Warmup 2,000 steps; constant phase 0–10T; linear decay over final 10%; GBS=2.36M tokens; peak LR 2e-4. Constant batch (no ramp) — 3B-class anchor."
+  },
+  {
+    authors: "Bekman, S.",
+    year: "ongoing",
+    title: "Machine Learning Engineering open book — performance and gradient accumulation",
+    venue: "github.com/stas00/ml-engineering",
+    url: "https://github.com/stas00/ml-engineering/blob/master/training/performance/README.md",
+    note: "Gradient-accumulation throughput benchmark: 20–30% improvement and 8× comms-overhead reduction at GAS=8 vs GAS=1."
+  }
+]} />

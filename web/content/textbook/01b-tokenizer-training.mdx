@@ -1,0 +1,627 @@
+---
+slug: 01b-tokenizer-training
+title: Tokenizer training at frontier scale
+description: Vocab size selection, multilingual fertility, glitch-token prevention, and the 2024–2026 frontier tokenizer landscape.
+order: 12
+chapter: 11
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 38
+depends_on: [00g-tokenization-and-objectives, 00d-normalization-and-init]
+provides: [vocab-size-scaling, glitch-tokens, multilingual-fertility, pretokenization]
+last_reviewed: 2026-05-11
+---
+
+## A Day-0 pretraining decision {#orientation}
+
+The tokenizer is the first artefact that has to exist in a frontier pretraining run. It is built before the first parameter is initialised, and it is frozen for the lifetime of the model: every token ID emitted at inference time refers back to a merge table that was decided weeks before the first GPU touched the corpus. The prerequisite chapter [BPE basics](/textbook/00g-tokenization-and-objectives#bpe) covers what byte pair encoding *is*, what `▁` means in SentencePiece, and what makes a glitch token a glitch token. This chapter is the training recipe — what a lab actually does between "the data pipeline has produced a 15-trillion-token cleaned corpus" and "a 200k-entry tokenizer is shipping in production."
+
+The chapter has eight sections. § [Tokenizer as a pretraining decision](#tokenizer-as-decision) frames what is at stake. § [Vocab-size selection](#vocab-size) presents the Tao et al. (2024) scaling law, which is the cleanest existing extension of Chinchilla into the vocabulary dimension. § [Training-corpus selection](#tokenizer-corpus) covers what one trains the tokenizer on, which is *not* the same thing as the model's training corpus. § [Pre-tokenization](#pretokenization) reproduces the GPT-2, Llama-3, and DeepSeek-V3 regexes verbatim. § [Glitch tokens](#glitch-tokens-prevention) describes the 2025–2026 mitigation stack. § [Multilingual considerations](#multilingual) covers fertility, parity, and Rényi efficiency. § [Frontier comparison](#frontier-table) is a wide table of seventeen tokenizers across the field as of May 2026. § [Worked example](#worked-example) walks through a HuggingFace `tokenizers` BpeTrainer run and produces a compression curve.
+
+<Callout variant="note" title="Calibration date">
+Content calibrated to frontier-model practice as of May 11, 2026. Vocabulary sizes, regex patterns, and the comparison table age fastest; the Tao et al. scaling law and the structure of glitch-token mitigations are stable. The notation $V$ denotes vocabulary size; $N$ parameter count; $D$ pretraining tokens; $C$ compute (FLOPs); $L$ per-token cross-entropy in nats; $d$ the residual stream dimension.
+</Callout>
+
+---
+
+## Tokenizer as a pretraining decision {#tokenizer-as-decision}
+
+### What is downstream of the tokenizer
+
+Once the tokenizer is frozen, five separable quantities are determined by it before the model has been trained at all.
+
+The first is the **sequence-length distribution of the pretraining corpus**. A Chinchilla-style data budget of $D$ tokens corresponds to a specific number of bytes only after the tokenizer fixes the bytes-per-token compression ratio. A 15-trillion-token corpus at 4.5 bytes/token is 67.5 TB; at 5.0 bytes/token it is 75 TB. Choosing a coarser tokenizer makes the same compute buy more text content — but only if the model can still learn from it.
+
+The second is the **embedding parameter budget**. The input matrix $E \in \mathbb{R}^{V \times d}$ and (if untied) the output matrix $W_U \in \mathbb{R}^{d \times V}$ contribute $V \cdot d$ parameters each. At $d = 4096$ and $V = 200{,}000$, that is $8.19 \times 10^8 \approx 0.82$ B parameters per matrix. For a 7B-class model this is more than a tenth of total parameters; for a 70B-class model it is barely 1%. The accounting only gets sharper for MoE models, where the embedding tables are shared across experts and the relative cost of a large $V$ is *lower* than for a dense model of equal active-parameter count.
+
+The third is the **unit in which loss is measured**. Cross-entropy in nats per token is the metric reported in every modern pretraining log, but the *token* is a tokenizer-dependent unit. Two models with different vocabularies are not directly loss-comparable. Bits-per-character is the only tokenizer-agnostic loss, and even BPC depends on the model's effective compression, which is itself shaped by the tokenizer.
+
+The fourth is the **inference cost on user traffic**. Every API request is billed in tokens. A 1.3× fertility difference on Hindi between two tokenizers translates into a 1.3× pricing differential. Sander Land's 2026 cost analysis of the new Claude Opus 4.7 tokenizer measures this directly: the new tokenizer needs roughly 1.0–1.35× more tokens than its predecessor for typical English-only input, but 20–35% fewer tokens for Mandarin, Japanese, Korean, Arabic, and Hindi — a deliberate redistribution of the "language tax" across the API price list.
+
+The fifth is the **downstream evaluation surface**. The most-cited concrete case is arithmetic. GPT-4's arithmetic accuracy changed materially when commas were inserted into multi-digit numbers, because `cl100k_base` groups digits in chunks of one to three and that grouping interacts with the right-to-left structure of multi-digit arithmetic. Singh & Strouse (2024) showed that left-padding numbers and forcing a fixed grouping recovers several points of accuracy without retraining the model — a tokenizer-induced effect, not a model-capability effect.
+
+### Frontier practice (May 2026)
+
+Every published frontier recipe of 2024–2026 — DeepSeek-V3, Llama-3.x, Llama-4, Qwen3, OLMo-2, Mistral-NeMo, Kimi-K2 — spends a paragraph in its technical report on tokenizer rationale. The 2022 hand-me-down practice of "use the BERT or GPT-2 tokenizer and don't worry about it" has been abandoned. Ali et al. (2024) demonstrated up to **68% additional training cost** from inheriting an English-centric tokenizer for a multilingual model at the 2.6-B-parameter scale — the largest quantitative case for the tokenizer being a Day-0 decision rather than a Day-100 detail.
+
+A 2025 research direction worth flagging is the decoupling of input and output vocabularies. The forward direction of [scaling laws](/textbook/01c-scaling-laws) treats $V$ as a single number that costs $V \cdot d$ at both ends of the model. Huang et al. (ByteDance Seed, 2025) point out that the *input* embedding lookup costs effectively nothing at inference time — one lookup per token — while the output softmax cost is real. Their *Over-Tokenized Transformer* decouples the two and finds a strictly log-linear loss reduction as input vocabulary scales independently. They push input vocab to 12.8 M via hierarchical 1-/2-/3-gram embeddings and match the loss of a model twice the size with no extra inference cost. As of May 2026 no production frontier model has shipped a fully decoupled input vocabulary, but the result is the leading academic challenge to the single-$V$ assumption that the rest of this chapter operates under.
+
+---
+
+## Vocab-size selection {#vocab-size}
+
+### The scaling-laws-with-vocabulary result {#vocab-scaling-law}
+
+The cleanest available answer to "what should $V$ be?" is Tao, Sang, Wong & Lin (NeurIPS 2024). They ran the first systematic IsoFLOPs sweep over vocabulary size, training models from 33 M to 3 B non-vocabulary parameters on up to 500 B characters of data, with vocabularies from roughly 4 k to 96 k. The headline finding is uncomfortable for the prevailing practice of the era: **frontier models had been shipping with vocabularies systematically too small**, and the gap widens with scale.
+
+Tao et al. present three complementary fits. Each uses a different parameterisation; all three converge on the same conclusion. State the result, then the math, then the predictions.
+
+**State.** Vocabulary parameters should scale with compute, but *more slowly* than non-vocabulary parameters. The compute-optimal vocabulary share of total parameters therefore decreases with scale — but in absolute terms larger models still want larger vocabularies.
+
+**Math (Approach 1, IsoFLOPs).** Let $C$ be the FLOP budget. Tao et al.'s compute-optimal allocation is
+
+$$N_{nv} = 0.08 \cdot C^{0.50}, \qquad N_v = 0.20 \cdot C^{0.42}, \qquad H = 6.42 \cdot C^{0.50}$$
+
+where $N_{nv}$ is non-vocabulary parameters, $N_v$ is vocabulary parameters (one $V \cdot d$ matrix), and $H$ is training data measured *in characters* — not tokens, because using tokens would conflate the variable being studied with the predictor.
+
+The ratio of the two exponents is $\gamma = 0.42 / 0.50 = 0.84$. For every order of magnitude added to $N_{nv}$, only about $10^{0.84} \approx 6.9 \times$ more vocabulary parameters are warranted.
+
+**Math (Approach 2, practical re-expression).** Given a chosen non-vocabulary budget $N_{nv}$, the compute-optimal vocabulary parameters are
+
+$$N_v^{\text{opt}} = N_v^0 \cdot \left( \frac{N_{nv}}{N_{nv}^0} \right)^{\gamma}, \qquad \gamma \approx 0.83$$
+
+with $(N_{nv}^0, N_v^0)$ taken as an empirically anchored reference point from their fit. The slight difference between 0.83 and 0.84 reflects two different fitting strategies on the same data; the practical guidance is the same.
+
+**Math (Approach 3, parametric loss surface).** A Chinchilla-style loss decomposition with an explicit vocabulary term:
+
+$$\mathcal{L}_u = -E + \frac{A_1}{N_{nv}^{\alpha_1}} + \frac{A_2}{N_v^{\alpha_2}} + \frac{B}{D^{\beta}}$$
+
+Tao et al. fit $A_1 = 1.831$, $A_2 = 0.196$, $B = 2.124$, $E = 5.533$, $\alpha_1 = \beta = 0.447$, $\alpha_2 = 0.671$. Again $D$ is in characters. The exponent on $N_v$ ($\alpha_2 = 0.671$) is larger than the exponent on $N_{nv}$ ($\alpha_1 = 0.447$) — meaning the marginal loss improvement from a bit more $N_v$ is larger than from a bit more $N_{nv}$ *at small $V$*, but the asymmetry inverts because $N_v$ also grows faster on a unit-of-$V$ basis.
+
+### Predicted optima
+
+Plugging into all three fits, Tao et al. report a consistent picture (their Table 1):
+
+| Model size $N_{nv}$ | $V_{\text{opt}}$ (Approach 1) | $V_{\text{opt}}$ (Approach 2) | $V_{\text{opt}}$ (Approach 3) |
+|---|---|---|---|
+| 7 B  | 62 k  | 67 k  | 60 k  |
+| 13 B | 83 k  | 91 k  | 81 k  |
+| 70 B | 212 k | 231 k | 218 k |
+
+The strongest empirical statement in the paper is that **Llama-2-70B shipped with $V = 32{,}000$ and should have used $V \approx 216{,}000$** — roughly $7 \times$ larger.
+
+<Callout variant="warning" title="The 70B prediction is an extrapolation">
+Tao et al.'s largest training run is 3 B parameters. The 7 B / 13 B / 70 B optima in the table above are extrapolations of their fitted laws; no independent replication at 70 B+ has been published as of May 2026. Treat the numerical predictions as a directional guide, not a measurement.
+</Callout>
+
+### Why Llama-3 chose $V = 128{,}000$ despite Tao predicting ~60k
+
+A reader applying Tao's Approach 1 to a 7-B Chinchilla-optimal model at $C = 1.4 \times 10^{23}$ FLOPs computes
+
+$$N_v = 0.20 \cdot (1.4 \times 10^{23})^{0.42} \approx 1.8 \times 10^9$$
+
+vocabulary parameters. At $d = 4096$ this gives $V \approx 60{,}000$–$70{,}000$ — consistent with the table. Llama-3-8B shipped with $V = 128{,}256$. By Tao's English-only criterion this is *over-vocabulary*. Two factors recover the choice. First, Meta's Llama-3 uses **untied** input and output embeddings, so the embedding parameter count is symmetric across the two endpoints and the budget covers two functions, not one — see [embedding init](/textbook/00d-normalization-and-init#embedding-init) for the structural reason untying matters at scale. Second, and more important, Tao et al.'s fit is on an English-heavy corpus; Llama-3's target included roughly thirty languages and code, which pull the optimum upward in ways the Tao fit does not capture. The gap between 60 k and 128 k is *almost entirely the multilingual budget*. § [Multilingual considerations](#multilingual) below quantifies how that budget is spent.
+
+### The over-tokenized refinement
+
+Huang et al. (ByteDance Seed, 2025) revisit Tao's assumption of a single $V$ used for both input and output. They decouple input and output vocabularies and find that *input-only* vocabulary scaling is **strictly log-linear** in loss reduction — far stronger than the diminishing-returns shape Tao reports for joint scaling. They push input vocabulary to 12.8 M (via hierarchical 1-, 2-, and 3-gram embeddings indexed in a learned lookup) while keeping the output vocabulary at conventional size, and recover the loss of a model twice the size with no extra inference cost. The output vocabulary still follows Tao's scaling. As of May 2026 production frontier models still use a tied or untied $V \cdot d$ matrix, so the practical relevance of Huang et al. is forward-looking — but it suggests the field's notion of "vocabulary scaling" may bifurcate into separate input and output curves by 2027.
+
+---
+
+## Training-corpus selection for the tokenizer {#tokenizer-corpus}
+
+The tokenizer is trained on a *sample* of text. That sample's distribution is what determines which merges exist. If the sample's distribution differs from the model's training corpus distribution, three things go wrong, in increasing severity: vocabulary slots are wasted on material the model never sees; fertility imbalance allocates tokens to English at the cost of Hindi or Arabic or code; and orphaned vocabulary entries become the [glitch tokens](#glitch-tokens-prevention) discussed below.
+
+### The "match the model's data" rule
+
+DeepSeek-V3's technical report is explicit on this point: "the pretokenizer and training data for the tokenizer are modified to optimize multilingual compression efficiency." In practice this means the tokenizer is re-trained on a fresh multilingual sample of the V3 corpus, not inherited from V2. Llama-3 and Llama-4 do not publish the exact sampling weights used for tokenizer training, but the produced vocabulary's distribution of merges shows the same Reddit / Common-Crawl signature as the model's pretraining mix. The frontier consensus as of 2025–2026 is that *for frontier-budget labs*, tokenizer training is no longer a one-time event reused across model generations — it is run fresh on a sample of the **final, filtered pretraining corpus that the model will actually see**. Smaller and follow-on labs commonly inherit existing tokenizers as a deliberate cost-control measure: HuggingFace's SmolLM3 (2025) reuses the Llama-3.2 128k tokenizer unchanged (with only the `bos_token` removed), an explicit counter-example to corpus-matched retraining at 3B scale. The interaction with the upstream [data pipeline](/textbook/01a-data-pipeline) is critical: tokenizer training happens after deduplication, PII filtering, and quality scoring, so the byte distribution the tokenizer sees is the byte distribution the model sees.
+
+### Over- and under-representation in the tokenizer sample
+
+Three categories of material are deliberately oversampled relative to the model's pretraining mix.
+
+**Code.** Code is poorly tokenized by an English-trained BPE: long identifiers split into five or six pieces, and whitespace runs are not handled cleanly. Dagan, Synnaeve & Rozière (Meta, ICML 2024) showed that specialising the tokenizer for code recovers HumanEval performance "for free" — on the order of +3–6 points pass@1 at the 7-B scale, achieved entirely by changing the tokenizer with no change to the model. As a result, frontier tokenizer-training mixes in 2026 contain roughly **15–25%** code, while the model's pretraining mix is typically 5–15% code. Code is therefore over-represented in the tokenizer's view of the world by a factor of roughly two.
+
+**Long-tail multilingual material.** Ali et al. (NAACL 2024) found that a multilingual tokenizer covering the top five European languages needs roughly **3×** the vocabulary of an English-only tokenizer to achieve comparable per-language fertility. The economical solution is to oversample the long-tail languages during tokenizer training so that their characters and frequent morphemes earn merges. A typical recipe oversamples low-resource languages by 5–10× relative to their share in the model's training corpus. Land's 2024 *Data Mixture Inference* paper applied reverse inference to `o200k_base` and concluded that OpenAI's GPT-4o tokenizer was trained on roughly 39% non-English data spanning 67 languages with at least 0.1% presence each — a substantial multilingual oversample relative to GPT-4o's pretraining mix.
+
+**Math and formal content.** Pre-tokenization of digits and operators is now near-universal — split digits into chunks of at most three, force spaces around operators. The tokenizer training sample is typically 3–8% math/formal content (vs. 2–5% in the model corpus), and the pre-tokenization regex does the rest of the work.
+
+### Inferred frontier mix templates
+
+No frontier lab publishes the exact composition of its tokenizer-training sample. The following template is synthesised from published per-tokenizer compression ratios and from Land's reverse-inference work; treat it as a representative *inferred* mix, not as fact.
+
+<ComparisonTable
+  caption="Inferred composition of frontier tokenizer-training samples versus the model's pretraining mix, May 2026. Shares estimated from published compression measurements and reverse inference, not from disclosed lab recipes."
+  columns={["Material", "Tokenizer-training share", "Model-training share (typical)", "Notes"]}
+  rows={[
+    ["English web", "30–40%", "50–70%", "Deliberately under-represented to free vocabulary slots"],
+    ["Code (GitHub etc.)", "15–25%", "5–15%", "Over-represented by ~2× for compression"],
+    ["Top-30 multilingual", "30–45%", "10–30%", "Over-represented to balance fertility"],
+    ["Math / formal", "3–8%", "2–5%", "Slight over-representation, mostly to seed digit splits"],
+    ["Long-tail languages", "2–10%", "&lt;2%", "Heavy over-representation (5–10×)"],
+  ]}
+/>
+
+Mistral AI's NeMo tokenizer (the Tekken family, July 2024) gives a public anchor point: the announcement claims roughly 30% compression improvement on code, 2× compression improvement on Korean, and 3× compression improvement on Arabic over its SentencePiece predecessor — achieved primarily by retraining on a corpus that resembled the new model's data rather than the old one's.
+
+---
+
+## Pre-tokenization {#pretokenization}
+
+Pre-tokenization splits a UTF-8 byte stream into chunks *before* BPE merges run, and restricts merges to within chunks. The pre-tokenizer therefore encodes a structural prior about what merges are meaningful: contractions stay together, digits group in small chunks, whitespace does not merge with the following word into a single super-token.
+
+### The GPT-2 regex
+
+The lineage tree of every byte-level-BPE frontier tokenizer descends from Radford et al. (2019). The GPT-2 pre-tokenization regex is:
+
+```text
+'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+```
+
+Reading left to right, it matches: English contractions (`'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, `'d`) as single tokens; runs of letters in any script (`\p{L}`), optionally with a leading space; runs of digits, optionally with a leading space — **with unbounded length**, which is the GPT-2 weakness; runs of non-letter / non-digit / non-space characters (punctuation and symbols); and whitespace runs.
+
+The unbounded digit run is the source of GPT-2's worst-known arithmetic failures. A multi-digit number like `12345` is tokenized as a single chunk; merges within it can produce arbitrary sub-token structure depending on what digit substrings happened to be frequent in WebText.
+
+### The Llama-3 / tiktoken pattern (May 2026 default)
+
+The dominant pre-tokenization regex in May 2026 is the one shipped with Llama-3 and used by `cl100k_base` and `o200k_base`:
+
+```text
+(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+```
+
+Three changes from the GPT-2 pattern are doing all the work. **Case-insensitive contractions** via `(?i:…)` capture `'S`, `'T`, etc., which GPT-2 missed and which fragmented in mixed-case input. **`\p{N}{1,3}` bounds digits to chunks of three**, which is the direct fix for the digit-run arithmetic problem; Singh & Strouse (2024) showed this alone recovers several points of arithmetic accuracy at GPT-3.5-class scale. **Explicit newline handling** via `\s*[\r\n]+` keeps newlines as their own tokens — important for code and for chat-template structure, where every newline is a semantic boundary.
+
+This pattern is now used by Llama-3, Llama-3.1, Llama-4 (with extensions), Qwen2.5, Qwen3 (the cl100k lineage), Mistral-NeMo's Tekken, Kimi-K2, DeepSeek-V3 (with the modification below), GPT-4o (`o200k_base`), and GPT-5 (`o200k_harmony`).
+
+### DeepSeek-V3 modification
+
+DeepSeek-V3 (December 2024) introduces tokens that combine **punctuation with a line break** as a single unit — for example `".\n"` as one token rather than two. This improves compression on web text, where sentence-ending punctuation is followed by a newline often enough to be worth a dedicated merge slot. The cost is a *token-boundary bias*: multi-line prompts that do not end in a newline are seen by the model differently at evaluation time than they were at training time, because the combined token never appeared in the un-newlined form. DeepSeek's mitigation is *boundary-bias augmentation* — random splitting of the combined tokens during model training (not during tokenizer training), exposing the model to both the combined and the split forms.
+
+### Unicode normalization
+
+Three normalization options exist; the frontier has converged on the third.
+
+**NFC (canonical composition)** combines combining characters into precomposed glyphs where one exists: `e + ´` → `é`. It is fully reversible and lossless for actual text. NFC is the safe default when normalization is desired.
+
+**NFKC (compatibility composition)** is more aggressive: `ﬁ` → `fi`, `½` → `1⁄2`, all width-variant CJK characters collapse to their canonical form. SentencePiece applies NFKC by default, so every SentencePiece-based frontier tokenizer — legacy Llama 1 and 2, the entire Gemma family, T5 — inherits NFKC normalization.
+
+**No normalization (byte-level BPE).** GPT-2, all of the tiktoken lineage, Llama-3, DeepSeek, Qwen — every byte-level BPE tokenizer — skips Unicode normalization entirely. The argument is operational: bytes are bytes, and any visually identical glyph that came in as a different byte sequence will be tokenized as a different sequence. This trades a small amount of semantic deduplication for full byte-level reversibility. The frontier consensus in May 2026 is byte-level-BPE-without-normalization for autoregressive language models; the SentencePiece-with-NFKC line continues to ship in the Gemma family and in Gemini 2.x.
+
+**Byte fallback.** In SentencePiece, byte fallback means any character not in the vocabulary decomposes into UTF-8 byte tokens — 256 reserved IDs that guarantee no `<unk>` is ever produced. Llama 1 and 2 used this. Byte-level BPE makes byte fallback the *default*: every vocabulary entry already *is* a byte sequence at the bottom of the merge tree, so there is no fallback — there is only the base case.
+
+### Beyond pre-tokenization
+
+A minority research direction in 2025–2026 questions the pre-tokenization step itself. Schmidt et al. (Kensho, COLM 2025) propose *Boundless BPE*, which relaxes the regex barrier and allows merges across pre-token boundaries. Their finding is that the regex is a stronger prior than necessary at frontier scale, where the model has enough capacity to learn the structure that the regex was meant to enforce. As of May 2026 no production frontier tokenizer has abandoned pre-tokenization, but the work is the leading candidate to do so.
+
+---
+
+## Glitch tokens and prevention {#glitch-tokens-prevention}
+
+The mechanism of glitch tokens is covered in [the prerequisite chapter](/textbook/00g-tokenization-and-objectives#glitch-tokens): a vocabulary entry whose embedding row receives essentially no gradient during pretraining, because the token is rare or absent in the model's actual training data. The structural cause is the gap between the tokenizer's training sample and the model's training corpus. This section is about the modern mitigation stack — what frontier labs do in 2025–2026 to prevent glitch tokens from shipping.
+
+### Two failure modes, recapped
+
+The first failure mode is **corpus mismatch**: a token was frequent in the tokenizer-training sample but rare in the model corpus. The canonical example is `SolidGoldMagikarp`, a Reddit username from r/counting. The tokenizer-training corpus contained the r/counting thread (so the username earned a merge); the model's training corpus did not (so the embedding row stayed near its random initialisation).
+
+The second failure mode is **filtering-pipeline mismatch**: even when both processes start from the same corpus, if the model's pipeline applies stronger PII filtering, dedup, or quality scoring than the tokenizer's pipeline, some tokens disappear from the model's view that survived in the tokenizer's view.
+
+### The five-layer mitigation stack
+
+Frontier practice in 2025–2026 stacks five mitigations.
+
+**Layer 1: train the tokenizer on the model's exact data, after the model's filters.** This is the single strongest mitigation and is standard practice at frontier-budget labs; smaller labs and many follow-on models commonly inherit an existing tokenizer instead (HuggingFace's SmolLM3, May 2025, reuses the Llama-3.2 tokenizer unchanged) and accept the residual glitch-token surface from a foreign corpus as the price of avoiding a re-encoding pass. The tokenizer training corpus is a sample (typically 10–100 GB) of the *final, filtered* pretraining corpus. The DeepSeek-V3 report makes this explicit: their tokenizer is re-trained on a sample of the V3 mix, not inherited from V2.
+
+**Layer 2: audit.** Land & Bartolo (Cohere, *Fishing for Magikarp*, EMNLP 2024) define three complementary detectors. A *corpus-frequency audit* counts each token's occurrences in the model's pretraining corpus and flags tokens whose count falls below a threshold — typically count $< 1000$ in a 1-trillion-token sample. A *weight-based detector* measures the L2 norm of each embedding row after training (or after a short pre-training stub); glitch tokens have anomalously low norms. A *behavioural probe* asks the model to repeat the token and checks whether the output ID matches the input ID. Land & Bartolo find that 510 of GPT-2's 50,257 tokens were never produced by the model across 3 million predictions, and 85% of tokens flagged by the weight-based or behavioural methods fall inside that never-produced set.
+
+**Layer 3: replace or re-initialise.** For tokens flagged by the audit, two options exist. One is to delete the token from the vocabulary outright, which requires re-encoding the pretraining corpus and is usually only feasible before the first training step. The other is to re-initialise the embedding row from the average of the byte-decomposition embeddings of the token's constituent bytes, so the row at least starts from a sensible direction in embedding space rather than from a random one.
+
+**Layer 4: boundary-bias augmentation.** Specific to DeepSeek-V3's combined-punctuation tokens (see § [Pre-tokenization](#pretokenization)). The model is exposed during training to the combined token *and* to its constituent pieces in random splits, ensuring both the combined embedding and the constituent embeddings receive gradient.
+
+**Layer 5: gradient-guided mining.** The Cohere group's *GlitchMiner* (arXiv:2410.15052, AAAI 2026 main / NeurIPS 2024 workshop) uses gradient-guided discrete search to find glitches efficiently in multi-hundred-thousand-vocab tokenizers, without brute-forcing every token. The audit in Layer 2 catches the easy cases; GlitchMiner catches the adversarially structured rare ones.
+
+### Prevalence and trends
+
+A Cohere-affiliated replication study at AAAI 2026 measured glitch-token prevalence in modern frontier vocabularies (GPT-4o, Llama-2, Llama-3, Mistral-Nemo, DeepSeek-V3) and reported an average of **~4.3%** of total vocabulary, using the threshold of corpus count $< 1000$ in a 1-T-token reference sample. The same methodology applied to GPT-3.5 (2023) reported roughly 8%. The factor-of-two reduction is attributed primarily to Layer 1 — training the tokenizer on the model's filtered data — becoming industry standard. The 4.3% figure should be reported with the threshold attached; different vocab-frequency cutoffs move the count by ±2 percentage points.
+
+<Callout variant="info" title="LiteToken (2026): intermediate merge residues">
+A 2026 result identifies a related but distinct failure mode: *intermediate merge residues* — tokens that appeared frequently during BPE merge accumulation but rarely appear in the final tokenized output of the model corpus, because higher-priority merges absorb them. The LiteToken paper (early 2026) estimates roughly 10% of tokens in major tokenizers are residues by this measure and proposes pruning them. The arXiv ID for the paper was not stable as of the writing of this chapter; verify before citing.
+</Callout>
+
+The Toxsec 2026 write-up of the Claude Opus 4.7 tokenizer "graveyard" provides a real-world example: the new tokenizer ships with a small but measurable population of vocabulary entries that fail the behavioural probe under typical Anthropic safety prompts, attributed to the gap between the tokenizer's training sample and the post-RLHF model's effective generation distribution.
+
+---
+
+## Multilingual considerations {#multilingual}
+
+### Fertility and parity {#fertility}
+
+**Fertility** is the average number of tokens produced per whitespace-delimited word in a target language. Lower is better — fewer tokens per word means more text per context window and a lower API bill per request. The canonical benchmark uses `cl100k_base` (GPT-4 era):
+
+- English fertility ≈ 1.2 tokens/word
+- French ≈ 1.5
+- Chinese ≈ 2.0 (per "word" defined as ≈ 1.5 characters)
+- Hindi ≈ 4.0
+- Burmese / Khmer / Thai ≈ 8–14
+
+The transition from `cl100k_base` to `o200k_base` (GPT-4o, 2024) cut Korean fertility by roughly 50% and Arabic fertility by roughly 60%, per OpenAI's release notes — figures that were subsequently replicated by independent measurement.
+
+**Parity ratio.** A more interpretable metric is fertility(language X) / fertility(English) for the same semantic content. Petrov et al. (2023) — the original "fertility tax" paper — showed parity ratios of 5–10× between English and several Indic and African languages on the GPT-3 tokenizer, with directly proportional price implications. The May-2026 frontier targets are roughly **parity ≤ 1.5 for major languages** (Spanish, French, German, Mandarin, Japanese, Korean, Arabic, Hindi) and **parity ≤ 3 for long-tail languages**.
+
+### Beyond fertility: STRR and Rényi efficiency
+
+Recent papers show that fertility correlates poorly with downstream model performance once it falls below roughly 2.0 tokens/word. Two replacement metrics have been proposed.
+
+**Rényi efficiency** (Zouhar et al. 2023) measures the entropy of the token-frequency distribution, penalising overly skewed vocabularies in which a small number of tokens carry most of the mass. The argument is that a flat distribution makes more efficient use of the embedding budget. Several 2024 counterexamples (Goldman et al., Downey et al., Cognetta et al.) show cases where Rényi efficiency does not predict downstream task quality.
+
+**STRR — single-token retention rate** — is the fraction of *words* in a language that get a single-token representation. STRR is the metric proposed by *Beyond Fertility* (arXiv:2510.09947, 2025); it is correlated with fertility but emphasises the tail (rare words that fragment) over the head (common words that compress well). On Indic languages, STRR is the more sensitive metric of the two.
+
+### Script-specific issues
+
+Four script families produce most of the remaining fertility problems in 2026.
+
+**CJK.** Chinese and Japanese have no whitespace word boundaries. The Llama-3 pre-tokenization regex puts long runs of `\p{L}` into single chunks, and BPE merges aggressively inside those chunks. Korean (Hangul) is syllabic and benefits from explicit sub-syllable merges; without dedicated coverage Korean fertility can blow out by 3–4× relative to a Korean-aware tokenizer.
+
+**Indic.** Devanagari, Bengali, Tamil, and the family of scripts with conjunct consonants and matra (diacritic) signs produce UTF-8 sequences in which one visually rendered character can span 2–4 bytes. Byte-level BPE on un-oversampled Indic data produces three to four tokens per syllable. *IndicSuperTokenizer* (arXiv:2511.03237, 2025) demonstrates +39.5% fertility improvement over Llama-4 by training on 22 Indic languages with deliberate oversampling.
+
+**Arabic.** Right-to-left script with root-and-pattern morphology and optional diacritics. BPE handles the byte sequence fine but produces awkward chunks when the regex's letter-run extraction doesn't respect morpheme boundaries. Mistral's Tekken (NeMo, July 2024) claims 3× compression improvement on Arabic over its SentencePiece predecessor, primarily by oversampling Arabic in the tokenizer training corpus.
+
+**Thai, Khmer, Burmese, Lao.** No whitespace, cluster-based scripts. The frontier tokenizers in 2026 still have fertility 6–14 tokens/word on these — the worst remaining gap in the multilingual coverage of frontier tokenizers, and the reason every comparison-table row for these languages still shows triple-digit parity-cost ratios.
+
+### Why 100k–256k became the frontier range
+
+The historical progression of frontier vocabulary sizes reflects a quiet consensus that has crystallised by 2026.
+
+- **32k era (2022–2023):** Llama 1, Llama 2, Mistral 7B. English-centric. Fast embedding matmul. Low parameter cost. Acceptable for a 7-B-class English-only model; unacceptable for anything multilingual.
+- **50–65k transitional (~2023):** Claude 3 generation, roughly 65k inferred. Modest multilingual.
+- **100–130k modern default (~2024):** Llama-3 at 128,256; DeepSeek-V3 at 129,280; Mistral-NeMo Tekken at ~131,072 ($2^{17}$). Strong English plus code plus decent multilingual.
+- **150–165k extended (~2025):** Qwen3 at 151,645 effective; Kimi-K2 at 163,840. Heavy Chinese coverage in addition to multilingual.
+- **200k–262k upper tier (2024–2025):** GPT-4o `o200k_base` at 199,997; GPT-5 `o200k_harmony` at 201,088; Gemma 3 / Gemini 2.x at 262,144. All major languages, plus heavy reserved-token slots for tool, multimodal, and agent tokens.
+
+The Tao et al. (2024) scaling-law math says a 70-B-class model can profitably use $V \geq 216{,}000$. The actual ceiling on production vocabulary in 2026 is set less by the Tao loss-vs-$V$ curve and more by three operational constraints: the embedding matmul becomes a memory-bandwidth bottleneck at $V > {\sim}250{,}000$ for small (&lt;7-B) models; the output-softmax cost grows in proportion to $V$ at sampling time; and the chicken-and-egg problem of needing proportionally more tokenizer-training data per added vocabulary slot.
+
+---
+
+## Frontier comparison {#frontier-table}
+
+The table below collects published or reliably inferred parameters for seventeen frontier tokenizers as of May 11, 2026. Cells marked *not disclosed* or *inferred* should be read with the caveat that the field's transparency on this question is uneven: open-weights labs (Meta, DeepSeek, Qwen, Mistral, AI2) ship tokenizer files; closed-API labs (Anthropic, OpenAI for some details, Google for parts of Gemini) ship descriptions that must be reverse-engineered.
+
+<ComparisonTable
+  caption="Frontier tokenizers, May 2026. Vocab sizes reflect best-known-public numbers; italicised cells indicate inferred or undisclosed values."
+  columns={["Model", "Year", "Vocab size", "Algorithm", "Pre-tokenization", "Notable corpus / multilingual posture", "Source"]}
+  rows={[
+    ["GPT-2", "2019", "50,257", "Byte-level BPE", "GPT-2 regex", "English WebText", "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf"],
+    ["Llama 2", "2023", "32,000", "SentencePiece BPE", "NFKC + SP word boundary", "English-heavy + code", "https://arxiv.org/abs/2307.09288"],
+    ["GPT-4 (cl100k_base)", "2023", "100,256", "Byte-level BPE (tiktoken)", "GPT-2-derived, digits ≤3", "English + ~30 languages", "https://github.com/openai/tiktoken"],
+    ["GPT-4o (o200k_base)", "2024", "199,997", "Byte-level BPE", "tiktoken regex", "67 languages ≥0.1%; ~39% non-English (inferred)", "https://arxiv.org/abs/2407.16607"],
+    ["GPT-5 (o200k_harmony)", "2025", "201,088", "Byte-level BPE (o200k superset)", "tiktoken regex", "Inherits o200k + ~1,075 reserved agent / tool slots", "https://modal.com/blog/what-is-o200k-harmony"],
+    ["Llama 3 / 3.1", "2024", "128,256", "Tiktoken-based BPE", "tiktoken regex, \\p{N}{1,3}", "Multilingual ~30 languages + code; 256 reserved", "https://ai.meta.com/blog/meta-llama-3/"],
+    ["Llama 4 (Scout / Maverick)", "2025", "not disclosed (tiktoken-based)", "Tiktoken-based BPE (extended)", "tiktoken-lineage regex", "200 languages, 40 T tokens", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Mistral 7B / Mixtral", "2023", "32,000", "SentencePiece BPE", "SP word boundary", "English-heavy", "https://mistral.ai/news/announcing-mistral-7b/"],
+    ["Mistral-NeMo (Tekken)", "2024", "~131,072 ($2^{17}$)", "Tiktoken-based (Tekken)", "tiktoken regex", "100+ languages; 3× Arabic, 2× Korean improvement", "https://mistral.ai/news/mistral-nemo"],
+    ["DeepSeek-V2", "2024", "100,000", "Byte-level BPE", "tiktoken regex", "English + Chinese", "https://arxiv.org/abs/2405.04434"],
+    ["DeepSeek-V3", "2024", "129,280", "Byte-level BPE", "tiktoken regex + punct+\\n combined", "Multilingual + code; FIM tokens", "https://arxiv.org/abs/2412.19437"],
+    ["Qwen2.5", "2024", "~151,851", "Byte-level BPE (cl100k-derived)", "tiktoken regex", "Heavy Chinese; 208 control tokens", "https://github.com/QwenLM/Qwen/blob/main/tokenization_note.md"],
+    ["Qwen3 (dense / MoE)", "2025", "151,645 (cfg padded 152,064)", "Byte-level BPE (cl100k-derived)", "tiktoken regex", "36 T tokens, 119 languages; thinking-mode tokens", "https://arxiv.org/abs/2505.09388"],
+    ["Kimi-K2", "2025", "163,840", "Tiktoken BPE", "tiktoken regex", "Heavy Chinese; tool / agent tokens", "https://huggingface.co/moonshotai/Kimi-K2-Instruct"],
+    ["Gemma 2", "2024", "256,128", "SentencePiece unigram LM", "SP + NFKC", "Multilingual (Gemini lineage)", "https://huggingface.co/google/gemma-2-9b"],
+    ["Gemma 3 / Gemini 2.x", "2025", "262,144", "SentencePiece unigram LM", "SP + NFKC + split digits + byte fallback", "Balanced for non-English; multimodal tokens", "https://developers.googleblog.com/gemma-explained-whats-new-in-gemma-3/"],
+    ["Claude 3 / 3.5 / 4.x (≤4.6)", "2023–2026", "~65,000 (inferred via streaming)", "Byte-level BPE (not released)", "GPT-2-style regex (inferred)", "English + multilingual; high non-Latin language tax", "https://javirando.com/blog/2024/claude-tokenizer/"],
+    ["Claude Opus 4.7", "Apr 2026", "not disclosed (>65k inferred)", "Byte-level BPE (not released)", "inferred tiktoken-lineage", "First Claude tokenizer change; 20–35% fewer tokens on Mandarin / Japanese / Korean / Arabic / Hindi; 1.0–1.35× more on English", "https://tokencontributions.substack.com/p/whole-words-and-claude-tokenization"],
+    ["OLMo 2", "2024–2025", "100,278 (embed padded to 100,352)", "Byte-level BPE (cl100k-derived)", "tiktoken regex", "English + code; fully open recipe", "https://arxiv.org/abs/2501.00656"],
+  ]}
+/>
+
+Three observations on the table. First, the field has split between two algorithm families: the **tiktoken / byte-level BPE** lineage (every OpenAI, DeepSeek, Qwen, Kimi, Mistral-NeMo, OLMo, and Llama-3+ model) and the **SentencePiece** lineage (Gemma family, Gemini, legacy Llama 1/2). The split correlates with multilingual posture: byte-level BPE wins where text is heterogeneous and byte-level reversibility matters; SentencePiece wins where strong CJK + Indic + Arabic balance is the priority. Second, the vocabulary-size distribution is bimodal: ~128k–165k for the byte-level lineage, ~256k–262k for the SentencePiece lineage. Third, the reserved-special-token budget is growing fast — Llama-3 reserves 256 slots, GPT-5's `o200k_harmony` reserves ~1,075 — driven by agentic and multimodal special tokens (channel, message, constrain, call, return) that did not exist in 2023 vocabularies. See [FIM / MTP objectives](/textbook/00g-tokenization-and-objectives#multi-token-prediction) for the structural origin of FIM-related reserved tokens.
+
+---
+
+## Worked example: a small BPE tokenizer and its compression curve {#worked-example}
+
+This section walks through a HuggingFace `tokenizers` training run, then reports the compression curve as $V$ scales from 4 k to 128 k.
+
+### Setup
+
+Use a 200 MB sample of OpenWebText. This is enough to train a 4 k–32 k byte-level BPE tokenizer in about 30 seconds on CPU using the Rust backend of HuggingFace `tokenizers`, and a 64 k–128 k tokenizer in roughly two to three minutes on the same machine.
+
+```python
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+
+def train_bpe(files, vocab_size, special_tokens=None):
+    tok = Tokenizer(BPE(unk_token=None))       # byte-level BPE: no unk needed
+    tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tok.decoder       = ByteLevelDecoder()
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=special_tokens or ["<|endoftext|>"],
+        initial_alphabet=ByteLevel.alphabet(),   # all 256 bytes guaranteed
+        min_frequency=2,
+    )
+    tok.train(files=files, trainer=trainer)
+    return tok
+
+# Train one tokenizer per target V
+for V in [4_000, 8_000, 16_000, 32_000, 64_000, 128_000]:
+    tok = train_bpe(["openwebtext-200MB.txt"], vocab_size=V)
+    tok.save(f"bpe-{V}.json")
+```
+
+Three details are worth noting. The `BPE(unk_token=None)` constructor disables the unknown-token fallback — byte-level BPE does not need one because every input byte is already in the base vocabulary. `initial_alphabet=ByteLevel.alphabet()` forces all 256 bytes to appear in the base vocabulary; without it the trainer might omit bytes that never occur in the training sample, breaking generalisation to unseen text. `min_frequency=2` discards any candidate merge that appears only once — this is a tiny but real glitch-token prevention mechanism, ensuring no merge slot is allocated to a pair that occurred exactly once.
+
+### A worked merge step
+
+For readers who skipped the [BPE basics](/textbook/00g-tokenization-and-objectives#bpe) prerequisite, here are the first five merges on the toy corpus from chapter 00g (the `low / lower / newest / widest` example). Initial representations after character splitting with an end-of-word marker `·`:
+
+```
+l o w ·        ×5
+l o w e r ·    ×2
+n e w e s t ·  ×6
+w i d e s t ·  ×3
+```
+
+The five highest-frequency merges, in order, are: `e s` (9 occurrences) → `es`; `es t` (9) → `est`; `est ·` (9) → `est·`; `l o` (7) → `lo`; `lo w` (7) → `low`. After five merges the vocabulary has grown from 12 base characters to 17, and a previously unseen word like `lowest` would tokenize to `low est·` rather than to six character tokens. The merges are recorded as an ordered list and applied greedily at tokenisation time.
+
+### The compression curve
+
+Running the training code at each target $V$ and measuring bytes-per-token on a held-out 20 MB of OpenWebText produces a table of the following shape. The numbers below are representative of what a careful run produces; exact values vary by a few percent across random samples and random merge tie-breaking.
+
+| $V$ | Bytes/token (English held-out) | Embedding params ($d=768$) | Notes |
+|------|----------------------|--------------------------|-------|
+|  4 k | 2.8 | 6.1 M | Very fine-grained; long sequences |
+|  8 k | 3.4 | 12.3 M | Morpheme-level merges dominate |
+| 16 k | 3.9 | 24.6 M | Sub-word and common-word level |
+| 32 k | 4.4 | 49.2 M | Llama-2 era default |
+| 64 k | 4.8 | 98.3 M | Diminishing returns begin |
+| 128 k | 5.0 | 196.6 M | Llama-3 / DeepSeek default; +3% over 64 k |
+
+The shape is the qualitative point. Each doubling of $V$ from 4 k to 32 k earns roughly +0.5 bytes/token of compression. Each doubling from 32 k onward earns at most +0.3 bytes/token, and the increment from 64 k to 128 k is only +0.2. The Tao et al. scaling law (§ [Vocab-size selection](#vocab-size)) is the same diminishing-returns shape evaluated against loss rather than compression, and predicts that the optimum sits at the point where the loss-curve derivative balances the embedding-parameter cost.
+
+The compression curve is *not* the same thing as the loss curve. A tokenizer can compress aggressively (high bytes/token) while producing sub-tokens that the model finds harder to learn — the worst case is a tokenizer whose merges hide morphological structure beneath rare super-tokens, where the model must learn each super-token essentially as a glitch. The Tao curve captures the loss side; the compression curve here captures the cost side. The intersection of the two is the practical answer to "what should $V$ be?"
+
+<Callout variant="exercise">
+Take the table above. Assuming the cost of an embedding-matrix lookup is $d$ FLOPs per token (the lookup is free; the lookup *and the matching output projection* together are $V \cdot d$ FLOPs per token), and assuming a 7-B model trained on $D = 15 \times 10^{12}$ tokens, compute the total FLOPs spent on the embedding component at $V \in \{32{,}000, 128{,}000, 262{,}144\}$. Express the result as a fraction of the model's total training FLOPs $C \approx 6 \cdot N \cdot D$. Compare against the Tao et al. predicted optimum of $V \approx 67{,}000$ at 7 B from § [Vocab-size selection](#vocab-size). Where does the chosen $V$ in production frontier models (128 k–262 k) come from, if not from the Tao curve alone?
+</Callout>
+
+---
+
+## Chapter summary {#summary}
+
+- The tokenizer is a Day-0 decision: it fixes the sequence-length distribution of the corpus, the embedding parameter budget, the unit in which loss is measured, the inference cost on user traffic, and the downstream evaluation surface — all before the first parameter is initialised.
+- **Tao et al. (2024)** is the cleanest existing scaling law for vocabulary. Three complementary fits converge on $\gamma \approx 0.83$–$0.84$ for the vocab-vs-non-vocab scaling exponent ratio. Predicted optima are roughly $V \approx 67{,}000$ at 7 B parameters and $V \approx 216{,}000$ at 70 B; the 70-B prediction is an extrapolation of fits trained at up to 3 B.
+- The **modern pre-tokenization regex** (Llama-3, `o200k_base`, used by all major byte-level-BPE frontier tokenizers as of May 2026) bounds digit runs to chunks of three with `\p{N}{1,3}`, handles case-insensitive contractions, and explicitly tokenizes newlines.
+- **Glitch tokens** are now mitigated by a five-layer stack: train the tokenizer on the model's filtered corpus; audit by frequency, weight norm, and behavioural probe; replace or re-initialise; apply boundary-bias augmentation for combined tokens; mine residual glitches with gradient-guided search. Average prevalence has dropped from ~8% (GPT-3.5 era) to ~4.3% (2024–2026 frontier).
+- The frontier vocabulary range has converged on **128 k–262 k**, split between a tiktoken/byte-level-BPE lineage at 128–165 k and a SentencePiece lineage at 256–262 k. Reserved-special-token budgets are growing fast to accommodate agentic and multimodal tokens.
+- **Fertility alone is not enough** as a multilingual evaluation metric. Parity ratios (target ≤ 1.5 for major languages, ≤ 3 for long-tail) and STRR (single-token retention rate) are the 2025–2026 replacements; Rényi efficiency is contested.
+
+---
+
+<Sources items={[
+  {
+    authors: "Tao, K., Sang, Y., Wong, R., & Lin, M.",
+    year: 2024,
+    title: "Scaling Laws with Vocabulary: Larger Models Deserve Larger Vocabularies",
+    venue: "NeurIPS 2024",
+    url: "https://arxiv.org/abs/2407.13623",
+    note: "IsoFLOPs sweep over V; three complementary fits; γ ≈ 0.83–0.84; predicts V ≈ 216k for 70B."
+  },
+  {
+    authors: "Tao et al.",
+    year: 2024,
+    title: "scaling-with-vocab (code repository)",
+    venue: "GitHub, sail-sg/scaling-with-vocab",
+    url: "https://github.com/sail-sg/scaling-with-vocab",
+    note: "Reference implementation and fitted-coefficient artefacts."
+  },
+  {
+    authors: "Ali, M., Fromm, M., et al.",
+    year: 2024,
+    title: "Tokenizer Choice For LLM Training: Negligible or Crucial?",
+    venue: "Findings of NAACL 2024",
+    url: "https://aclanthology.org/2024.findings-naacl.247/",
+    note: "Up to 68% additional training cost from English-centric tokenizer on multilingual 2.6B model; 3× vocab needed for top-5 European."
+  },
+  {
+    authors: "Dagan, G., Synnaeve, G., & Rozière, B.",
+    year: 2024,
+    title: "Getting the most out of your tokenizer for pre-training and domain adaptation",
+    venue: "ICML 2024",
+    url: "https://arxiv.org/abs/2402.01035",
+    note: "Code-specialised tokenizer recovers +3–6 pts HumanEval pass@1 at 7B with no model changes."
+  },
+  {
+    authors: "Huang, X. et al.",
+    year: 2025,
+    title: "Over-Tokenized Transformer: Vocabulary is Generally Worth Scaling",
+    venue: "arXiv:2501.16975 (ByteDance Seed)",
+    url: "https://arxiv.org/abs/2501.16975",
+    note: "Decoupled input/output vocabulary; log-linear loss reduction with input V up to 12.8 M via hierarchical n-gram embeddings."
+  },
+  {
+    authors: "Singh, A. K. & Strouse, D. J.",
+    year: 2024,
+    title: "Tokenization counts: the impact of tokenization on arithmetic in frontier LLMs",
+    venue: "arXiv:2402.14903",
+    url: "https://arxiv.org/abs/2402.14903",
+    note: "Digit-grouping in cl100k_base interacts with right-to-left arithmetic; left-padding and forced grouping recover accuracy."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "V = 129,280; tokenizer trained on V3 corpus; punctuation + newline combined tokens; boundary-bias augmentation; FIM special tokens."
+  },
+  {
+    authors: "Land, S.",
+    year: 2026,
+    title: "Whole words and Claude tokenization",
+    venue: "Token Contributions Substack",
+    url: "https://tokencontributions.substack.com/p/whole-words-and-claude-tokenization",
+    note: "Language-tax cost measurements for Claude 4.7; 1.0–1.35× more tokens on English vs 20–35% fewer on Mandarin / Japanese / Korean / Arabic / Hindi."
+  },
+  {
+    authors: "Hoffmann, J. et al.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models",
+    venue: "NeurIPS 2022 (Chinchilla)",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "Pre-cursor scaling law that Tao et al. extend to include the vocabulary dimension."
+  },
+  {
+    authors: "Radford, A. et al.",
+    year: 2019,
+    title: "Language Models are Unsupervised Multitask Learners (GPT-2)",
+    venue: "OpenAI",
+    url: "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf",
+    note: "Original byte-level BPE; GPT-2 pre-tokenization regex; V = 50,257."
+  },
+  {
+    authors: "Meta AI",
+    year: 2024,
+    title: "Llama 3 tokenizer source",
+    venue: "github.com/meta-llama/llama3",
+    url: "https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py",
+    note: "Llama-3 pre-tokenization regex with \\p{N}{1,3} digit bound; 128,256 vocab; 256 reserved special tokens."
+  },
+  {
+    authors: "OpenAI",
+    year: 2024,
+    title: "tiktoken",
+    venue: "GitHub, openai/tiktoken",
+    url: "https://github.com/openai/tiktoken",
+    note: "Reference Rust implementation of cl100k_base, o200k_base, and o200k_harmony pre-tokenization."
+  },
+  {
+    authors: "Kudo, T. & Richardson, J.",
+    year: 2018,
+    title: "SentencePiece: A simple and language-independent subword tokenizer",
+    venue: "EMNLP 2018",
+    url: "https://arxiv.org/abs/1808.06226",
+    note: "SentencePiece library; NFKC default; underlying tokenizer for Gemma family and legacy Llama."
+  },
+  {
+    authors: "Schmidt, F. et al.",
+    year: 2025,
+    title: "Boundless Byte Pair Encoding: Breaking the Pre-tokenization Barrier",
+    venue: "COLM 2025 (Kensho)",
+    url: "https://arxiv.org/abs/2504.00178",
+    note: "Relaxes the pre-tokenization regex barrier; argues that frontier-scale models can learn the structure the regex enforces."
+  },
+  {
+    authors: "Rumbelow, J. & Watkins, M.",
+    year: 2023,
+    title: "SolidGoldMagikarp (plus, prompt generation)",
+    venue: "LessWrong / Alignment Forum, January 2023",
+    url: "https://www.lesswrong.com/posts/aPeJE8bSo6rAFoLqg/solidgoldmagikarp-plus-prompt-generation",
+    note: "Original public documentation of glitch tokens in the GPT-3 family."
+  },
+  {
+    authors: "Land, S. & Bartolo, M.",
+    year: 2024,
+    title: "Fishing for Magikarp: Automatically Detecting Under-trained Tokens in Large Language Models",
+    venue: "EMNLP 2024 (Cohere)",
+    url: "https://arxiv.org/abs/2405.05417",
+    note: "Three detection methods: corpus-frequency, weight-norm, behavioural probe; 510 never-output GPT-2 tokens; code at cohere-ai/magikarp."
+  },
+  {
+    authors: "GlitchMiner authors",
+    year: 2024,
+    title: "Mining Glitch Tokens via Gradient-based Discrete Optimization",
+    venue: "arXiv:2410.15052 (AAAI 2026 main)",
+    url: "https://arxiv.org/abs/2410.15052",
+    note: "Gradient-guided discrete search for glitch tokens; scales to multi-hundred-thousand-vocab tokenizers."
+  },
+  {
+    authors: "Toxsec",
+    year: 2026,
+    title: "Token-Level AI Security: The Opus 4.7 Tokenizer Graveyard",
+    venue: "Toxsec blog",
+    url: "https://www.toxsec.com/p/token-level-ai-security-the-opus",
+    note: "Vendor write-up of glitch-token population in Claude Opus 4.7; real-world example of mitigation-stack gaps."
+  },
+  {
+    authors: "Petrov, A. et al.",
+    year: 2023,
+    title: "Language Model Tokenizers Introduce Unfairness Between Languages",
+    venue: "NeurIPS 2023",
+    url: "https://arxiv.org/abs/2305.15425",
+    note: "Original 'fertility tax' paper; parity ratios of 5–10× between English and several Indic / African languages on GPT-3."
+  },
+  {
+    authors: "Beyond Fertility authors",
+    year: 2025,
+    title: "Beyond Fertility: Analyzing STRR as a Metric for Multilingual Tokenization Evaluation",
+    venue: "arXiv:2510.09947",
+    url: "https://arxiv.org/abs/2510.09947",
+    note: "Proposes STRR (single-token retention rate); shows fertility correlates poorly with downstream performance below ~2 tokens/word."
+  },
+  {
+    authors: "IndicSuperTokenizer authors",
+    year: 2025,
+    title: "IndicSuperTokenizer",
+    venue: "arXiv:2511.03237",
+    url: "https://arxiv.org/abs/2511.03237",
+    note: "+39.5% fertility improvement over Llama-4 on 22 Indic languages via deliberate oversampling."
+  },
+  {
+    authors: "Mistral AI",
+    year: 2024,
+    title: "Mistral NeMo (Tekken tokenizer)",
+    venue: "Mistral AI blog, July 2024",
+    url: "https://mistral.ai/news/mistral-nemo",
+    note: "Tekken tokenizer; 100+ languages; ~30% compression improvement on code, 2× on Korean, 3× on Arabic vs SentencePiece predecessor."
+  },
+  {
+    authors: "Land, S.",
+    year: 2024,
+    title: "Data Mixture Inference: What do BPE Tokenizers Reveal about their Training Data?",
+    venue: "arXiv:2407.16607",
+    url: "https://arxiv.org/abs/2407.16607",
+    note: "Reverse-inference method on o200k_base; ~39% non-English / 67 languages with ≥0.1% share."
+  },
+  {
+    authors: "Walsh, S. et al.",
+    year: 2025,
+    title: "OLMo 2 Technical Report",
+    venue: "AI2 / arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "V = 100,278 (padded to 100,352 for embedding shape divisible by 128); cl100k-derived byte-level BPE."
+  },
+  {
+    authors: "HuggingFace",
+    year: 2024,
+    title: "tokenizers library — BpeTrainer reference",
+    venue: "HuggingFace documentation",
+    url: "https://huggingface.co/docs/tokenizers/api/trainers",
+    note: "BpeTrainer API used in the worked example."
+  },
+  {
+    authors: "Karpathy, A.",
+    year: 2024,
+    title: "minBPE",
+    venue: "GitHub, karpathy/minbpe",
+    url: "https://github.com/karpathy/minbpe",
+    note: "Minimal BPE reference implementation; reproduces the GPT-4 tokenizer."
+  },
+  {
+    authors: "Raschka, S.",
+    year: 2025,
+    title: "Implementing a BPE Tokenizer From Scratch",
+    venue: "sebastianraschka.com",
+    url: "https://sebastianraschka.com/blog/2025/bpe-from-scratch.html",
+    note: "Walkthrough of BPE training and tokenization in Python; useful complement to the worked example."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner (blog)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Inherits Llama 3.2 tokenizer unchanged; small-lab counter-example to corpus-matched retraining."
+  }
+]} />

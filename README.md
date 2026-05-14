@@ -32,7 +32,9 @@ If you're new to this repo (or returning after a break):
 1. Read [`docs/superpowers/specs/2026-04-25-frontierllm-design.md`](docs/superpowers/specs/2026-04-25-frontierllm-design.md) for the original design.
 2. Open [`ROADMAP.md`](ROADMAP.md) to see current status.
 3. **Prereqs textbook:** start at [`web/content/textbook/00-prerequisites.mdx`](web/content/textbook/00-prerequisites.mdx) or visit `/textbook` in the web reader for the eight-chapter module on transformers, attention variants, positional encodings, normalisation, activations, optimisers, tokenisation, and MoE plumbing. Synthesised from primary sources as of May 2026.
-4. **First active activity:** [`notes/07-frontier-labs/00-orientation.md`](notes/07-frontier-labs/00-orientation.md) — read 6 recent frontier-model technical reports and produce a comparative writeup. The output is a personal map of "what I know / don't know" that drives the next deep dive.
+4. **Pretraining-at-scale textbook:** Module 1 at [`web/content/textbook/01-pretraining.mdx`](web/content/textbook/01-pretraining.mdx) or `/textbook/01-pretraining` covers data pipeline, tokenizer training, scaling laws, μP / HP transfer, schedules and batch sizes, data curriculum, long-context extension, and the midtraining / annealing / FP8 reliability phase. Synthesised from 2024–2026 frontier-lab tech reports + the SmolLM3 training playbook.
+5. **Distributed-training textbook:** Module 2 at [`web/content/textbook/02-distributed.mdx`](web/content/textbook/02-distributed.mdx) or `/textbook/02-distributed` covers DP/DDP, tensor parallelism, pipeline parallelism (incl. DualPipe), expert parallelism, FSDP / ZeRO, NCCL primitives and overlap, mixed precision and gradient checkpointing, and 3D/4D parallelism composition. Verbatim configurations from Llama-3.1 405B, DeepSeek-V3, OLMo-2, PaLM, GPT-3.
+6. **First active activity:** [`notes/07-frontier-labs/00-orientation.md`](notes/07-frontier-labs/00-orientation.md) — read 6 recent frontier-model technical reports and produce a comparative writeup. The output is a personal map of "what I know / don't know" that drives the next deep dive.
 
 ## How to use
 

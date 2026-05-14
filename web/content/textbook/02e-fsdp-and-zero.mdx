@@ -1,0 +1,582 @@
+---
+slug: 02e-fsdp-and-zero
+title: FSDP and ZeRO
+description: Sharding optimiser state, gradients, and parameters across DP ranks — ZeRO-1/2/3 memory math, FSDP-1 vs FSDP-2, and the hybrid sharding recipe at frontier scale.
+order: 24
+chapter: 23
+module: 2
+module_title: Distributed training
+reading_minutes: 42
+depends_on: [02a-data-parallel, 01e-schedules-and-batch]
+provides: [zero-stage-1, zero-stage-2, zero-stage-3, fsdp-1, fsdp-2, hsdp, weight-prefetch, reduce-scatter]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Plain data parallelism, the subject of [the previous chapter](/textbook/02a-data-parallel), replicates the full model state on every rank and synchronises gradients with a ring all-reduce. The replication is conceptually clean and bandwidth-optimal, but it imposes a hard memory floor: every rank must hold every weight, every gradient, and every byte of optimiser state. For a 70-billion-parameter dense model trained with AdamW in mixed precision, that floor is over a terabyte per rank — well above the 80 GB available on an H100. Replication does not scale to frontier model sizes on commodity GPU memory.
+
+The Zero Redundancy Optimizer (ZeRO) family of algorithms, introduced by Rajbhandari et al. (2019) at Microsoft Research, observes that with $N_d$ data-parallel ranks under DDP, a fraction $(N_d - 1)/N_d$ of every byte of model state is redundant: each rank holds an identical copy. ZeRO partitions the redundant state across ranks in three increasingly aggressive stages, trading communication for memory. PyTorch's Fully Sharded Data Parallel (FSDP), shipped first as FSDP-1 in PyTorch 1.12 (May 2022) and redesigned as FSDP-2 / `fully_shard` from PyTorch 2.4 onward, implements the most aggressive ZeRO stage natively inside the PyTorch autograd machinery. By May 2026, FSDP-2 is the open-source default for 1-D parallelism across the Meta Llama, Alibaba Qwen, Mistral, AI2 OLMo, and Cohere stacks, with DeepSpeed ZeRO-3 retaining a meaningful share inside Microsoft research (Phi family) and inside the Hugging Face Trainer for fine-tuning workflows.
+
+This chapter develops three things. Sections [ZeRO-1 / 2 / 3](#zero-stages) and [Memory math](#memory-math) state the per-stage memory and communication formulas verbatim from Rajbhandari et al. (2019, Table 1), with the per-stage decomposition that is the single most-cited formula error in secondary sources. The section on [FSDP-1 vs FSDP-2](#fsdp-1-vs-2) distinguishes a *PyTorch implementation revision* from an *algorithmic stage*: ZeRO-3 and FSDP are equivalent at the algorithm level, while FSDP-1's FlatParameter and FSDP-2's per-parameter DTensor sharding are two different ways of executing that same algorithm. The [worked example](#worked-example) then walks the canonical 70-billion-parameter Llama-style decoder on a 64-H100 cluster end-to-end, with memory math, communication math, and the comparison to plain DDP and to the intermediate ZeRO stages.
+
+<Callout variant="note" title="Notation and prerequisites">
+Throughout this chapter: $\Psi$ denotes the total trainable parameter count, used both as a count and as a byte count where the unit is clear from context. $K$ is the optimiser state multiplier in mixed precision; for AdamW with BF16 weights and FP32 master + first / second moment, $K = 12$ (four bytes each for the FP32 master, the first moment $m$, and the second moment $v$), giving a per-rank baseline of $16\Psi$ bytes (two for BF16 weights, two for BF16 gradients, twelve for optimiser state). $N_d$ denotes the data-parallel world size — the dimension along which ZeRO / FSDP shards. Where this chapter contrasts ZeRO with other parallelism axes, the module-wide $W$ from [the data-parallel chapter](/textbook/02a-data-parallel) refers to the full DP world; under pure 1-D parallelism $W = N_d$. The chapter assumes familiarity with [AdamW](/textbook/00f-optimizers#adamw), with the [ring all-reduce of DDP](/textbook/02a-data-parallel), and with the global-batch and DP-degree figures developed in [the schedules chapter](/textbook/01e-schedules-and-batch#batch-ramp).
+</Callout>
+
+---
+
+## ZeRO-1 / 2 / 3 {#zero-stages}
+
+The ZeRO observation, stated precisely, is the following. Plain DDP holds three pieces of model state on every rank: BF16 (or FP16) parameters, BF16 (or FP16) gradients, and an FP32 optimiser state. Under $N_d$-way data parallelism, every byte of every piece is replicated $N_d$ times across the world. The three ZeRO stages partition these three pieces in turn:
+
+1. **ZeRO-1 ($P_{\text{os}}$).** Partition the *optimiser state* across the $N_d$ ranks; keep parameters and gradients replicated. Each rank still receives the full gradient (via the usual all-reduce) and still holds the full BF16 weight tensor, but the FP32 master parameters and the Adam moments live only on the rank responsible for each parameter slice.
+2. **ZeRO-2 ($P_{\text{os}+\text{g}}$).** Partition optimiser state *and* gradients. The all-reduce of gradients is replaced by a reduce-scatter: each rank ends up with $1/N_d$ of the global gradient sum, exactly the slice that matches its optimiser state. The BF16 parameter tensor remains replicated.
+3. **ZeRO-3 ($P_{\text{os}+\text{g}+\text{p}}$).** Partition optimiser state, gradients, and parameters. The model in rest state holds only $1/N_d$ of every parameter on each rank. Parameters are all-gathered on demand, one layer (or one FSDP unit) at a time, used for the forward or backward pass, and then dropped. This is the stage that PyTorch FSDP implements natively.
+
+Each successive stage moves one more piece of state from "replicated on every rank" to "sharded across $N_d$ ranks." The shift trades communication for memory. ZeRO-1 and ZeRO-2 preserve the DDP communication volume (one ring's worth of bytes per step, asymptotically); ZeRO-3 raises communication to $1.5\times$ DDP because the parameters must be all-gathered twice per step (once for forward, once for backward) on top of the gradient reduce-scatter.
+
+The stages are nested in the literal set-theoretic sense: ZeRO-3 implies ZeRO-2 implies ZeRO-1. A run that benefits from ZeRO-3's parameter sharding is also benefiting from ZeRO-2's gradient sharding and from ZeRO-1's optimiser-state sharding. The names $P_{\text{os}}$, $P_{\text{os}+\text{g}}$, $P_{\text{os}+\text{g}+\text{p}}$ in the original paper make this nesting explicit; the numeric shorthand "ZeRO-1 / 2 / 3" hides it.
+
+---
+
+## Memory math {#memory-math}
+
+### Baseline (DDP)
+
+For a model with $\Psi$ trainable parameters trained with AdamW in mixed precision, plain DDP holds three components per rank (Rajbhandari et al. 2019, §3):
+
+- $2\Psi$ bytes of BF16 parameters, used in the forward and backward pass.
+- $2\Psi$ bytes of BF16 gradients, produced by autograd before the optimiser step.
+- $K\Psi$ bytes of optimiser state, with $K = 12$ for AdamW in mixed precision: four bytes of FP32 master parameters (the canonical copy the optimiser actually steps on), four bytes of the FP32 first moment $m$, and four bytes of the FP32 second moment $v$.
+
+The baseline per-rank model-state memory under DDP is therefore $(2 + 2 + K)\Psi = 16\Psi$ bytes. Activation memory is on top of this and depends on batch size, sequence length, and recomputation policy — addressed later in [mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute).
+
+<ComparisonTable
+  caption="Per-rank model-state memory under plain DDP, at sixteen bytes per parameter (BF16 weights + BF16 grads + 12-byte AdamW state). Activation memory is on top of this."
+  columns={["Model size Ψ", "16Ψ DDP per-rank model state", "Source"]}
+  rows={[
+    ["7 B", "112 GB", "https://arxiv.org/abs/1910.02054"],
+    ["13 B", "208 GB", "https://arxiv.org/abs/1910.02054"],
+    ["70 B", "1,120 GB", "https://arxiv.org/abs/1910.02054"],
+    ["405 B", "6,480 GB", "https://arxiv.org/abs/1910.02054"],
+  ]}
+/>
+
+A single 80 GB H100 cannot hold even the model state of a 7 B run under DDP — it can hold a 7 B BF16 forward pass and some activations, but not the FP32 master and Adam moments. That is the memory wall ZeRO breaks.
+
+### The three stages
+
+The per-rank memory under each ZeRO stage, with $N_d$ data-parallel ranks, follows directly from which components are sharded and which are replicated. The expressions, exactly as in Rajbhandari et al. (2019, Table 1), are:
+
+$$
+M_{\text{DDP}} = (2 + 2 + K)\Psi = 16\Psi
+$$
+
+$$
+M_{\text{ZeRO-1}} = 2\Psi + 2\Psi + \frac{K\Psi}{N_d} = 4\Psi + \frac{12\Psi}{N_d}
+$$
+
+$$
+M_{\text{ZeRO-2}} = 2\Psi + \frac{(2 + K)\Psi}{N_d} = 2\Psi + \frac{14\Psi}{N_d}
+$$
+
+$$
+M_{\text{ZeRO-3}} = \frac{(2 + 2 + K)\Psi}{N_d} = \frac{16\Psi}{N_d}
+$$
+
+ZeRO-3's per-rank model-state memory is linear in $1/N_d$. With $N_d = 64$ and $\Psi = 70 \times 10^9$, model state per rank is $16 \cdot 70 / 64 \approx 17.5$ GB, which fits comfortably on an 80 GB H100 with room to spare for activations. ZeRO-1 and ZeRO-2 retain an unsharded $4\Psi$ and $2\Psi$ component respectively that does not shrink with $N_d$; in the same example, ZeRO-1 gives $4 \cdot 70 + 12 \cdot 70 / 64 \approx 293$ GB per rank and ZeRO-2 gives $2 \cdot 70 + 14 \cdot 70 / 64 \approx 155$ GB per rank — both infeasible on a single H100.
+
+<Callout variant="warning" title="The most common ZeRO-2 formula error">
+Many secondary sources write the ZeRO-2 per-rank memory as $\tfrac{2\Psi}{N_d} + \tfrac{(2+K)\Psi}{N_d}$, which double-counts the parameter byte: it shards parameters under ZeRO-2 as if it were ZeRO-3. The correct expression keeps the BF16 parameter byte unsharded under ZeRO-2, since only gradients and optimiser state are partitioned. The unsharded $2\Psi$ term is what makes ZeRO-2 infeasible for very large models even at high $N_d$, and is what motivates the third stage.
+</Callout>
+
+The worked numbers in the original paper (Rajbhandari et al. 2019, Table 1, on V100-class GPUs) at $N_d = 64$ are that ZeRO-1 trains up to about 7.5 B parameters, ZeRO-2 up to 14 B, and ZeRO-3 up to 128 B. At $N_d = 1024$, ZeRO-3 reaches the 1-trillion-parameter regime, which is the paper's headline claim. Those absolute thresholds depend on the assumed activation footprint and the per-GPU HBM (16 / 32 GB at the time); the *scaling* in $\Psi / N_d$ is what carries over to H100s and beyond.
+
+### Communication volume
+
+Communication is the price of partitioning. Rajbhandari et al. (2019, §5) and Zhao et al. (2023, §4) both analyse it. The asymptotic per-rank communication volume per step is:
+
+- **DDP baseline.** One ring all-reduce of gradients per step. A bandwidth-optimal ring all-reduce on $\Psi$ BF16 gradients moves $2\Psi$ bytes per rank (one reduce-scatter half plus one all-gather half, each of size $\Psi$). The familiar "$2\Psi$ DDP communication" figure refers to this ring volume.
+- **ZeRO-1.** The gradient all-reduce stays in place; the optimiser step runs locally on each rank's slice of the FP32 master; then an all-gather of the updated BF16 parameters must distribute every rank's $1/N_d$ slice to every other rank. Because the all-reduce decomposes as reduce-scatter + all-gather under ring topology, the post-step all-gather can fuse with the second half of the original all-reduce; ZeRO-1 ends up with the same $2\Psi$ asymptotic communication as DDP.
+- **ZeRO-2.** The gradient all-reduce is replaced by an explicit reduce-scatter (cost $\Psi$); each rank steps its optimiser slice; an all-gather (cost $\Psi$) redistributes the updated BF16 parameters. Total $2\Psi$, matching DDP.
+- **ZeRO-3.** Each forward pass needs the parameters of the current FSDP unit, requiring an all-gather. Across the whole forward, the cumulative all-gather volume is $\Psi$. Each backward pass needs the parameters again — another $\Psi$. Gradients are then reduce-scattered, another $\Psi$. Total $3\Psi$ per step, which is exactly $1.5\times$ the DDP baseline.
+
+The $1.5\times$-DDP figure is the canonical communication cost of ZeRO-3 / FSDP, and it is the headline trade-off: 50 % more bytes moved in exchange for $N_d$ times less model-state memory. The "$1.5\times$" is sometimes misquoted as "$4\times$" by analyses that count each all-gather and reduce-scatter as a separate round trip rather than as halves of a ring; the correct figure follows from the same ring-bandwidth accounting that gives DDP its $2\Psi$.
+
+Whether the extra 50 % communication is acceptable in practice depends on how well it overlaps with computation. The overlap is the engineering content of FSDP-2's prefetch machinery, treated in [the next section on the forward / backward dance](#fwd-bwd) and developed further in [the chapter on collectives and overlap](/textbook/02f-collectives-and-overlap).
+
+### ZeRO-Infinity and offload
+
+Rajbhandari et al. (2021, "ZeRO-Infinity," SC '21) extend ZeRO-3 along three further axes. The *Infinity offload engine* parks each rank's slice of the optimiser state in CPU DRAM or on local NVMe, bringing it back to GPU memory only for the optimiser step (CPU offload) or for the parameter all-gather (NVMe offload). *Memory-centric tiling* slices very large linear layers into tiles so that only one tile's worth of parameters is materialised on a rank at a time. *Bandwidth-centric partitioning* co-designs the all-gather schedule with the NVLink / InfiniBand topology of the host system. The paper claims one trillion parameters per V100 DGX-2 node and tens of trillions at cluster scale.
+
+By 2026 the offload component of ZeRO-Infinity is mostly used in fine-tuning and instruction tuning on resource-constrained clusters — the answer.ai "70-B at home" FSDP + QLoRA recipe leans heavily on CPU offload, for instance — not in pretraining the largest open models, where the PCIe bandwidth between CPU and GPU is the bottleneck that makes offload a ten-fold throughput penalty.
+
+---
+
+## FSDP-1 vs FSDP-2 {#fsdp-1-vs-2}
+
+At the algorithm level, FSDP *is* ZeRO-3. Both shard parameters, gradients, and optimiser state across a data-parallel group; both keep the model in a sharded rest state where each rank holds $1/N_d$ of every parameter; both all-gather the parameters of a unit on the way into a forward pass, compute, re-shard, and repeat. The PyTorch FSDP paper (Zhao et al. 2023, VLDB '23) and the DeepSpeed ZeRO-3 documentation both describe the same loop. Where FSDP and DeepSpeed ZeRO-3 differ is in the ecosystem around the algorithm; where FSDP-1 and FSDP-2 differ is in how the same algorithm is implemented inside PyTorch.
+
+### DeepSpeed ZeRO-3
+
+DeepSpeed originated at Microsoft Research in 2019 and was integrated as a Hugging Face Trainer backend around 2020. The native API is `deepspeed.initialize(model, optimizer, config=...)`, with the JSON config selecting the stage. DeepSpeed exposes ZeRO-1 and ZeRO-2 as user-selectable configurations that ship the full parameter set on every rank but partition gradients and optimiser state. Offload is granular: optimiser state and parameters can be offloaded to CPU or NVMe independently, with tunable prefetch granularity. The integration with Hugging Face is the strongest: passing `--deepspeed config.json` to the Trainer is the canonical recipe for fine-tuning a 70 B model on a small cluster. The implementation monkey-patches autograd at module entry and exit, which makes it slightly less native inside PyTorch than FSDP.
+
+### PyTorch FSDP-1 (FlatParameter)
+
+PyTorch's first FSDP shipped as a stable feature in PyTorch 1.12 (May 2022) under `torch.distributed.fsdp.FullyShardedDataParallel`. Its internal representation is the **FlatParameter**: each FSDP module is wrapped, and all parameters in the unit are concatenated and flattened into a single 1-D tensor, which is then chunked across ranks. The flat layout makes one all-gather and one reduce-scatter per unit — bandwidth-optimal for NCCL on dense parameter sets — and makes the original implementation tractable: one big tensor, one collective per direction.
+
+The costs of FlatParameter are real. Per-parameter metadata (`dtype`, `requires_grad`, custom precision policy) is awkward, because the unit of sharding is a flat concatenation of heterogeneous tensors. Frozen-parameter mixes — LoRA, where most of the base model is frozen and only adapters train — are clunky because the FlatParameter merges trainable and frozen tensors. Mixing FP8 and BF16 parameter dtypes in the same FSDP unit is not naturally supported. State-dict materialisation requires an all-gather across ranks because the flat representation is not a sane on-disk format. None of these is fatal, but they accumulate enough friction to motivate a rewrite.
+
+The FSDP paper (Zhao et al. 2023) reports near-DDP scaling efficiency on up to 512 A100s for models from 1 B to 175 B, validating the design's performance even with FlatParameter. The reservation is composability: FlatParameter does not compose cleanly with `torch.compile`, with float8 all-gather, or with parameter-efficient fine-tuning, all of which became central use cases in 2024–2025.
+
+### PyTorch FSDP-2 (`fully_shard`)
+
+FSDP-2 is the redesign. The new entry point is `torch.distributed.fsdp.fully_shard(module, mesh=..., reshard_after_forward=...)`, *not* the `FullyShardedDataParallel` class. PyTorch shipped FSDP-2 as a prototype in **PyTorch 2.4 (July 2024)**, promoted it through beta / under-active-development in **PyTorch 2.5 (October 2024)** and **PyTorch 2.6**, and it is the FSDP that gets new features. TorchTitan (the PyTorch-native reference LLM training stack of Liang et al. 2024, ICLR '25) ships with FSDP-2 as the default 1-D parallelism. **PyTorch 2.11 deprecates FSDP-1 entirely.**
+
+The substantive changes in FSDP-2 are five. First, **DTensor instead of FlatParameter**: each `nn.Parameter` becomes a `DTensor` sharded along dimension zero across the data-parallel mesh. There is no per-unit flat concatenation; each parameter is its own sharded object with its own metadata. Second, **per-parameter sharding** means FSDP-2 can mix FP8 / BF16 / FP32 parameters in the same model, freeze individual parameters (LoRA works out of the box), and apply different mixed-precision policies per parameter. Third, the **sharded state dict** is communication-free: each rank saves its own DTensor shard to disk directly; the full state dict, if needed, is materialised at load time, not at save time. Asynchronous checkpointing — copy DTensor shards to CPU, then have a side thread write them to disk while training proceeds — is built in. Fourth, **deterministic memory**: FSDP-1 used `recordStream` to manage the lifetime of unsharded buffers across CUDA streams, which produced non-deterministic peak memory; FSDP-2 uses explicit stream-to-stream synchronisation and avoids `recordStream`, giving a lower and deterministic peak. Fifth, **prefetch is implicit and always on `BACKWARD_PRE`**: FSDP-1 exposed three prefetch modes; FSDP-2 always prefetches `BACKWARD_PRE` because it is the only mode that correctly overlaps the all-gather of unit $k-1$ with the backward compute of unit $k$ in nested-module cases. Explicit forward prefetch is not yet implemented in FSDP-2 as of mid-2026.
+
+TorchTitan measurements on Llama-2 7 B on 8 H100s (Liang et al. 2024, Table 2) report FSDP-2 vs FSDP-1 at roughly **7 % lower peak GPU memory** and **1.5 % higher MFU**. The memory savings come primarily from deterministic allocation; the throughput gains come from simpler stream management. The per-parameter sharding by itself does not improve throughput on dense unit sizes; the wins are in *composability* — FSDP-2 composes cleanly with [tensor parallelism](/textbook/02b-tensor-parallel), with pipeline parallelism, with FP8 all-gather (Han et al., PyTorch blog 2024), with LoRA, and with `torch.compile`, in ways FSDP-1 did not.
+
+<ComparisonTable
+  caption="FSDP-1 vs FSDP-2 at the API and implementation level. FSDP-1 reaches end-of-life in PyTorch 2.11."
+  columns={["Property", "FSDP-1", "FSDP-2", "Source"]}
+  rows={[
+    ["Entry point", "FullyShardedDataParallel class", "fully_shard function", "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html"],
+    ["First stable / prototype release", "PyTorch 1.12 (May 2022)", "Prototype 2.4 (Jul 2024), beta 2.5 (Oct 2024)", "https://pytorch.org/blog/pytorch2-4/"],
+    ["End-of-life", "PyTorch 2.11", "—", "https://pytorch.org/blog/pytorch2-5/"],
+    ["Sharding unit", "FlatParameter (concatenated 1-D tensor)", "DTensor per-parameter", "https://arxiv.org/abs/2304.11277"],
+    ["Mixed dtypes per unit", "Awkward", "Native (FP8 / BF16 / FP32)", "https://github.com/pytorch/pytorch/issues/114299"],
+    ["Frozen parameters / LoRA", "Clunky (flat merges trainable + frozen)", "Native", "https://huggingface.co/docs/accelerate/concept_guides/fsdp1_vs_fsdp2"],
+    ["State-dict save", "All-gather to full state dict", "SHARDED_STATE_DICT, per-rank", "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html"],
+    ["Memory determinism", "Non-deterministic (recordStream)", "Deterministic (explicit syncs)", "https://arxiv.org/abs/2410.06511"],
+    ["torch.compile composition", "Limited", "Native (SimpleFSDP)", "https://arxiv.org/abs/2411.00284"],
+    ["Llama-2 7B on 8 H100s, peak memory", "Baseline", "−7 %", "https://arxiv.org/abs/2410.06511"],
+    ["Llama-2 7B on 8 H100s, MFU", "Baseline", "+1.5 %", "https://arxiv.org/abs/2410.06511"],
+  ]}
+/>
+
+The semantic flag that maps onto the ZeRO stages is `reshard_after_forward`. With `reshard_after_forward=True` (the default), the unsharded parameter buffer is freed after each forward unit and the parameters are all-gathered a second time at the matching backward — pure ZeRO-3 semantics. With `reshard_after_forward=False`, the unsharded parameters stay resident between forward and backward, saving one all-gather per unit at the cost of an extra $2\Psi / N_d$ of resident parameter buffer per unit. The flag is the FSDP-2 equivalent of switching between ZeRO-3 and a ZeRO-2-flavoured intermediate. It is not literally identical to DeepSpeed ZeRO-2 — DeepSpeed ZeRO-2 keeps the BF16 parameters replicated across all ranks, while FSDP-2 with `reshard_after_forward=False` still holds only the unsharded forward-window's worth of parameters per unit — but the memory characteristics are similar at the layer granularity.
+
+---
+
+## The forward / backward dance {#fwd-bwd}
+
+Following the canonical TorchTitan pattern, the user calls `fully_shard` on each transformer block and then on the top-level model:
+
+```python
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.device_mesh import init_device_mesh
+
+mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+for block in model.layers:
+    fully_shard(block, mesh=mesh, reshard_after_forward=True)
+fully_shard(model, mesh=mesh, reshard_after_forward=True)
+```
+
+Each `fully_shard` call defines an **FSDP unit**: a group of parameters that will be all-gathered together as one NCCL collective. The unit granularity matters for communication efficiency — NCCL collectives have a per-call latency floor of order ten microseconds on H100, so one call on a one-gigabyte tensor is far cheaper than a thousand calls on one-megabyte tensors each. FSDP-2 makes "the parameters in this module that are not in a sub-`fully_shard` call" the natural unit; in TorchTitan and across the Llama / Qwen / Mistral codebases that natural unit is exactly "one transformer block."
+
+For a model with $L$ FSDP units — typically one per transformer block plus one for the embedding and head — the per-microbatch schedule under `reshard_after_forward=True` runs as follows.
+
+**Forward.** The first unit's parameters are all-gathered across the DP mesh, producing an unsharded BF16 buffer on every rank. The forward of unit 1 runs against the unsharded weights. Immediately after, the unsharded buffer is freed (re-shard), and simultaneously a side CUDA stream begins the all-gather of unit 2. The forward of unit 2 runs as soon as its all-gather completes; the re-shard of unit 2 and the all-gather of unit 3 then overlap; and so on through unit $L$.
+
+**Backward.** Unit $L$ has either been kept unsharded (`reshard_after_forward=False`) or is all-gathered now. The backward of unit $L$ computes local gradients on the rank's slice of the batch, producing an unsharded gradient tensor. A reduce-scatter on that gradient leaves each rank with $1/N_d$ of the global gradient sum — exactly the slice it needs to step its piece of the optimiser state. While the reduce-scatter is in flight, the all-gather of unit $L-1$'s parameters runs in parallel on a side stream. The backward of unit $L-1$, the reduce-scatter of its gradients, and the prefetch of unit $L-2$ then overlap, and so on down to unit 1.
+
+**Optimiser step.** Each rank runs the optimiser locally on its shard of the FP32 master parameters, using its shard of the gradient. No communication.
+
+The crucial observation is that all of the FSDP collectives — $L$ forward all-gathers, $L$ backward all-gathers (under `reshard_after_forward=True`), and $L$ backward reduce-scatters — can in principle be overlapped with the compute of *adjacent* units. The overlap that is actually achieved is the central performance question and is treated mechanistically in [the NCCL collectives chapter](/textbook/02f-collectives-and-overlap). In the common pretraining regime where the compute time per unit exceeds the collective time per unit, FSDP-2 hides essentially all of the collective and the step is compute-bound; in the limit of small per-rank microbatch or very large $N_d$, the collective dominates and the step is communication-bound.
+
+### The `reshard_after_forward` knob
+
+`reshard_after_forward=False` removes one all-gather per unit on the backward — the parameters are still resident from forward, so no second gather is needed. It is the FSDP-2 analogue of ZeRO-2 semantics. The cost is that the unsharded parameter buffer of every unit must coexist in memory between forward and backward. With $L = 80$ transformer blocks and a 70 B model (so each block holds about 0.9 B parameters, contributing $\sim 1.8$ GB of unsharded BF16 weights), keeping all unsharded blocks resident would cost $80 \times 1.8 = 144$ GB per rank — infeasible on an 80 GB H100.
+
+A compromise that TorchTitan adopts is to leave only the *final* unit unsharded after forward, since it will be the first one needed at backward; this saves a single all-gather without committing significant resident memory. Llama-3 405 B's setup goes further: the Meta team explicitly disables the post-forward re-shard for *all* layers because the surrounding PP/TP configuration has already shrunk per-rank memory enough that the resident-parameter cost is acceptable, and the savings on the backward all-gather pays for itself in throughput. The exact variant Llama-3 uses is not fully settled in secondary sources (see [the frontier-lab landscape](#frontier-landscape) below) — both "ZeRO-1-equivalent" and "ZeRO-2-equivalent" descriptions appear in the literature.
+
+---
+
+## FSDP / ZeRO vs tensor parallel {#vs-tp}
+
+The reader has just finished [the tensor-parallel chapter](/textbook/02b-tensor-parallel) and [the data-parallel chapter](/textbook/02a-data-parallel). The natural question is when ZeRO-3 wins over tensor parallel and when the choice goes the other way. The answer turns on what each axis communicates.
+
+### What is communicated
+
+**Tensor parallel** (Megatron-style) communicates *activations*. At each transformer block, one all-reduce moves the output of the attention projection (shape $(B, S, H)$, where $B$ is the local batch, $S$ the sequence length, $H$ the hidden size), and a second all-reduce moves the output of the MLP. The per-block communication volume per rank is $\Theta(2 \cdot B \cdot S \cdot H)$ bytes, *independent of parameter count*.
+
+**ZeRO-3 / FSDP** communicates *parameters and gradients*. Each FSDP unit needs one parameter all-gather in forward and one in backward, of volume $\Theta(\Psi_{\text{unit}})$ each, plus a reduce-scatter of gradients of the same volume. Per unit per microbatch, the volume is $3 \Psi_{\text{unit}}$.
+
+The crossover depends on which is larger: the per-block parameter volume or the per-block activation volume.
+
+For a single transformer block of a Llama-3-style 70 B model — hidden size $H = 8192$, grouped-query attention with eight key-value heads, FFN intermediate $4H = 28672$ — the parameter count is roughly 0.9 B, so a forward all-gather moves about 1.8 GB of BF16 weights. An activation tensor at $(B, S, H) = (8, 8192, 8192)$ in BF16 is about 1 GB; the two per-block all-reduces under TP move about 2 GB.
+
+The volumes are comparable, but the *scaling* differs. Parameter volume is independent of batch and sequence length. Activation volume scales with $B \cdot S$. At small batch or short sequence, TP communicates less than ZeRO-3; at large batch and long sequence — the frontier-pretraining regime — ZeRO-3 communicates less relative to compute. The cleanest statement is from the Wang et al. (2024) ZeroPP analysis and the nanotron Ultrascale Playbook: **ZeRO-3 wins as the global batch size grows.**
+
+### Where each is fast in hardware
+
+Tensor parallel's per-block all-reduce sits on the *critical path* of every transformer block: the next block depends on its output, and there is no adjacent compute to overlap it with. TP latency is therefore the per-block all-reduce latency, and it demands the fastest available interconnect — intra-node NVLink / NVSwitch on a single DGX H100 or B200 node, at 900 GB/s. TP across nodes is almost never viable at scale.
+
+FSDP / ZeRO-3 all-gathers and reduce-scatters are *not on the critical path*: forward and backward prefetch overlap them with the compute of adjacent units. FSDP can therefore tolerate a slower interconnect — 400 Gbps per GPU on InfiniBand (the H100 baseline) is enough to hide collectives for typical pretraining unit sizes. FSDP scales out across nodes naturally; TP does not.
+
+The classical pattern, used by Llama-3 405 B (Grattafiori et al. 2024, §3.3) and by TorchTitan's three-dimensional reference setup, is *TP within a node, FSDP / ZeRO-3 across nodes*. When the model is too large for TP=8 alone — and 405 B does not fit at TP=8 on 80 GB H100s — pipeline parallelism is added across racks (PP=16 for 405 B). FSDP becomes the outermost dimension over the remaining DP cores. The Llama-3 paper is explicit (§3.3.1) that the team considered ZeRO-3 *across PP stages* but rejected it because of "extra communication overheads on every PP stage forward and backward" and "performance interference when overlapped with PP" — that is, the FSDP and PP collectives contended for the same network. The reported configuration instead uses a custom FSDP variant that does not shard parameters across the PP dimension, keeping parameters resident between forward and backward of each PP microbatch. The full four-dimensional decomposition is the subject of [the 3D / 4D composition chapter](/textbook/02h-3d-4d-composition).
+
+### TP + FSDP together (2-D parallelism)
+
+Stacking TP within a node and FSDP across nodes gives a two-dimensional mesh. The parameter shard on each rank is sized $\Psi / (N_d \cdot N_{tp})$ instead of $\Psi / N_d$, which both reduces the FSDP all-gather volume per call (the all-gather is now only over the $N_d$ axis, and only of the TP-sharded slice) and reduces the activation memory per rank (because TP shards activations too). TorchTitan reports an additional **12.6 %** throughput gain on Llama-3 70 B at 256-GPU scale from FSDP-2 + TP over pure FSDP-2 (Liang et al. 2024, §5). At 512-GPU scale on Llama-3 405 B, adding PP on top gives another **30 %**.
+
+---
+
+## Hybrid sharding (HSDP) {#hsdp}
+
+**Hybrid Sharded Data Parallel** combines FSDP within a "shard group" with DDP-style replication across shard groups. In PyTorch the mesh is two-dimensional, conventionally $(N_{\text{replicate}}, N_{\text{shard}})$, where the **shard** dimension runs FSDP (all-gather plus reduce-scatter on parameters) and the **replicate** dimension runs DDP (all-reduce of the locally reduced gradients). The typical mapping on a multi-node cluster is:
+
+- Shard dimension $= 8$, the GPUs within one DGX-style node (intra-node NVLink at 900 GB/s);
+- Replicate dimension $= N_{\text{nodes}}$, across InfiniBand at 400 Gbps per GPU.
+
+Pure FSDP across many nodes hits a wall: the parameter all-gather of an FSDP unit must traverse the slow inter-node IB fabric, and the bytes per rank stay at $\Psi_{\text{unit}}$. With many nodes, this all-gather dominates. HSDP confines the FSDP all-gather to within a node, where NVLink bandwidth is plentiful. Across nodes the only inter-node traffic is the all-reduce of locally reduced gradients — exactly the DDP pattern, which is bandwidth-optimal on the ring at $2\Psi$.
+
+The cost of HSDP relative to pure FSDP is *memory*: each node holds a full replica of the model state, sharded across its 8 GPUs by FSDP but not sharded across nodes. The decision rule is whether the per-node FSDP-sharded model state fits on one GPU. For a 13 B model on an 8-GPU node, intra-node sharding gives $16 \times 13 / 8 = 26$ GB per rank — fits — so HSDP is the right thing and collapses inter-node all-gathers into the cheaper all-reduce. For a 70 B model, intra-node sharding gives $16 \times 70 / 8 = 140$ GB per rank — does not fit on a single H100 — so 70 B must shard across nodes anyway and HSDP cannot apply at the 8-GPU node granularity. For 405 B, $16 \times 405 / 8 = 810$ GB per node is infeasible at any 8-GPU node, which is exactly why Llama-3 405 B abandons HSDP and uses TP × PP × FSDP without replication.
+
+A two-dimensional variant of FSDP-2 — sharding within a group and replicating across groups with `reshard_after_forward=False` — is sometimes called MiCS (Zhang et al. 2022) and matches the semantics of Amazon's SageMaker "sharded data parallelism." TorchTitan documents both: HSDP is ZeRO-3-within / DDP-across, and the `reshard_after_forward=False` variant has the same memory characteristics as ZeRO-2-within / DDP-across.
+
+---
+
+## Worked example: 70B on 64 H100s {#worked-example}
+
+The example tracks a realistic mid-2026 academic-tier cluster: a Llama-3-style 70 B dense decoder on 64 H100s.
+
+### Setup
+
+- **Model.** Llama-3-style 70 B dense decoder. $\Psi = 70 \times 10^9$ trainable parameters, $L = 80$ transformer blocks, hidden size $H = 8192$, grouped-query attention with eight key-value heads, FFN intermediate size $28672$, vocabulary 32 000 tokens.
+- **Cluster.** 8 DGX H100 nodes × 8 H100 GPUs = **64 H100s**, 80 GB HBM3 per GPU. Intra-node NVSwitch 900 GB/s; inter-node InfiniBand 400 Gbps per GPU (50 GB/s effective).
+- **Mixed precision.** BF16 forward and backward, FP32 master weights, FP32 Adam moments, FP32 gradient accumulation buffer.
+- **Step shape.** Sequence length 8192; per-GPU microbatch 1; global batch taken from [the schedules chapter](/textbook/01e-schedules-and-batch#batch-ramp) at $\approx 4$ M tokens, achieved by gradient accumulation across the DP world of 64.
+
+### Memory math under pure FSDP-2 (no TP, no PP, ZeRO-3)
+
+Per the [memory math section](#memory-math), per-rank model-state memory under ZeRO-3 is $16\Psi / N_d$:
+
+$$
+M_{\text{model state}} = \frac{16 \cdot 70 \times 10^9}{64} = 17.5 \times 10^9 \text{ bytes} = 17.5 \text{ GB}.
+$$
+
+Activation memory under selective recomputation — every-other-block recompute, the 2026 frontier default treated in [the mixed-precision and recompute chapter](/textbook/02g-mixed-precision-and-recompute) — for $L = 80$ blocks at $H = 8192$, $S = 8192$, $B_{\text{local}} = 1$ in BF16, is approximately 8.6 GB per rank (the full no-recompute footprint is about 17.2 GB; the every-other-block policy halves it).
+
+The unsharded parameter buffer is the maximum in-flight buffer under `reshard_after_forward=True`: one block's worth of unsharded BF16 weights. With $\Psi_{\text{block}} \approx 0.9$ B, that is $2 \times 0.9 \times 10^9 = 1.8$ GB.
+
+NCCL workspace, CUDA context, and FlashAttention scratch contribute roughly another 4 GB.
+
+The per-rank total is therefore approximately
+
+$$
+17.5 + 8.6 + 1.8 + 4 \approx 31.9 \text{ GB},
+$$
+
+leaving about 48 GB of headroom on an 80 GB H100 — enough to drop the recompute (saving wall-clock at a memory cost), to grow the microbatch to 2, or to extend the sequence to 16 K.
+
+### Comparison with weaker stages
+
+The same model on the same cluster:
+
+- **Plain DDP.** Model state per rank is $16 \Psi = 1120$ GB. Infeasible.
+- **ZeRO-1.** $4 \Psi + 12 \Psi / N_d = 4 \cdot 70 + 12 \cdot 70 / 64 = 280 + 13.1 \approx 293$ GB per rank. Infeasible.
+- **ZeRO-2.** $2 \Psi + 14 \Psi / N_d = 140 + 15.3 \approx 155$ GB per rank. Infeasible.
+- **ZeRO-3 / FSDP-2.** 17.5 GB per rank. **Fits.**
+
+ZeRO-3 is the smallest stage that fits 70 B on 80 GB H100s at $N_d = 64$. ZeRO-2 cannot reach a feasible footprint at any reasonable DP degree because of its unsharded $2\Psi$ term: even at $N_d = 1024$, $2 \cdot 70 + 14 \cdot 70 / 1024 \approx 140.96$ GB per rank. The parameter byte must be sharded.
+
+### Communication math
+
+Per microbatch step under pure FSDP-2:
+
+- **Forward.** Eighty all-gathers, one per block. Each rank receives $\Psi_{\text{block}} \cdot (N_d - 1) / N_d \cdot 2 \text{ bytes/param} \approx 2 \times 0.9 \text{ GB} \times 63 / 64 \approx 1.77$ GB. Total forward all-gather receive volume per rank is $80 \times 1.77 \approx 142$ GB.
+- **Backward.** Eighty more all-gathers (same volume), plus 80 reduce-scatters (each rank *sends* about 1.77 GB). Total backward volume per rank is $80 \times 1.77 + 80 \times 1.77 \approx 283$ GB.
+- **Total per step.** Approximately **425 GB per rank**.
+
+At an effective inter-node IB bandwidth of 50 GB/s per H100, the un-overlapped communication time is $425 / 50 \approx 8.5$ seconds. The compute side is comparable: a forward + backward microbatch through a 70 B dense decoder at sequence 8192 and microbatch 1 is about $6 \Psi S B_{\text{local}} = 6 \times 70 \times 10^9 \times 8192 \times 1 \approx 3.4 \times 10^{15}$ FLOP, which at 400 TFLOP/s sustained (a representative H100 rate for an FSDP-2 70 B run) is about 8.6 seconds. With compute approximately equal to communication, *overlap quality dictates the step time*. With FSDP-2's prefetch the step is approximately compute-bound; with FSDP-1 on the same hardware, TorchTitan reports about 7 % lower MFU.
+
+### Adding HSDP
+
+If the cluster has more nodes — say 32 nodes / 256 GPUs — pure FSDP across all 256 ranks gives a per-rank model state of $16 \times 70 / 256 = 4.4$ GB, well within budget. HSDP at the 8-GPU node granularity would give $16 \times 70 / 8 = 140$ GB per rank, infeasible. For 70 B specifically, plain FSDP across all available GPUs is the correct choice on standard 8-GPU nodes; HSDP would only pay off on 16-GPU nodes (such as a 2-rack H100 configuration) where intra-node sharding alone suffices.
+
+For a 13 B model on the same 32-node / 8-GPU-per-node cluster, the math swings: intra-node FSDP gives $16 \times 13 / 8 = 26$ GB per rank — fits — so HSDP collapses inter-node all-gathers into inter-node all-reduces and is a real win. The decision rule generalises: HSDP saves the inter-node FSDP all-gather only when the per-node FSDP sharding alone is sufficient to fit model state.
+
+---
+
+## Frontier-lab landscape, May 2026 {#frontier-landscape}
+
+### The PyTorch open-source default
+
+Across the open-weights labs — Meta Llama, Alibaba Qwen, Mistral, AI2 OLMo, DeepSeek for non-pretraining workflows, Cohere — **FSDP-2 via TorchTitan or a thin TorchTitan derivative is the default 1-D parallelism** as of PyTorch 2.5 / 2.6. For models that fit comfortably in HSDP per-node memory (roughly $\lesssim 200$ B parameters on a 64-H100 cluster), the default is HSDP within node + DDP across. For larger models, FSDP slots in as the outermost dimension of a TP × PP × FSDP stack.
+
+### DeepSpeed in 2026
+
+DeepSpeed ZeRO-3 remains the de-facto choice in three settings. First, **Microsoft research and the Phi family**: the Phi-3 / Phi-4 pretraining stack uses DeepSpeed ZeRO-3 with offload, with Abdin et al. (Phi-4 tech report, arXiv:2412.08905) describing the pretraining infrastructure as DeepSpeed-based. Second, **the Hugging Face Trainer for fine-tuning**: when the user passes `--deepspeed config.json`, DeepSpeed ZeRO-3 is invoked, and the 2024 answer.ai "70-B at home" FSDP + QLoRA recipe demonstrated that FSDP with NF4 quantisation and CPU offload could substitute for DeepSpeed at the low end. DeepSpeed retains an edge on offload tunability. Third, **MoE training in legacy stacks** such as Megatron-DeepSpeed (the BigScience BLOOM / Megatron-Turing 530 B codebase) combines DeepSpeed ZeRO-1 with Megatron TP / PP.
+
+<Callout variant="warning" title="What ZeRO is not used for">
+Cerebras' CS-2 and CS-3 wafers are sometimes informally grouped with the DeepSpeed-ZeRO ecosystem, but they do not run ZeRO at all. Their memory model is *weight streaming* from a separate MemoryX appliance into the wafer's on-chip SRAM, layer by layer; the wafer does not hold a sharded copy of the model state in the ZeRO sense. The two approaches solve the same problem (the model state does not fit in accelerator memory) along orthogonal axes — wafer-scale streaming versus rank-wise sharding — and are not interchangeable.
+</Callout>
+
+### Llama-3 and Llama-4
+
+**Llama-3 405B** (Grattafiori et al. 2024, §3.3, "Parallelism for Model Training") uses four-dimensional parallelism: TP=8 within node, CP (context parallel) for long-context fine-tuning, PP=16 across 16 racks, and FSDP as the outermost DP dimension. With this setup Meta reports 41 % BF16 MFU on 16 384 H100s. The exact FSDP variant is described in the paper as a custom FSDP that does not shard parameters across the PP dimension; secondary sources describe it variously as "ZeRO-1-equivalent" (sharding only optimiser state across DP) and as "ZeRO-2-equivalent" (sharding optimiser state and gradients but not parameters). The Llama-3 paper itself is more specific than either shorthand: it keeps parameters resident between forward and backward of each PP microbatch on the grounds that the FSDP and PP collectives otherwise contend for the same network. Pending a clarifying note from the Meta team, the safest reading is that the variant is ZeRO-2-like at the layer level but distinct from textbook ZeRO-2 in its interaction with the pipeline schedule; the literal "ZeRO-1 vs ZeRO-2" question is unsettled in secondary sources.
+
+**Llama-4** (Meta, April 2025 release notes; no formal paper as of May 2026) is described as "MoE with expert parallelism and 4D parallelism similar to Llama-3," with FSDP-2 explicitly listed as the data-parallel backbone.
+
+### DeepSeek-V3
+
+DeepSeek-V3 (DeepSeek-AI 2024, arXiv:2412.19437) runs on the in-house HAI-LLM framework with an unusual configuration: **ZeRO-1 only** (optimiser-state sharding) on the DP axis, **PP=16**, and **EP=64** (expert parallelism for the MoE FFN), with **no tensor parallelism**. The omission of TP is explicit: the DualPipe pipeline schedule and the large expert-parallel dimension saturate the compute and memory budget without requiring TP. ZeRO-1 (not ZeRO-3) is sufficient because EP already shards the bulk of the parameters — the MoE FFN is the parameter mass of a 671 B-parameter MoE, and the shared dense parameters are small enough that they do not need further partitioning. This is the canonical 2024–2025 counter-example to "ZeRO-3 is the default": when expert parallelism shards the parameters for you, lighter ZeRO is enough.
+
+### Qwen and partial disclosures
+
+Qwen-2.5 (Qwen Team, arXiv:2412.15115) does not publicly disclose its parallelism stack in detail; the supporting fine-tuning recipes published by Alibaba use DeepSpeed ZeRO-2 and ZeRO-3. Qwen-3 (Qwen Team, arXiv:2505.09388) similarly publishes DeepSpeed-based fine-tuning recipes. Phi-4's pretraining is stated to be DeepSpeed-based but parallelism stack details beyond that are not in the technical report. Gemma-3 (Google DeepMind, 2025) runs on JAX / Pathways with sharding patterns analogous to FSDP / ZeRO-3 but is not specific in the public report. GPT-OSS does not have a public technical report at the level of detail of the Llama-3 herd; its parallelism stack is inferred rather than disclosed.
+
+<ComparisonTable
+  caption="Disclosed (or inferred) ZeRO / FSDP configurations at frontier scale, May 2026. Variants flagged 'partial' or 'unsettled' indicate that the secondary literature does not converge on a single description."
+  columns={["Model", "Year", "Framework", "ZeRO / FSDP variant", "Other axes", "Source"]}
+  rows={[
+    ["Llama-3 405B", "2024", "PyTorch (custom)", "Custom FSDP, ZeRO-2-like at layer level (unsettled)", "TP=8, PP=16, CP", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-4", "2025", "PyTorch / FSDP-2", "FSDP-2 (release notes)", "MoE + EP + 4D similar to Llama-3", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["DeepSeek-V3", "2024", "HAI-LLM (in-house)", "ZeRO-1 only", "PP=16, EP=64, no TP", "https://arxiv.org/abs/2412.19437"],
+    ["Phi-4", "2024", "DeepSpeed", "ZeRO-3 with offload (partial)", "Not disclosed beyond DeepSpeed", "https://arxiv.org/abs/2412.08905"],
+    ["Qwen-2.5", "2024", "DeepSpeed (fine-tune)", "ZeRO-2 / ZeRO-3 in published recipes; pretraining stack not disclosed", "Partial", "https://arxiv.org/abs/2412.15115"],
+    ["Qwen-3", "2025", "DeepSpeed (fine-tune)", "ZeRO-2 / ZeRO-3 in published recipes; pretraining stack not disclosed", "Partial", "https://arxiv.org/abs/2505.09388"],
+    ["TorchTitan (reference)", "2024", "PyTorch FSDP-2", "FSDP-2 (`fully_shard`)", "TP + PP + CP optional", "https://arxiv.org/abs/2410.06511"],
+    ["BigScience / Megatron-DeepSpeed (legacy)", "2022", "Megatron-DeepSpeed", "ZeRO-1 + TP + PP", "MoE in some configs", "https://arxiv.org/abs/2201.11990"],
+  ]}
+/>
+
+### Pitfalls worth flagging
+
+A few engineering points come up often enough to call out. Mixing FSDP-1 wrap policies with FSDP-2 silently falls back to non-overlapping execution — the two APIs are not source-compatible, and the migration guide is required reading before porting a codebase. `reshard_after_forward=False` blows out memory on long pipelines; it should be used only for the final unit or when PP / TP have already shrunk per-rank memory enough. Frozen-parameter mixes (LoRA, frozen embeddings) work out of the box in FSDP-2 and are awkward in FSDP-1; if the workflow is parameter-efficient fine-tuning, FSDP-2 is the only sane choice. State-dict serialisation defaults to `SHARDED_STATE_DICT` in FSDP-2, which writes one shard per rank; obtaining a single-file `FULL_STATE_DICT` triggers a full all-gather and a memory spike on rank zero. CPU offload moves parameters and gradients through PCIe at about 64 GB/s, which is a ten-fold slowdown over GPU-resident training and is generally acceptable only when the alternative is out-of-memory. FP8 all-gather composability — all-gathering FP8 weights, halving FSDP communication volume, and recasting locally — is FSDP-2-only and is the next frontier for FSDP communication efficiency, with Han et al. (2024) reporting throughput improvements on Llama-3 70 B that have not yet been replicated at 405 B scale in the public record. DeepSpeed-to-FSDP migration is not 1-to-1: subtle differences in mixed-precision casting, gradient clipping, and optimiser state placement can affect numerics on close-to-instability runs, documented in the Hugging Face Accelerate "From DeepSpeed to FSDP and back" guide.
+
+---
+
+## Chapter summary {#summary}
+
+The Zero Redundancy Optimizer is the answer to a simple observation: DDP replicates model state across every data-parallel rank, and at frontier model sizes a single rank cannot hold what DDP asks it to hold. ZeRO partitions the three components of model state — optimiser state, gradients, parameters — across $N_d$ ranks in three stages. The per-rank model-state memory drops from $16\Psi$ under DDP to $4\Psi + 12\Psi / N_d$ under ZeRO-1, $2\Psi + 14\Psi / N_d$ under ZeRO-2, and $16\Psi / N_d$ under ZeRO-3. The communication cost rises from $2\Psi$ per step under DDP to $3\Psi$ under ZeRO-3 — $1.5\times$ DDP — in exchange for the linear reduction in memory.
+
+ZeRO-3 and PyTorch FSDP are the same algorithm. FSDP-1, the original 2022 implementation, represents each unit as a FlatParameter and ships its first stable release in PyTorch 1.12; FSDP-2, the redesigned `fully_shard` API shipped as a prototype in PyTorch 2.4 (July 2024) and as beta in PyTorch 2.5 (October 2024), replaces FlatParameter with per-parameter DTensor sharding and is the FSDP that gets new features. FSDP-1 reaches end-of-life in PyTorch 2.11. The substantive wins of FSDP-2 over FSDP-1 are deterministic memory, native composition with `torch.compile` and FP8 all-gather, and native support for mixed dtypes and frozen parameters; TorchTitan reports about 7 % lower peak memory and about 1.5 % higher MFU at the Llama-2 7 B scale.
+
+The choice between ZeRO-3 and tensor parallelism is determined by what each axis communicates. TP communicates activations and is on the critical path of every transformer block, demanding NVLink-class intra-node bandwidth and capping out at TP=8 on a DGX H100. ZeRO-3 / FSDP communicates parameters and gradients off the critical path via prefetch and can tolerate inter-node InfiniBand bandwidth. The frontier-pretraining pattern is TP within node and FSDP across nodes, with PP layered across racks for the largest models. Hybrid Sharded Data Parallel (HSDP) — FSDP within a shard group, DDP across groups — collapses inter-node FSDP all-gathers into the cheaper all-reduce and is the right choice whenever per-node FSDP sharding alone is sufficient to fit model state.
+
+The worked example anchors the abstractions: a 70 B Llama-3-style decoder on 64 H100s under pure FSDP-2 fits in about 32 GB per rank, leaves 48 GB of headroom for activations and microbatch, and moves about 425 GB of inter-rank traffic per step against an inter-node bandwidth that admits roughly that volume in the un-overlapped step time — making overlap quality the deciding factor for throughput, and FSDP-2's deterministic prefetch the reason it beats FSDP-1 by single-digit percentages on the same hardware. The mechanics of that overlap, and the NCCL primitives that implement it, are the subject of [the next chapter](/textbook/02f-collectives-and-overlap).
+
+---
+
+<Sources items={[
+  {
+    authors: "Rajbhandari, S., Rasley, J., Ruwase, O., He, Y.",
+    year: 2019,
+    title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+    venue: "SC '20, arXiv:1910.02054",
+    url: "https://arxiv.org/abs/1910.02054",
+    note: "Original ZeRO paper. Per-stage memory decomposition: DDP 16Ψ, ZeRO-1 4Ψ + 12Ψ/Nd, ZeRO-2 2Ψ + 14Ψ/Nd, ZeRO-3 16Ψ/Nd. K=12 for AdamW. 1.5× DDP communication for ZeRO-3."
+  },
+  {
+    authors: "Rajbhandari, S., Ruwase, O., Rasley, J., Smith, S., He, Y.",
+    year: 2021,
+    title: "ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning",
+    venue: "SC '21, arXiv:2104.07857",
+    url: "https://arxiv.org/abs/2104.07857",
+    note: "Infinity offload engine, memory-centric tiling, bandwidth-centric partitioning. 1 T parameters per DGX-2 V100 node, tens of T at cluster scale."
+  },
+  {
+    authors: "DeepSpeed Team (Microsoft)",
+    year: 2025,
+    title: "DeepSpeed ZeRO tutorial",
+    venue: "deepspeed.ai documentation",
+    url: "https://www.deepspeed.ai/tutorials/zero/",
+    note: "Canonical DeepSpeed ZeRO configuration reference; stage selection via JSON config; offload tunability."
+  },
+  {
+    authors: "Wang, G., Rajbhandari, S. et al.",
+    year: 2023,
+    title: "ZeRO++: Extremely Efficient Collective Communication for Giant Model Training",
+    venue: "ICML '24, arXiv:2306.10209",
+    url: "https://arxiv.org/abs/2306.10209",
+    note: "Quantised weight all-gather and hierarchical reduce-scatter that reduce ZeRO-3 communication by up to 4× on commodity clusters."
+  },
+  {
+    authors: "Zhao, Y., Gu, A., Varma, R. et al.",
+    year: 2023,
+    title: "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel",
+    venue: "VLDB '23, arXiv:2304.11277",
+    url: "https://arxiv.org/abs/2304.11277",
+    note: "PyTorch FSDP-1 paper. FlatParameter representation, near-DDP scaling efficiency on up to 512 A100s for 1B–175B models. Communication analysis matching Rajbhandari et al. 1.5× DDP for ZeRO-3."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2024,
+    title: "PyTorch 2.4 Release Blog",
+    venue: "pytorch.org blog",
+    url: "https://pytorch.org/blog/pytorch2-4/",
+    note: "FSDP-2 prototype shipped in PyTorch 2.4 (July 2024) under torch.distributed.fsdp.fully_shard."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2024,
+    title: "PyTorch 2.5 Release Blog",
+    venue: "pytorch.org blog",
+    url: "https://pytorch.org/blog/pytorch2-5/",
+    note: "FSDP-2 promoted to beta in PyTorch 2.5 (October 2024); FSDP-1 deprecation timeline."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2024,
+    title: "Getting Started with Fully Sharded Data Parallel (FSDP2)",
+    venue: "pytorch.org tutorials",
+    url: "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html",
+    note: "Official FSDP-2 tutorial. fully_shard API, mesh construction, reshard_after_forward flag, sharded state dict."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2023,
+    title: "Per-Parameter-Sharding FSDP RFC",
+    venue: "GitHub pytorch/pytorch#114299",
+    url: "https://github.com/pytorch/pytorch/issues/114299",
+    note: "Design RFC for FSDP-2: DTensor per-parameter sharding instead of FlatParameter, motivating composability with float8 / LoRA / torch.compile."
+  },
+  {
+    authors: "Hugging Face Accelerate Team",
+    year: 2025,
+    title: "FSDP1 vs FSDP2",
+    venue: "huggingface.co/docs",
+    url: "https://huggingface.co/docs/accelerate/concept_guides/fsdp1_vs_fsdp2",
+    note: "Side-by-side comparison of FSDP-1 and FSDP-2 from the Accelerate team. Migration guidance and behavioural differences."
+  },
+  {
+    authors: "Liang, W., Liu, T., Wright, L. et al.",
+    year: 2024,
+    title: "TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training",
+    venue: "ICLR '25, arXiv:2410.06511",
+    url: "https://arxiv.org/abs/2410.06511",
+    note: "PyTorch-native reference LLM training stack. FSDP-2 vs FSDP-1 on Llama-2 7B on 8 H100s: 7% lower peak memory, 1.5% higher MFU. 12.6% throughput gain from FSDP-2 + TP on Llama-3 70B at 256 GPUs; further 30% from PP on Llama-3 405B at 512 GPUs."
+  },
+  {
+    authors: "TorchTitan maintainers",
+    year: 2025,
+    title: "FSDP documentation",
+    venue: "github.com/pytorch/torchtitan",
+    url: "https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md",
+    note: "TorchTitan's FSDP documentation, including HSDP recipes and the reshard_after_forward conventions."
+  },
+  {
+    authors: "Zhang, R. et al.",
+    year: 2024,
+    title: "SimpleFSDP: Simpler Fully Sharded Data Parallel with torch.compile",
+    venue: "arXiv:2411.00284",
+    url: "https://arxiv.org/abs/2411.00284",
+    note: "torch.compile-native FSDP-2 implementation. Demonstrates FSDP-2's composability with compile in ways FSDP-1 did not support."
+  },
+  {
+    authors: "Grattafiori, A. et al. (Meta Llama Team)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3 405B parallelism: TP=8 within node, CP, PP=16, FSDP outermost. Custom FSDP variant that does not shard parameters across PP. 41% BF16 MFU on 16,384 H100s. §3.3 explicitly considers and rejects ZeRO-3-across-PP."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "Llama 4: Multimodal Intelligence",
+    venue: "ai.meta.com blog",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama-4 release notes. MoE with expert parallelism and 4D parallelism similar to Llama-3, with FSDP-2 listed as data-parallel backbone."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "In-house HAI-LLM framework. ZeRO-1 only on DP, PP=16, EP=64, no TP. Canonical example of lighter-ZeRO sufficiency when expert parallelism shards the bulk of parameters."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "Phi-4 14B. Pretraining infrastructure described as DeepSpeed-based; specific ZeRO stage and offload configuration not fully disclosed."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "Qwen-2.5 pretraining parallelism stack not disclosed in detail; supporting fine-tuning recipes use DeepSpeed ZeRO-2 / ZeRO-3."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Qwen-3 pretraining parallelism not disclosed in detail; published fine-tuning recipes use DeepSpeed-based ZeRO."
+  },
+  {
+    authors: "Wang, D., Lu, T. et al.",
+    year: 2024,
+    title: "ZeroPP: Unleashing Exceptional Parallelism Efficiency through Tensor-Parallelism-Free Methodology",
+    venue: "arXiv:2402.03791",
+    url: "https://arxiv.org/abs/2402.03791",
+    note: "Comparative analysis of ZeRO-3 vs TP communication scaling: ZeRO-3 wins as global batch grows."
+  },
+  {
+    authors: "Tazi, N., Wolf, T. et al. (Hugging Face / nanotron)",
+    year: 2025,
+    title: "The Ultrascale Playbook",
+    venue: "huggingface.co/spaces/nanotron/ultrascale-playbook",
+    url: "https://huggingface.co/spaces/nanotron/ultrascale-playbook",
+    note: "Comprehensive parallelism playbook covering FSDP / ZeRO / TP / PP / CP trade-offs at frontier scale."
+  },
+  {
+    authors: "Zhang, Z. et al.",
+    year: 2022,
+    title: "MiCS: Near-linear Scaling for Training Gigantic Model on Public Cloud",
+    venue: "arXiv:2205.00119",
+    url: "https://arxiv.org/abs/2205.00119",
+    note: "Minimum-Communication-Sharding: FSDP within a group plus replication across groups, matching SageMaker 'sharded data parallelism' semantics and prefiguring HSDP."
+  },
+  {
+    authors: "Han, A. et al. (PyTorch)",
+    year: 2024,
+    title: "Supercharging Training using float8 and FSDP2",
+    venue: "pytorch.org blog",
+    url: "https://pytorch.org/blog/training-using-float8-fsdp2/",
+    note: "FP8 all-gather with FSDP-2: weights all-gathered in FP8, locally cast back to BF16. Halves FSDP communication volume; FSDP-2-only because FlatParameter cannot mix dtypes."
+  },
+  {
+    authors: "Geiping, J. et al. (answer.ai)",
+    year: 2024,
+    title: "You can now train a 70b language model at home",
+    venue: "answer.ai blog",
+    url: "https://www.answer.ai/posts/2024-03-06-fsdp-qlora.html",
+    note: "FSDP + QLoRA + CPU-offload recipe for fine-tuning 70B models on small clusters. Demonstrates FSDP as a substitute for DeepSpeed at the low end."
+  },
+  {
+    authors: "Hugging Face Accelerate Team",
+    year: 2024,
+    title: "From DeepSpeed to FSDP and Back Again",
+    venue: "huggingface.co blog",
+    url: "https://huggingface.co/blog/deepspeed-to-fsdp-and-back",
+    note: "Migration guide documenting subtle differences in mixed-precision casting, gradient clipping, and optimiser state placement between DeepSpeed ZeRO-3 and FSDP."
+  },
+  {
+    authors: "AWS SageMaker documentation",
+    year: 2025,
+    title: "Hybrid sharded data parallelism",
+    venue: "docs.aws.amazon.com",
+    url: "https://docs.aws.amazon.com/sagemaker/latest/dg/model-parallel-core-features-v2-sharded-data-parallelism.html",
+    note: "SageMaker's HSDP-equivalent 'sharded data parallelism' offering. MiCS-style semantics."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "NVIDIA H100 Tensor Core GPU",
+    venue: "nvidia.com",
+    url: "https://www.nvidia.com/en-us/data-center/h100/",
+    note: "H100 specifications: 80 GB HBM3, NVSwitch 900 GB/s intra-node, 400 Gbps InfiniBand per GPU baseline."
+  }
+]} />

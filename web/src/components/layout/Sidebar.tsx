@@ -370,7 +370,7 @@ export function Sidebar() {
             label="Reading List"
             icon={<List className="w-4 h-4" />}
             collapsed={collapsed}
-            defaultOpen={readingActive || !collapsed}
+            defaultOpen={readingActive}
           >
             <NavItem
               to="/reading"

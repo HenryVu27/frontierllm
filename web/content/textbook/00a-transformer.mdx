@@ -34,6 +34,10 @@ $$\mathbf{x}^{(\ell)} = \mathbf{x}^{(\ell-1)} + \Delta_{\text{attn}}^{(\ell)} + 
 
 where $\Delta_{\text{attn}}^{(\ell)}$ is the output of the attention sub-layer applied to the stream (or a normalised version of it — the exact form depends on norm placement, covered in §[Pre-norm vs post-norm](#pre-norm-vs-post-norm)), and $\Delta_{\text{mlp}}^{(\ell)}$ is the output of the MLP sub-layer. The stream itself performs no computation; it is the running sum of all component contributions on top of the initial embedding.
 
+<Figure caption="Pre-norm transformer block. The residual stream (left) is the running sum; the attention and MLP sub-blocks read a normalised view, do their work, and write a delta back via the +-nodes.">
+  <TransformerBlock />
+</Figure>
+
 This framing was made precise by Elhage et al. (2021) in a mechanistic interpretability context, but it is equally useful as an engineering mental model. The key observations are:
 
 **The stream has linear read-write structure.** Every component reads from the stream with a left-multiplication by a weight matrix and writes back via an additive contribution. Attention head $i$ at layer $\ell$ reads $\mathbf{x}$ through $W_i^Q$, $W_i^K$, $W_i^V$, computes a context-weighted value, and writes the result back through $W_i^O$. The MLP reads $\mathbf{x}$ through $W_1$ and writes back through $W_2$. Neither the attention head nor the MLP modifies the stream in-place; they produce a residual that is added to it.

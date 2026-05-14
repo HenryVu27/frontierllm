@@ -1,0 +1,600 @@
+---
+slug: 01d-mup-and-transfer
+title: μP and hyperparameter transfer
+description: Predicting frontier-scale learning rates from small-width sweeps — Tensor Programs V, the 2025 challenges, and what frontier labs actually do.
+order: 14
+chapter: 13
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 34
+depends_on: [00d-normalization-and-init, 00f-optimizers]
+provides: [mup, mup-transfer, depth-mup, completep, init-scaling]
+last_reviewed: 2026-05-11
+---
+
+<Callout variant="note" title="Currency">
+Calibrated to frontier-model practice as of May 2026. The mathematical core (Tensor Programs IV/V, Table 3) is durable. The lab-by-lab adoption table and the Kosson 2025 refinement are the fastest-aging material in this chapter — recheck every 6–12 months.
+</Callout>
+
+## Why hyperparameter transfer matters {#orientation}
+
+A frontier pretraining run costs more compute than any organization can afford to repeat for the sake of a sweep. The 405B parameter Llama 3 run consumed approximately $3.8 \times 10^{25}$ FLOP across roughly sixteen thousand H100s for about fifty-four days (Meta 2024, §3); DeepSeek-V3 reported 2.788M H800-GPU-hours, about $5.6\text{M}$ in marginal cloud cost (DeepSeek 2024, §1). Within such a run, the learning rate, weight decay, $\beta_2$, initialization standard deviation, warmup length, and batch size collectively span at least five sensitive axes. A modest grid sweep over those axes is thousands of training-fleet-years.
+
+The maximal update parametrization (μP), introduced by Yang and collaborators in 2021–2022, attempts to answer this dilemma. Its central claim is that, under a particular re-scaling of initialization variances, per-parameter learning rates, and forward multipliers, the *optimal* base learning rate becomes invariant to model width. A practitioner can then sweep at a small proxy width — say $n = 256$ — and apply the proxy-derived $\eta_\text{base}$ at a target width several orders of magnitude larger, paying only the proxy's training cost. Yang et al. demonstrated this on BERT (a 13M-parameter proxy beating published BERT-large at 350M) and on GPT-3-style models (a 40M proxy outperforming a 6.7B target) at a tuning cost of roughly 7% of the full pretraining budget (Yang et al. 2022, abstract). Subsequent work has refined μP for SwiGLU, mixture-of-experts, depth, and Muon, and one 2025 paper has challenged the conventional account of why μP works at all. This chapter develops μP from first principles, presents the canonical parametrization table, walks the transfer procedure, surveys the 2024–2026 refinements, audits which frontier labs actually use μP, and presents the Kosson et al. weight-decay refinement.
+
+The chapter assumes familiarity with the [normalization and initialization chapter](/textbook/00d-normalization-and-init#initialization), which introduces depth-scaled initialization and gives a one-paragraph preview of μP, and with the [optimizer chapter](/textbook/00f-optimizers#adamw), which covers AdamW and per-parameter learning rate groups.
+
+**Notation.** Throughout: $n$ denotes width (input or hidden dimension), with $n_\text{base}$ a reference proxy width and $m = n / n_\text{base}$ the width multiplier; $L$ denotes depth; $\eta$ denotes the learning rate, with $\eta_\text{base}$ a base value defined at the proxy; $\sigma$ denotes initialization standard deviation; $d_h$ denotes the per-head dimension; $\lambda$ denotes the weight-decay coefficient.
+
+---
+
+## Why sweep at scale is infeasible {#why-infeasible}
+
+The compute case for hyperparameter transfer is elementary arithmetic. A single frontier pretraining run as of May 2026 costs $10^{24}$ to $10^{25}$ FLOP. Llama 3 405B ran for $3.8 \times 10^{25}$ FLOP across 15.6T tokens (Meta 2024, §3). DeepSeek-V3 671B (37B active) consumed 2.788M H800-GPU-hours over 14.8T tokens (DeepSeek 2024, §1). Published GPT-4-class compute is in the low $10^{25}$ FLOP range. A naive grid sweep over the learning rate alone uses ten to twenty points; a joint sweep over learning rate, weight decay, $\beta_2$, initialization standard deviation, and warmup length is five-dimensional. Even a coarse $4^5$ Latin-hypercube sample is roughly a thousand configurations. Running a thousand frontier-scale models is approximately $10^{28}$ FLOP — beyond the cumulative compute spent on every known frontier LLM combined. No organization sweeps at full target scale.
+
+What labs do instead, in the absence of μP or any equivalent transfer recipe, is one of three workarounds. The first is to *inherit prior recipes*: GPT-3 175B used $\eta = 6 \times 10^{-5}$, Llama-2 7B used $3 \times 10^{-4}$, Llama-3 405B used $8 \times 10^{-5}$ (Meta 2024, §3.4.1). These were not freshly derived for each run; they were extrapolated from prior runs of similar architecture and refined with short ablations at smaller checkpoints. The second is to *sweep at a fraction of total compute* — train several variants for 100B to 500B tokens rather than the full 10T–15T, evaluate, and choose. Even at one percent of the budget per data point, a five-point sweep costs five percent of the run. The third is to use *scaling laws for $N$ and $D$, not for hyperparameters* — Chinchilla (Hoffmann et al. 2022) gives the optimal $D \approx 20 N$ ratio but says nothing about how $\eta$ or $\lambda$ should change with size.
+
+The promise of μP, if it transfers cleanly, is to replace these workarounds with a principled small-proxy sweep. The central economic claim is the Yang et al. 2022 abstract figure of roughly 7% of total pretraining cost for proxy tuning. This is the single most impactful theoretical result for LLM economics besides Chinchilla itself. The next sections develop the mechanism behind that claim and then qualify it carefully.
+
+---
+
+## Standard parametrization vs μP {#sp-vs-mup}
+
+### The update-RMS preservation condition
+
+Consider a hidden feature $h^\ell \in \mathbb{R}^{n_\ell}$ at layer $\ell$ with width $n_\ell$. Define the per-step change $\Delta h^\ell$ produced by one optimizer step. The μP design principle is:
+
+> The RMS magnitude of $\Delta h^\ell$ should be $\Theta(1)$ — independent of width $n_\ell$ — during training.
+
+Why this matters. If the relative update magnitude $\|\Delta h^\ell\| / \|h^\ell\|$ shrinks with width, then large models effectively train at a slower per-step rate and increasing width *hurts* sample efficiency. If it grows with width, large models become unstable and require a smaller learning rate, defeating the point of building a larger model. The boundary regime — feature updates of order one — is *maximal* in the sense of "as much per-step learning as is consistent with stability." This is what "maximal" in *Maximal Update Parametrization* refers to.
+
+Yang and Hu (2021, Tensor Programs IV) made this rigorous. They proved a **Dynamical Dichotomy Theorem**: any parametrization of a deep network's weights either admits feature learning or has an infinite-width training dynamics given by kernel gradient descent (the NTK regime), but not both. They characterized the space of stable parametrizations as an *abc-parametrization* family $(a_\ell, b_\ell, c)$, where $a_\ell$ controls each layer's weight scale, $b_\ell$ controls its initialization variance, and $c$ controls the global learning rate. μP is the unique vertex of the feature-learning polyhedron in which *every* layer is in the feature-learning regime. Standard parametrization — the GPT-2 convention of fixed $\sigma \approx 0.02$ initialization and a single global $\eta$ — corresponds to a different vertex of the same polyhedron in which most layers are in the kernel regime.
+
+### Where the width-dependence comes from in SP
+
+The cleanest derivation of the SP problem starts from an Adam update on a linear layer $W \in \mathbb{R}^{n_\text{out} \times n_\text{in}}$. In SP, entries are initialized as $W_{ij} \sim \mathcal{N}(0, \sigma^2)$ with $\sigma = 0.02$ (the GPT-2 convention), and the global learning rate $\eta$ is fixed across all parameters. Under Adam the update to a single entry is approximately $\eta \cdot \mathrm{sign}(g_{ij})$ in expectation, because Adam normalizes by the running RMS of the gradient. For a hidden feature $h_j = \sum_i W_{ij} x_i$, the change in $h_j$ after one Adam step is the sum of $n_\text{in}$ approximately uncorrelated terms of size $\eta$:
+
+$$
+\Delta h_j \approx \sum_{i=1}^{n_\text{in}} \eta \cdot \mathrm{sign}(g_{ij}) \cdot x_i = \Theta\!\left(\eta \cdot \sqrt{n_\text{in}}\right).
+$$
+
+The $\sqrt{n_\text{in}}$ comes from the assumption that sign-flips are approximately independent — a step that Tensor Programs makes rigorous. The conclusion is that under SP plus Adam, the per-step feature change grows as $\sqrt{n_\text{in}}$. This is precisely the width-dependence that prevents transfer: if doubling the width doubles the effective learning rate at the feature level, the optimal $\eta$ must be roughly halved to compensate.
+
+μP corrects this by scaling the per-parameter learning rate by $1/n_\text{in}$ on hidden weights, so $\Delta h_j = \Theta(\eta_\text{base} / n_\text{in}) \cdot \sqrt{n_\text{in}} \cdot \sqrt{n_\text{in}} = \Theta(\eta_\text{base})$ — width-independent. The init variance is scaled in parallel so that the *static* forward activation magnitudes are also width-independent at step zero.
+
+### Tensor Programs V Table 3 {#table-3}
+
+The canonical μP versus SP comparison is Table 3 of Tensor Programs V (Yang et al. 2022). The table is reproduced verbatim below in the form most useful for an implementer: per parameter type, what changes in initialization variance, what changes in the per-parameter Adam learning rate, and what forward multiplier is needed, all relative to a base reference at width $n_\text{base}$ where $m = n / n_\text{base}$.
+
+<ComparisonTable
+  caption="Tensor Programs V Table 3 — SP and μP for general neural networks. Width multiplier m = n / n_base. Hidden weights are those with both fan-in and fan-out scaling with width."
+  columns={["Parameter type", "SP init variance", "SP Adam LR", "μP init variance", "μP Adam LR", "μP forward multiplier"]}
+  rows={[
+    ["Input weights + embeddings", "1/n_in (Kaiming)", "1 (no scaling)", "σ²_base (no scaling)", "η_base (no scaling)", "α_input (tunable)"],
+    ["Hidden weights", "1/n_in (Kaiming)", "1 (no scaling)", "σ²_base / m", "η_base / m", "none"],
+    ["Output (readout) weights", "1/n_in² (small)", "1/n_in", "σ²_base / m²", "η_base / m", "α_out / m"],
+    ["Biases", "—", "1 (no scaling)", "σ²_base (no scaling)", "η_base (no scaling)", "—"],
+    ["LayerNorm / RMSNorm gains", "—", "1 (no scaling)", "σ²_base (no scaling)", "η_base (no scaling)", "—"],
+    ["Attention logits", "softmax(QKᵀ / √d_h)", "—", "softmax(QKᵀ / d_h)", "—", "—"]
+  ]}
+/>
+
+The most surprising row is the last. In standard transformer attention, scores are computed as $\mathrm{softmax}(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_h})$. Under μP, the scale changes from $1/\sqrt{d_h}$ to $1/d_h$ — divide by the head dimension itself, not its square root. The motivation: under μP, the query and key entries have magnitude $\Theta(1)$ rather than $\Theta(\sqrt{d_h})$, so their dot product is $\Theta(d_h)$ and must be normalized by $d_h$ (not by $\sqrt{d_h}$) for the pre-softmax logits to remain $\Theta(1)$. This is not a typo. It is part of the parametrization, and it is the modification most commonly forgotten when an implementer ports an existing transformer codebase to μP.
+
+### What μP changes and what it does not {#changes-not-changes}
+
+Relative to the GPT-2 SP baseline, μP changes six items: hidden-layer init variance is scaled by $1/m$; hidden-layer Adam LR is scaled by $1/m$; output-layer Adam LR is scaled by $1/m$; output forward multiplier $\alpha_\text{out}/m$ is applied to the logits; attention scoring uses $1/d_h$ rather than $1/\sqrt{d_h}$; and tunable embedding multiplier $\alpha_\text{input}$ is applied at the embedding output. It does *not* change: the embedding learning rate (stays at $\eta_\text{base}$), bias learning rate, norm-gain learning rate, the optimizer choice (SGD, Adam, AdamW, Lion, Muon all admit μP, though Muon requires the telescoping algorithm of Shah et al. 2025), or the architecture beyond the attention-scale tweak.
+
+A practical note: Appendix B of Tensor Programs V gives two algebraically equivalent forms. The first scales initialization variances and learning rates simultaneously (Table 3 above). The second uses fixed initialization plus a forward multiplier per parameter group (Table 8 in the paper). Microsoft's `mup` library uses a hybrid: Table 3-style initialization, learning rates implemented via param groups, and forward multipliers ($\alpha_\text{input}$, $\alpha_\text{out}$) as inline scalars in the model code.
+
+---
+
+## The mup-transfer procedure {#transfer-procedure}
+
+A working μP setup is established and validated by a four-step protocol. The same protocol appears in both the EleutherAI practitioner's guide (2024) and Cerebras's developer documentation, and is the de facto standard for adopting μP in a new codebase.
+
+### Step 1: coordinate check
+
+Train models at widths $n \in \{64, 128, 256, 512\}$ for approximately ten steps each. Log the per-layer mean absolute activation $\overline{|h^\ell|}$ at every transformer block. Under correct μP, these curves should be approximately constant across the four widths at every depth. Under SP, the curves diverge — hidden-layer activation magnitudes grow with width. If the coordinate check fails, the implementation has a bug. The most common bug is leaving the attention scoring at $1/\sqrt{d_h}$; the second most common is forgetting one of the four code changes itemized in [§Implementation](#implementation). The coordinate check is cheap (single-GPU, minutes per run) and should be re-run after any non-trivial change to the model code.
+
+### Step 2: HP sweep on a proxy
+
+Choose a proxy width $n_\text{base}$ between 256 and 512. The EleutherAI guide recommends a minimum of 256 because the law-of-large-numbers approximations underlying μP's derivation hold only as a function of width; below 128 they are too noisy. Match the *target depth* $L$ at the proxy — μP-as-originally-stated does not transfer across depth, so the proxy and target must share $L$. Train each proxy configuration for approximately $20$ tokens per parameter, roughly Chinchilla-optimal. Random-search over four scalars: the base learning rate $\eta_\text{base}$, the base initialization standard deviation $\sigma_\text{base}$, and the two multipliers $\alpha_\text{input}$ and $\alpha_\text{output}$. Twenty to fifty proxy runs is typical.
+
+### Step 3: predict
+
+The optimal $(\eta_\text{base}, \sigma_\text{base}, \alpha_\text{input}, \alpha_\text{output})$ at the proxy applies directly to the target. The *effective* hidden-layer learning rate at target width $n_\text{target}$ is $\eta_\text{base}/m_\text{target}$ with $m_\text{target} = n_\text{target}/n_\text{base}$. Embeddings, biases, and norm gains retain $\eta_\text{base}$ with no width scaling. The library `mup.MuAdam` handles this automatically by reading the `infshape.width_mult()` of each parameter (set at model construction via `mup.set_base_shapes`); a hand-rolled implementation must use AdamW [param groups](/textbook/00f-optimizers#adamw) explicitly.
+
+### Step 4: validation
+
+Train a single intermediate-width model (e.g. $n = 4 n_\text{base}$) with the proxy-derived hyperparameters and confirm that the validation-loss-versus-LR curve matches the proxy-derived prediction. The visual signature of working μP is a plot of validation loss versus $\eta_\text{base}$, with one curve per width, in which *all curves share the same minimum-$\eta$ point*. Under SP the curves' minima drift to the left as width grows, by roughly a factor of $1/m$. Under μP the curves shift *down* (better loss at larger width) but stay aligned in $\eta$. This is Figure 1 of Tensor Programs V and the canonical visual artifact of the μP literature; it is reproduced in Cerebras-GPT Figure 3, u-μP Figure 1, and CompleteP Figure 2.
+
+The published empirical scales the procedure has been validated to are:
+
+- Yang et al. 2022 on BERT: hyperparameters transferred from a 13M proxy outperformed published BERT-large at 350M — a 27× parameter ratio.
+- Yang et al. 2022 on GPT-3-style architectures: hyperparameters transferred from a 40M proxy outperformed published GPT-3 6.7B — a 168× ratio, at 7% of total pretraining cost.
+- Dey et al. 2023 (Cerebras-GPT): μP applied from a 40M proxy to a 2.7B target gave a 0.43% improved Pile test loss and 1.7% higher downstream task accuracy versus matched SP runs, and the μP family had a 0.04% loss-versus-fit standard deviation across the [scaling law](/textbook/01c-scaling-laws) versus 0.66% for SP — a 16× variance reduction.
+- Lingle 2024 ("A Large-Scale Exploration of μ-Transfer"): tested up to 10B parameters and 190B tokens, confirming transfer works for "the majority of important cases" with several caveats developed in [§Refinements](#refinements).
+
+---
+
+## Refinements: SwiGLU, MoE, and depth {#refinements}
+
+The original μP derivation was for dense feedforward networks with element-wise nonlinearities. Modern transformers add gated FFNs, mixture-of-experts, very large depth, and orthogonalized optimizers like Muon. Each of these has required a refinement.
+
+### SwiGLU and gated FFNs
+
+A concern when μP was first applied to LLaMA-style transformers was whether the gated FFN — $\mathrm{SwiGLU}(x) = \mathrm{SiLU}(W_1 x) \odot (W_3 x)$, then projected by $W_2$ — breaks the μP derivation. The element-wise gate introduces a multiplicative cross-term whose variance scales differently from a simple linear layer, and the Tensor Programs analysis was originally stated for non-gated activations. Lingle 2024 (§4.2.10) tested this empirically: SwiGLU and Squared-ReLU both admit μ-transfer of the optimal learning rate across model sizes in his experiments, with no additional gate-specific scaling needed beyond the standard hidden-weight rule. The theoretical argument is that [SwiGLU](/textbook/00e-activations-and-gating#swiglu) is still locally bilinear in its weight matrices, so the Tensor Programs machinery applies. A caveat: the gate parameter $W_3$ is a hidden weight (fan-in $d_\text{model}$, fan-out $d_\text{ffn}$), so it follows the standard $1/m$ learning-rate rule. Implementations that try to "decouple" the gate from the other hidden weights with a separate multiplier do not improve transfer and may break it.
+
+### Mixture of Experts
+
+MoE introduces three new scaling axes not present in the dense derivation: the number of experts $E$, the top-$k$ routing parameter, and the *granularity* (the ratio of expert hidden size to total active parameters). The dense μP derivation does not by itself say anything about these.
+
+Two concurrent works in 2025–2026 address MoE-μP. Małaśnicki et al. 2025 ("μ-Parameterization for Mixture of Experts") treats router weights — which map $d_\text{model} \to E$, infinite-to-finite — as *output weights* under μP: their learning rate scales as $1/m$ in width $m = d_\text{model}/d_\text{base}$. Expert MLP weights are *hidden weights* under the standard rule. The empirical finding is that the optimal learning rate transfers across the *number of experts* $E$ when the model uses fixed granularity, but transfer breaks when granularity is changed — i.e., when expert hidden size $d_{\text{ff,expert}}$ is varied while active parameter count is held constant. The authors attribute this to the joint shift in top-$k$ and expert hidden size altering router-target distributions. Li, Bergsma et al. 2026 ("Hyperparameter Transfer with Mixture-of-Experts Layers") provides a parametrization for transformers with MoE layers scaling jointly along width, depth, $E$, and expert size; the derivation uses dynamic mean-field theory and the work builds on the CompleteP machinery (below). Transfer is demonstrated empirically across 51M to >2B total parameters. Neither paper has been validated at frontier scale; the largest public frontier MoEs (DeepSeek-V3 671B, Llama-4 Maverick, Qwen3-MoE-235B) have not reported MoE-μP transfer.
+
+### Depth-μP and CompleteP
+
+Width is one axis; depth is another, and the original μP only governs width. The standard workaround was to fix $L$ at the target value during the proxy sweep. The 2023–2025 work on depth-μP is the natural complement.
+
+Yang and Yu et al. 2023 (Tensor Programs VI, "Feature Learning in Infinite-Depth Neural Networks") proposes **Depth-μP** for residual networks with single-layer residual blocks. Each residual branch is scaled by $a/\sqrt{L}$ for a constant $a$ — i.e., $\alpha = 1/2$ in the $(\alpha, \gamma)$ parametrization space — and Adam learning rate is scaled by $1/\sqrt{L}$ with depth. The authors find that the absolute-value activation $|\cdot|$ is the unique homogeneous nonlinearity that maximizes feature diversity under this infinite-depth limit; ReLU, GELU, and SiLU give *degraded* performance at very large depth, which is a striking theoretical result though one of limited practical use given that no frontier transformer uses $|\cdot|$ as its activation. An important caveat is that Tensor Programs VI explicitly notes that for *transformer blocks* — which are multi-sub-layer residual blocks consisting of attention plus FFN — the single-layer derivation does not directly apply, and depth transfer in transformers has weaker theoretical guarantees. Bordelon, Atanasov, and Pehlevan 2023 ("Depthwise Hyperparameter Transfer in Residual Networks") gave a parallel dynamical mean-field-theory derivation for ResNets confirming the $1/\sqrt{L}$ residual scaling.
+
+The most actionable transformer-focused work is Dey et al. 2025, "Don't be lazy: CompleteP enables compute-efficient deep transformers." CompleteP sets:
+
+- Residual branch scaling: $h_{\ell+1} = h_\ell + L^{-\alpha} \, \mathcal{F}_\ell(h_\ell)$ with $\alpha = 1$ (not the $1/\sqrt{L}$ of Tensor Programs VI).
+- Hidden-layer learning rate: $\eta_\text{base} \cdot m_N^{-1} \cdot m_L^{\alpha - 1}$ where $m_L = L / L_\text{base}$ and $m_N$ is the width multiplier. With $\alpha = 1$ this collapses to $\eta_\text{base} / m_N$ — the depth correction lives in the residual-branch multiplier $L^{-\alpha}$ instead.
+- Pre-LN gain learning rate: $\eta_\text{base} \cdot m_L^{\alpha - 1}$.
+- Weight decay scaling: $\lambda_\text{base} \cdot m_N$.
+- AdamW $\epsilon$: $\epsilon_\text{base} \cdot m_N^{-1} \cdot m_L^{-\alpha}$.
+
+CompleteP was tested at depths up to $L = 179$ for 1.5B-parameter models. The headline result: CompleteP achieves **11.8% FLOP savings over μP at compute-optimal $N{:}L$ ratios**, and **34.4% savings at the deepest configurations** with $N/L \approx 11.8$. The mechanism is that CompleteP's $\alpha = 1$ scaling keeps every layer in the feature-learning regime even at extreme depth, whereas Depth-μP's $\alpha = 1/2$ admits a partial collapse to kernel-regime behavior in deep blocks.
+
+Wang et al. 2026 ("Completed Hyperparameter Transfer across Modules, Width, Depth, Batch and Duration") extends CompleteP to batch size and training duration, demonstrating per-module HP transfer in the LLM regime. Wang et al. 2026 ("Spectral Condition for μP under Width–Depth Scaling") gives a unifying spectral condition $\|W\|_*$ and $\|\Delta W\|_*$ that reproduces the prior depth-μP variants as special cases, validated empirically on nanoGPT trained with Muon-Kimi. Neither paper has been demonstrated at the 70B+ scale publicly.
+
+### u-μP
+
+Blake et al. 2025 ("u-μP: The Unit-Scaled Maximal Update Parametrization", ICLR 2025) combines μP with **Unit Scaling**, which inserts deterministic scale factors so that activations, weights, and gradients all begin training with RMS $\approx 1$. The combined recipe removes the need for loss scaling in FP8 training, reduces hyperparameter interdependencies (allowing nearly one-dimensional sweeps), and reports transfer error of 0.005 versus μP's 0.03 — the loss-difference between proxy-predicted optimal LR and the actually-optimal LR at target scale. u-μP works out-of-the-box in FP8 and is the recipe Graphcore uses for its internal FP8 experiments at 350M to 7B.
+
+### QK-norm and trainable RMSNorm gains
+
+Two modifications most frontier transformers carry that the original μP did not anticipate. The first is **QK-norm** (Henry et al. 2020; adopted in Gemma 3, Qwen3, OLMo 2), which inserts an RMSNorm on $\mathbf{Q}$ and $\mathbf{K}$ before the dot product. QK-norm *enlarges* the learning-rate basin — Lingle 2024 notes it reduces LR sensitivity and makes near-optimal performance easier to find — and is empirically compatible with μP. The second is **trainable RMSNorm gains**. Lingle 2024 §4.2.3 reports that "optimal LRs for these models do not reliably transfer when using $\Theta(1)$ LR scaling for the gains" — the trainable gains, with width-independent learning rate as μP prescribes, harm transferred models at the largest scales tested. Lingle's recommendation is to train norm gains with a separate, smaller learning rate or to freeze them entirely.
+
+### μP with Muon
+
+Muon (Jordan et al. 2024) orthogonalizes the gradient via a Newton–Schulz iteration before applying the parameter update. Orthogonalization introduces a per-matrix scale factor that is not present in Adam, so a direct application of μP's Adam-derived rules over-corrects. Shah et al. 2025 ("Practical Efficiency of Muon for Pretraining", Essential AI) study this combination. They confirm that μP plus Muon enables hyperparameter transfer up to 4B parameters, and they propose a **telescoping algorithm** that accounts for the additional sources of μP-error introduced by Muon's normalization at modest resource overhead. They also find that Muon retains its data efficiency at large batch sizes far beyond AdamW's critical batch size, expanding the compute-time Pareto frontier versus AdamW. Essential AI's use of μP plus Muon is one of the few cases where μP is publicly confirmed at the multi-billion-parameter scale by an industrial lab.
+
+---
+
+## What μP does and does not give you {#scope}
+
+A careful accounting separates μP's claims into three confidence tiers.
+
+**What μP gives cleanly (high confidence).** Width transfer of the base learning rate under Adam or AdamW is empirically reliable up to width multipliers of approximately 30× (Yang 2022) and confirmed at roughly 40× and 10B parameters (Lingle 2024). Cerebras-GPT demonstrates a 16× reduction in the variance of scaling-law fits relative to SP, which is a meaningful win for any lab whose scaling-law extrapolations drive training-budget decisions. μP also reduces sensitivity to small architectural changes — depth, head count, and FFN expansion factor can be iterated at small scale with a useful confidence that the proxy-optimal hyperparameters will still apply at the target. And μP provides a *theoretical framework* (Tensor Programs IV–VI, DMFT) that explains what was previously folk wisdom about learning-rate scaling.
+
+**What μP gives partially (medium confidence).** The output multiplier $\alpha_\text{out}$ and input multiplier $\alpha_\text{input}$ transfer in principle, but in practice they need to be swept jointly with $\eta_\text{base}$ at the proxy — they are not free parameters to inherit. The base initialization standard deviation $\sigma_\text{base}$ transfers, but the loss surface is much less sensitive to $\sigma_\text{base}$ than to $\eta_\text{base}$, so many practitioners use $\sigma = 0.02$ regardless. Weight decay $\lambda$ transfers under *independent* (decoupled) weight decay; under *coupled* weight decay (the L2-as-regularizer interpretation, which is what PyTorch's `Adam` uses by default), transfer is unreliable (Lingle §4.2.8; Kosson 2025). Batch-size transfer is *not* covered by original μP. The Power Lines framework (Bergsma et al. 2025) addresses it but is separate machinery: the AdamW timescale $\tau = B/(\eta \lambda D)$ should remain approximately constant across settings, and optimal $\lambda$ scales linearly with batch size $B$.
+
+**What μP does not give.** It does not choose model size $N$ or data quantity $D$ — that remains the job of IsoFLOP and Chinchilla-style [scaling laws](/textbook/01c-scaling-laws). μP makes the within-scaling-law variance smaller but does not move the optimal point on the $(N, D)$ curve. It does not give depth transfer in its original form — depth transfer requires Depth-μP or CompleteP, neither of which has been demonstrated at frontier scale. It does not give *schedule* transfer (warmup, cosine vs WSD vs constant) — schedule choice is orthogonal to μP and is covered in [the schedules and batch chapter](/textbook/01e-schedules-and-batch). It does not give *optimizer-choice* transfer: a proxy tuned with Lion does not give hyperparameters that work for a target trained with Adam. And it says nothing about tokenizer choice or data mixture.
+
+There is also a *diminishing-returns concern at the largest scales* that the literature has begun to articulate. The How-To-Scale book notes that μP shows stronger benchmark improvements at small to medium scales (200B–300B tokens) and that returns appear to diminish as scale increases. Kosson et al. 2025 — covered in [§Kosson](#kosson-2025) — provides a mechanistic explanation. The practical implication for May 2026 is that μP is most useful as a *mid-scale tuning tool* (1B to 30B parameters): labs can sweep at 100M and run at 7B–30B with high confidence, while at >100B parameters additional manual tuning at or near target scale is still typical.
+
+---
+
+## Implementation {#implementation}
+
+A working μP implementation requires changes in four places in the model and optimizer code. Each has a characteristic failure mode if omitted.
+
+### The four code changes
+
+**Initialization.** Replace a single `nn.init.normal_(W, std=0.02)` call with width-dependent standard deviations per parameter type. Input and embedding weights keep $\sigma_\text{base}$. Hidden weights use $\sigma_\text{base}/\sqrt{m}$. Output (readout) weights use $\sigma_\text{base}/m$. (The Microsoft `mup` library handles this through `mup.init.normal_` after `set_base_shapes` has been called on the model.)
+
+**Optimizer param groups.** This is the single most important code change. Split parameters into at least three groups in the AdamW constructor:
+
+```python
+param_groups = [
+    {"params": embedding_params,     "lr": lr_base},          # input/embed
+    {"params": hidden_params,        "lr": lr_base / m},      # hidden weights
+    {"params": output_params,        "lr": lr_base / m},      # output weights
+    {"params": norm_and_bias_params, "lr": lr_base},          # gains + biases
+]
+optimizer = torch.optim.AdamW(param_groups, weight_decay=lambda_base)
+```
+
+The library equivalent is `mup.MuAdam(model.parameters(), lr=lr_base, ...)`, which reads each parameter's `infshape.width_mult()` and divides the effective learning rate by that factor.
+
+**Forward multipliers.** Two inline scalars in the model code. The first is on the embedding output, $h = \mathrm{embed}(x) \cdot \alpha_\text{input}$. The second is on the final logits, $\mathrm{logits} = \mathrm{readout}(h) \cdot \alpha_\text{out} / m$. Both $\alpha_\text{input}$ and $\alpha_\text{out}$ are scalars swept at the proxy and inherited at the target.
+
+**Attention logit scale.** Change
+
+```python
+scores = q @ k.transpose(-2, -1) / math.sqrt(d_head)
+```
+
+to
+
+```python
+scores = q @ k.transpose(-2, -1) / d_head
+```
+
+This is the most commonly forgotten μP modification. The coordinate check (Step 1 of the [transfer procedure](#transfer-procedure)) is specifically designed to catch it: if the attention scale is left at $1/\sqrt{d_h}$, attention output norms grow with head dimension and the coordinate-check curves spread across widths.
+
+### What breaks if a term is forgotten
+
+A concise diagnostic table for the most common failures.
+
+<ComparisonTable
+  caption="Common μP implementation failures and their diagnostic signatures."
+  columns={["Forgotten term", "Visible failure mode", "Coordinate-check signature"]}
+  rows={[
+    ["Attention scale change (1/√d_h → 1/d_h)", "HP transfer fails above m ≈ 4; attention output norms grow with head dim", "Curves spread across widths at the attention output"],
+    ["Exempt embeddings from LR scaling", "Embedding updates shrink with width; learning plateaus early", "Embedding output norm decays over training at large m"],
+    ["Output-logit multiplier α_out/m", "Logits explode with width; loss spikes early", "Final logit magnitude diverges with width"],
+    ["Coupled weight decay (use decoupled)", "Hidden weights' pull-to-zero weakens with width; transfer unreliable", "Long-run weight norms drift across widths"],
+    ["Init scaling but not LR scaling (or vice versa)", "Either step-zero activations or per-step updates width-dependent; transfer breaks", "Either step-zero or post-step activation magnitudes drift"]
+  ]}
+/>
+
+### LR-schedule interaction
+
+A subtle implementation issue. Most PyTorch learning-rate schedulers (`CosineAnnealingLR`, `LinearLR`, etc.) operate on the optimizer's *absolute* per-group learning rates rather than on a single logical $\eta_\text{base}$. With μP param groups, an implementer must confirm the scheduler scales all groups proportionally — otherwise a cosine decay that hits the embedding group will leave hidden weights at their proxy-derived absolute LR for the entire run. The Microsoft `mup` library warns about this explicitly. The cleanest pattern is to define one logical $\eta_\text{base}$, schedule against that, and apply $\eta_\text{actual} = \eta_\text{base}/m$ inside the optimizer (which `MuAdam` does internally). The same caveat applies to schedule transfers between proxy and target, which is one of the reasons schedule choice is treated separately from μP in the [schedules and batch chapter](/textbook/01e-schedules-and-batch).
+
+---
+
+## Worked example: a width sweep {#worked-example}
+
+A concrete walk-through with believable numbers, designed to be reproducible without a GPU farm. All numbers below are schematic — the precise validation losses depend on data and seed — but the *qualitative shape* and the *transfer arithmetic* are exact.
+
+### Proxy configuration
+
+Take a small dense GPT-style transformer with $n_\text{base} = 256$, $L = 12$, $d_h = 64$, single-query attention (MHA, eight heads), SwiGLU FFN, RMSNorm, RoPE. The model has approximately 50M parameters. Sweep ten learning rates logarithmically spaced from $10^{-3}$ to $10^{-1}$:
+
+$$
+\eta_\text{base} \in \{1.0, 1.5, 2.2, 3.4, 5.2, 7.9, 12.1, 18.4, 28.1, 100\} \times 10^{-3}.
+$$
+
+Train each for 1B tokens — approximately 20 tokens per parameter, Chinchilla-optimal — and record final validation loss. The resulting validation-loss-versus-$\eta_\text{base}$ curve has its minimum at $\eta_\text{base}^\star = 8 \times 10^{-3}$. (The exact $\eta_\text{base}^\star$ depends on tokenizer, data, and minor architectural choices; values in the $5 \times 10^{-3}$ to $1.5 \times 10^{-2}$ range are typical for a 256-wide proxy with these conventions.)
+
+### Predicting the target
+
+Suppose the production model is $n_\text{target} = 8192$, $L = 32$, with everything else held fixed. The width multiplier is $m = 8192/256 = 32$. The transfer equations are:
+
+$$
+\eta_\text{hidden}(n_\text{target}) \;=\; \frac{\eta_\text{base}^\star}{n_\text{target}/n_\text{base}} \;=\; \frac{8 \times 10^{-3}}{32} \;=\; 2.5 \times 10^{-4},
+$$
+
+$$
+\eta_\text{other}(n_\text{target}) \;=\; \eta_\text{base}^\star \;=\; 8 \times 10^{-3} \quad (\text{embeddings, biases, norm gains}).
+$$
+
+Forward multipliers $\alpha_\text{input}$ and $\alpha_\text{out}$ inherit their proxy-optimal values directly. Initialization standard deviation $\sigma_\text{base}$ inherits at the proxy value with the per-parameter $1/\sqrt{m}$ or $1/m$ scaling baked into the init function.
+
+This $\eta_\text{hidden} = 2.5 \times 10^{-4}$ is the practical "headline LR" — the value an engineer would write into the training config. The other rates are typically expressed as ratios of the same logical $\eta_\text{base}$ inside the optimizer wrapper.
+
+### Validation curves: SP vs μP
+
+The diagnostic plot is validation loss versus $\eta_\text{base}$ with one curve per width, schematic numbers below.
+
+Under **SP** (no width scaling), the optimal learning rate moves to the left as width grows because of the $\sqrt{n}$ amplification derived in [§SP vs μP](#sp-vs-mup). On a log $\eta$ axis the curves are shifted but the *shapes* also widen unpredictably:
+
+- $n=256$: $\eta^\star \approx 4 \times 10^{-3}$
+- $n=512$: $\eta^\star \approx 2 \times 10^{-3}$
+- $n=1024$: $\eta^\star \approx 9 \times 10^{-4}$
+- $n=2048$: $\eta^\star \approx 4 \times 10^{-4}$
+
+Under **μP** with the proxy-derived $\eta_\text{base}^\star = 8 \times 10^{-3}$ and the per-parameter $1/m$ scaling applied internally, every width has its minimum at the *same* logical $\eta_\text{base}$. The curves shift *down* (smaller minimum loss at larger width) but stay aligned in $\eta$. This is Figure 1 of Tensor Programs V; reproducing this qualitative shape in a small ablation is the definitive practical evidence that a μP implementation is correct.
+
+### Grounding in public runs
+
+Cerebras-GPT (Dey et al. 2023, Table 7) set its base learning rate once for the 40M proxy and applied it through the entire family up to 2.7B with the per-width $1/m$ scaling. Llama-3 405B reports a final $\eta = 8 \times 10^{-5}$ for a $d_\text{model} = 16{,}384$ model (Meta 2024, §3.4.1); a back-of-envelope μP transfer from a $d = 2048$ proxy at $\eta_\text{base} \approx 1.3 \times 10^{-3}$ predicts the same $8 \times 10^{-5}$ for $m = 8$. The arithmetic is consistent with μP, but Meta does not document μP usage anywhere in the Llama-3 tech report. The number is therefore *suggestive* and not *evidence*. The next section makes this distinction explicit.
+
+---
+
+## Frontier-lab adoption as of May 2026 {#frontier-adoption}
+
+Adoption of μP at frontier scale is much thinner than community lore suggests. The published evidence as of May 2026 supports four labs as explicit μP users — Cerebras, Graphcore (u-μP), Essential AI, and Microsoft as the maintainer of the reference library. Every other major frontier-scale open-weight model lab either does not mention μP in its technical report or, in the case of DeepSeek-V3, uses an initialization scheme that explicitly contradicts μP. Absence of confirmation is not absolute proof of non-use — labs do not document every internal practice — but for working practitioners, the inference space should match the documented surface, not optimistic conjecture.
+
+<ComparisonTable
+  caption="μP adoption at frontier scale, as of May 2026. 'Publicly confirmed' means the technical report explicitly states μP is used; 'not confirmed' means the technical report does not mention μP in any form; 'explicit counter-example' means the report describes a recipe that is incompatible with μP."
+  columns={["Lab / Model", "Year", "μP status", "Evidence", "Source URL"]}
+  rows={[
+    ["Cerebras-GPT (111M–13B)", "2023", "Publicly confirmed (μP up to 2.7B; 13B in same family, scope ambiguous in §5.2)", "Dey et al. 2023 §3, §5.2 — explicit μP from 40M proxy with SP-vs-μP ablation", "https://arxiv.org/abs/2304.03208"],
+    ["Microsoft `mup` library", "2022–", "Reference implementation", "GitHub README, used in research at Microsoft", "https://github.com/microsoft/mup"],
+    ["Microsoft Phi-1 / 2 / 3 / 4", "2023–24", "Not confirmed (inferred from research lineage only)", "Phi-4 tech report does not mention μP", "https://arxiv.org/abs/2412.08905"],
+    ["Graphcore u-μP", "2024–25", "Publicly confirmed", "Blake et al. 2025, ICLR 2025 — unit-scaled μP, tested 350M–7B in FP8", "https://arxiv.org/abs/2407.17465"],
+    ["Essential AI (Muon study)", "2025", "Publicly confirmed", "Shah et al. 2025 §3 — μP+Muon with telescoping, up to 4B", "https://arxiv.org/abs/2505.02222"],
+    ["Meta Llama 2 70B", "2023", "Not confirmed", "Touvron et al. 2023 — tech report does not discuss μP", "https://arxiv.org/abs/2307.09288"],
+    ["Meta Llama 3 / 3.1 405B", "2024", "Not confirmed", "Meta 2024 — tech report does not discuss μP; §3.4.1 reports η=8e-5 without derivation", "https://arxiv.org/abs/2407.21783"],
+    ["DeepSeek-V2", "2024", "Not confirmed", "DeepSeek-V2 tech report does not mention μP", "https://arxiv.org/abs/2405.04434"],
+    ["DeepSeek-V3 671B", "2024", "Explicit counter-example (uniform std=0.006 init, no width scaling)", "DeepSeek-V3 §4.2 — uniform initialization is incompatible with μP's fan-in-scaled hidden-weight init", "https://arxiv.org/abs/2412.19437"],
+    ["Alibaba Qwen 2.5 72B", "2024", "Not confirmed", "Qwen 2.5 tech report — discusses HP scaling laws fitted to data, not μP", "https://arxiv.org/abs/2412.15115"],
+    ["Alibaba Qwen 3", "2025", "Not confirmed", "Qwen 3 tech report does not mention μP", "https://arxiv.org/abs/2505.09388"],
+    ["Google Gemma 2 / 3", "2024–25", "Not confirmed", "Gemma 2 and Gemma 3 tech reports do not mention μP", "https://arxiv.org/abs/2408.00118"],
+    ["AI2 OLMo 2", "2025", "Not confirmed", "OLMo 2 tech report does not mention μP", "https://arxiv.org/abs/2501.00656"],
+    ["Moonshot Kimi K2 (1T / 32B active)", "2025", "Not confirmed", "Uses MuonClip with QK-clip; tech report does not mention μP. External Spectral-μP paper demonstrates compatibility academically.", "https://arxiv.org/abs/2507.20534"],
+    ["HuggingFace SmolLM2 / SmolLM3 (3B)", "2025", "Not confirmed", "SmolLM3 blog: AdamW β=(0.9, 0.95), wd=0.1, peak LR 2e-4 inherited from Llama-3 / DeepSeek-V3; no μP claim", "https://huggingface.co/blog/smollm3"]
+  ]}
+/>
+
+Several observations follow from this table. First, the labs that publicly confirm μP are precisely those with explicit research investment in scaling theory: Cerebras (publishes about it and uses it operationally), Graphcore (u-μP), Microsoft (the library), Essential AI (Muon plus μP). Second, the frontier-scale *open-weight* model labs — Meta, DeepSeek, Alibaba, Google — appear to rely on scaling-law-fitted hyperparameter recipes derived from runs of intermediate size at or near target scale, rather than μP transfer from a small proxy. Third, DeepSeek-V3 671B is an existence proof that *frontier MoE performance is achievable without μP*: a uniform $\sigma = 0.006$ initialization is incompatible with μP's fan-in-scaled hidden-weight init, and the run produced one of the strongest open-weight models of 2024.
+
+Two cautions about reading the table. The Phi family is occasionally cited in community discussion as a μP user, on the grounds that Microsoft maintains the reference library. The published tech reports for Phi-1, Phi-2, Phi-3, and Phi-4 do not state that μP is used. The inference is from shared institutional affiliation and tooling, not from a tech-report statement. The chapter classifies Phi as "not confirmed" on that basis. Similarly, Llama-3 405B's $\eta = 8 \times 10^{-5}$ is arithmetically consistent with μP-style transfer from a small proxy, but Meta's tech report describes scaling-law experiments for $(N, D)$ and not for hyperparameters, and the LR derivation is not documented. The chapter classifies Llama 3 as "not confirmed."
+
+A partial mechanistic explanation for the gap between μP's promise and its frontier adoption — beyond the institutional fact that frontier labs already had hard-won scaling-law recipes before μP was published — is given by the Kosson et al. 2025 work covered next.
+
+---
+
+## The Kosson 2025 challenge {#kosson-2025}
+
+Kosson et al. ("Weight Decay may matter more than μP for Learning Rate Transfer in Practice", arXiv:2510.19093, October 2025) is the most challenging recent result on μP. The paper does not refute μP and does not claim Yang et al.'s original transfer demonstrations are wrong — those experiments are reproducible. It does, however, qualify *why* μP works and argue that for much of training, something else is doing the load-bearing work.
+
+The central empirical finding is that the μP invariant — that layer inputs are approximately geometrically aligned with weights and gradients, which is the assumption underlying the $\Theta(1)$-feature-update derivation — **holds only briefly at the very start of training**, for the first few hundred steps, and breaks down thereafter. After this opening phase, the geometric alignment that the Tensor Programs analysis depends on is no longer maintained. Yet μP-transferred learning rates still produce good runs at the target scale.
+
+Kosson et al.'s explanation is that **independent (decoupled) weight decay**, not μP's init-plus-LR scaling, is what stabilizes update dynamics across widths for the bulk of training. Under decoupled weight decay $W \leftarrow (1 - \lambda) W$ applied after the optimizer step, the long-run distribution of weight magnitudes is set by a balance between weight decay's pull-to-zero and the per-step optimizer update. This balance, the paper argues, *does* preserve a width-independent update-to-weight ratio in the regime where μP's invariant has broken down — provided the weight decay is applied independently and not as an L2 term inside the loss. μP's role, on this account, is mainly to set up the *opening* of training such that the post-warmup state is in a regime where weight decay can take over. The paper frames μP scaling as functioning, late in training, primarily as an *implicit learning-rate warmup* effect.
+
+This account fits a long-standing folk observation in the practitioner community: μP only transfers cleanly when used with *independent* weight decay. Coupled weight decay (the L2 interpretation, which appears in PyTorch's `Adam` constructor through the `weight_decay` argument when used with non-decoupled L2) has been informally known to break μP transfer, and Lingle 2024 §4.2.8 documented it empirically. Kosson 2025 supplies the mechanism: under coupled weight decay, the effective regularization scales with $\eta$, so when $\eta$ shrinks as $1/m$ for hidden weights the regularization also shrinks and the long-run weight norm grows with width — re-introducing the very width dependence that μP was designed to eliminate.
+
+The constructive companion to Kosson's critique is Bergsma et al. 2025, "Power Lines: Scaling Laws for Weight Decay and Batch Size in LLM Pre-training" (NeurIPS 2025). Bergsma et al. establish that the AdamW timescale $\tau = B/(\eta \lambda D)$ should remain approximately constant across training settings, that optimal $\lambda$ scales linearly with batch size $B$, and that optimal $\tau$ obeys a power law in tokens-per-parameter $D/N$. Combined with Kosson's analysis, the Power Lines framework provides a route to *deliberate* weight-decay tuning that is more directly under the practitioner's control than the implicit weight-decay-via-μP story.
+
+The chapter's reading of Kosson 2025 is that it is a **refinement**, not a refutation. Yang et al.'s original learning-rate transfer demonstrations remain valid as engineering recipes — they show that the proxy-derived $\eta_\text{base}$ produces a good run at the target scale. The Kosson work changes the picture in three practical ways. First, it strongly motivates joint weight-decay tuning at target scale *even after* the μP-transferred learning rate is fixed, rather than treating $\lambda$ as a free parameter to inherit. Second, it provides a partial explanation for the diminishing-returns observation at very large scales: as runs extend into the regime where the μP invariant is broken for most of training, μP's incremental value over a carefully tuned constant baseline narrows. Third, it suggests that the cleanest practitioner recipe is **μP for the learning rate**, **Power Lines for the weight decay and batch size**, and **CompleteP if depth is also being varied** — three orthogonal frameworks each addressing a different axis.
+
+---
+
+## Chapter summary {#summary}
+
+- The maximal update parametrization (Yang et al. 2022) re-scales initialization variances, per-parameter learning rates, and forward multipliers so that the *effective* feature update is $\Theta(1)$ per step independently of model width. The optimal base learning rate then becomes width-invariant and can be tuned on a small proxy.
+- The canonical practitioner recipe is the four-step protocol: coordinate check, proxy sweep (typically $n_\text{base} \in [256, 512]$ for 20–50 runs), prediction via $\eta_\text{hidden} = \eta_\text{base}^\star / m$, and a single intermediate-width validation run. Published demonstrations cover 27× (BERT) and 168× (GPT-3) width ratios at roughly 7% of full pretraining cost (Yang 2022) and 16× variance reduction in scaling-law fits (Cerebras-GPT, Dey et al. 2023).
+- The attention-scale change from $1/\sqrt{d_h}$ to $1/d_h$ is part of μP and is the most commonly forgotten modification. Other modern transformer ingredients are largely compatible with μP: SwiGLU transfers cleanly (Lingle 2024); QK-norm enlarges the LR basin and helps; MoE has its own recipes (Małaśnicki 2025, Li-Bergsma 2026) tested up to ≤2B parameters; depth requires Depth-μP or CompleteP (Dey et al. 2025, with up to 34.4% FLOP savings at large depth); Muon requires the Shah et al. telescoping algorithm.
+- μP adoption at frontier scale is thinner than commonly assumed. As of May 2026, the labs that publicly confirm μP are Cerebras, Graphcore (u-μP), Essential AI, and Microsoft (as library maintainer). Meta (Llama 2/3), DeepSeek (V2/V3), Alibaba (Qwen 2.5/3), Google (Gemma 2/3), AI2 (OLMo 2), and Moonshot (Kimi K2) do not document μP usage in their technical reports. DeepSeek-V3's uniform $\sigma = 0.006$ initialization is an explicit counter-example: a frontier MoE that reached state-of-the-art performance without μP.
+- Kosson et al. (2025) provides a significant refinement, not a refutation: the μP geometric invariant breaks down within hundreds of steps, and independent (decoupled) weight decay does most of the cross-width stabilization for the bulk of training. This explains the long-known requirement that μP be paired with decoupled weight decay and partially explains μP's diminishing returns at very large scales.
+- For working practitioners as of May 2026, the recommended stack is **μP for learning-rate transfer across width**, **Power Lines (Bergsma 2025) for weight decay and batch size**, **CompleteP (Dey 2025) for depth**, and a small amount of target-scale ablation budget retained for joint weight-decay tuning after the μP-transferred learning rate is fixed.
+
+---
+
+<Sources items={[
+  {
+    authors: "Yang, G. & Hu, E. J.",
+    year: 2021,
+    title: "Tensor Programs IV: Feature Learning in Infinite-Width Neural Networks",
+    venue: "ICML 2021",
+    url: "https://arxiv.org/abs/2011.14522",
+    note: "The Dynamical Dichotomy Theorem and the abc-parametrization family; theoretical foundation that μP is the unique 'maximal' feature-learning parametrization."
+  },
+  {
+    authors: "Yang, G. et al.",
+    year: 2022,
+    title: "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer",
+    venue: "arXiv:2203.03466",
+    url: "https://arxiv.org/abs/2203.03466",
+    note: "The canonical μP paper. Table 3 gives the SP-vs-μP comparison; demonstrates BERT 13M→350M and GPT-3-style 40M→6.7B transfer at ~7% tuning cost."
+  },
+  {
+    authors: "Yang, G., Yu, D. et al.",
+    year: 2023,
+    title: "Tensor Programs VI: Feature Learning in Infinite-Depth Neural Networks",
+    venue: "arXiv:2310.02244",
+    url: "https://arxiv.org/abs/2310.02244",
+    note: "Depth-μP for single-layer residual blocks; residual branch scaled by a/√L; absolute-value activation maximizes feature diversity at infinite depth. Caveats on transformer applicability."
+  },
+  {
+    authors: "Bordelon, B., Atanasov, A., Pehlevan, C.",
+    year: 2023,
+    title: "Depthwise Hyperparameter Transfer in Residual Networks",
+    venue: "arXiv:2309.16620",
+    url: "https://arxiv.org/abs/2309.16620",
+    note: "DMFT-based derivation of 1/√L residual scaling for ResNets; parallel to Tensor Programs VI."
+  },
+  {
+    authors: "Dey, N. et al.",
+    year: 2023,
+    title: "Cerebras-GPT: Open Compute-Optimal Language Models",
+    venue: "arXiv:2304.03208",
+    url: "https://arxiv.org/abs/2304.03208",
+    note: "Explicit μP usage from a 40M proxy through 2.7B; SP-vs-μP ablation shows 0.43% improved Pile test loss, 1.7% higher downstream accuracy, 16× variance reduction in scaling-law fits."
+  },
+  {
+    authors: "Hoffmann, J. et al.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models (Chinchilla)",
+    venue: "arXiv:2203.15556",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "Establishes D ≈ 20N compute-optimal ratio; cited here for what μP does NOT replace — namely, IsoFLOP for choosing N and D."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2024,
+    title: "The Practitioner's Guide to the Maximal Update Parameterization",
+    venue: "EleutherAI Blog",
+    url: "https://blog.eleuther.ai/mutransfer/",
+    note: "The standard practitioner guide; four-step protocol (coordinate check, proxy sweep, predict, validate); recommends n_base ≥ 256."
+  },
+  {
+    authors: "Cerebras",
+    year: 2024,
+    title: "The Practitioner's Guide to the Maximal Update Parameterization",
+    venue: "Cerebras Blog",
+    url: "https://www.cerebras.ai/blog/the-practitioners-guide-to-the-maximal-update-parameterization",
+    note: "Cerebras's developer-facing guide; aligned with EleutherAI's protocol and Microsoft's library."
+  },
+  {
+    authors: "Microsoft",
+    year: 2022,
+    title: "mup: Maximal Update Parametrization Library",
+    venue: "GitHub",
+    url: "https://github.com/microsoft/mup",
+    note: "Reference PyTorch implementation. MuAdam reads infshape.width_mult() per parameter. set_base_shapes wires up the per-parameter width-multiplier metadata."
+  },
+  {
+    authors: "Lingle, L.",
+    year: 2024,
+    title: "A Large-Scale Exploration of μ-Transfer",
+    venue: "arXiv:2404.05728",
+    url: "https://arxiv.org/abs/2404.05728",
+    note: "Tests up to 10B parameters and 190B tokens. §4.2.3: trainable RMSNorm gains harm transfer at large scale. §4.2.8: coupled weight decay breaks transfer. §4.2.10: SwiGLU and Squared-ReLU admit μ-transfer."
+  },
+  {
+    authors: "Blake, C. et al.",
+    year: 2025,
+    title: "u-μP: The Unit-Scaled Maximal Update Parametrization",
+    venue: "ICLR 2025; arXiv:2407.17465",
+    url: "https://arxiv.org/abs/2407.17465",
+    note: "Combines μP with Unit Scaling. Removes loss-scaling need in FP8; transfer error 0.005 vs μP's 0.03. Graphcore's frontier-scale μP variant."
+  },
+  {
+    authors: "Dey, N. et al.",
+    year: 2025,
+    title: "Don't be lazy: CompleteP enables compute-efficient deep transformers",
+    venue: "NeurIPS 2025; arXiv:2505.01618",
+    url: "https://arxiv.org/abs/2505.01618",
+    note: "Residual branch scaled by L⁻¹ (α=1, not 1/√L); 11.8% FLOP savings at compute-optimal N:L; 34.4% savings at deepest configs. Tested at L=179, 1.5B parameters."
+  },
+  {
+    authors: "Wang et al.",
+    year: 2026,
+    title: "Completed Hyperparameter Transfer across Modules, Width, Depth, Batch and Duration",
+    venue: "arXiv:2512.22382",
+    url: "https://arxiv.org/abs/2512.22382",
+    note: "Extends CompleteP to batch size and training duration; per-module HP transfer in the LLM regime."
+  },
+  {
+    authors: "Wang et al.",
+    year: 2026,
+    title: "Spectral Condition for μP under Width–Depth Scaling",
+    venue: "arXiv:2603.00541",
+    url: "https://arxiv.org/abs/2603.00541",
+    note: "Unifies prior depth-μP variants under a spectral condition on ‖W‖_* and ‖ΔW‖_*. Empirical validation on nanoGPT with Muon-Kimi."
+  },
+  {
+    authors: "Małaśnicki, J. et al.",
+    year: 2025,
+    title: "μ-Parameterization for Mixture of Experts",
+    venue: "arXiv:2508.09752",
+    url: "https://arxiv.org/abs/2508.09752",
+    note: "MoE-μP. Router treated as output weight (1/m LR); experts as hidden weights. LR transfers across E at fixed granularity; breaks when granularity is varied."
+  },
+  {
+    authors: "Li, M., Bergsma, S. et al.",
+    year: 2026,
+    title: "Hyperparameter Transfer with Mixture-of-Experts Layers",
+    venue: "arXiv:2601.20205",
+    url: "https://arxiv.org/abs/2601.20205",
+    note: "DMFT-justified joint scaling across width, depth, E, and expert size. Builds on CompleteP. Transfer demonstrated up to >2B total parameters."
+  },
+  {
+    authors: "Shah, P. et al. (Essential AI)",
+    year: 2025,
+    title: "Practical Efficiency of Muon for Pretraining",
+    venue: "arXiv:2505.02222",
+    url: "https://arxiv.org/abs/2505.02222",
+    note: "μP+Muon up to 4B. Telescoping algorithm accounts for μP-error from Muon's orthogonalization. Muon retains efficiency at large batch sizes beyond AdamW's critical batch."
+  },
+  {
+    authors: "Kosson, A. et al.",
+    year: 2025,
+    title: "Weight Decay may matter more than μP for Learning Rate Transfer in Practice",
+    venue: "arXiv:2510.19093",
+    url: "https://arxiv.org/abs/2510.19093",
+    note: "μP geometric invariant breaks within first few hundred steps. Independent (decoupled) weight decay does most of the cross-width stabilization for the rest of training. μP late in training functions as implicit LR warmup."
+  },
+  {
+    authors: "Bergsma, S. et al.",
+    year: 2025,
+    title: "Power Lines: Scaling Laws for Weight Decay and Batch Size in LLM Pre-training",
+    venue: "NeurIPS 2025; arXiv:2505.13738",
+    url: "https://arxiv.org/abs/2505.13738",
+    note: "AdamW timescale τ = B/(η λ D) should remain constant; optimal λ scales linearly with batch size B; optimal τ obeys a power law in D/N. Constructive companion to Kosson 2025."
+  },
+  {
+    authors: "Meta Llama Team",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "§3 compute breakdown (~3.8 × 10²⁵ FLOP). §3.4.1 LR = 8e-5 for 405B without derivation. Tech report does not mention μP — basis for the 'not confirmed' classification."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "§4.2 uses uniform initialization std = 0.006 with no width-dependent scaling — incompatible with μP's fan-in-scaled hidden-weight init. The explicit counter-example in the frontier-adoption table."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2 Technical Report",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "Predecessor model; tech report does not mention μP."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "Llama 2 tech report; does not mention μP."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "Discusses HP scaling laws fitted to data; does not mention μP."
+  },
+  {
+    authors: "Qwen Team",
+    year: 2025,
+    title: "Qwen 3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Qwen 3 tech report; does not mention μP."
+  },
+  {
+    authors: "Gemma Team",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv:2408.00118",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "Gemma 2 tech report; does not mention μP."
+  },
+  {
+    authors: "AI2 OLMo Team",
+    year: 2025,
+    title: "OLMo 2: Furthering Cyclic Scaling",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "OLMo 2 tech report; does not mention μP."
+  },
+  {
+    authors: "Moonshot AI",
+    year: 2025,
+    title: "Kimi K2: Open Mixture-of-Experts LLM",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "Uses MuonClip with QK-clip; tech report does not mention μP. External Spectral-μP paper (Wang 2026) demonstrates compatibility academically."
+  },
+  {
+    authors: "Abdin, M. et al.",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "Phi-4 tech report; does not explicitly mention μP. Basis for classifying Phi family as 'not confirmed' despite Microsoft's maintenance of the mup library."
+  },
+  {
+    authors: "Stevens, S.",
+    year: 2024,
+    title: "Maximal Update Parameterization (muP or μP)",
+    venue: "samuelstevens.me",
+    url: "https://samuelstevens.me/writing/mup",
+    note: "Pedagogical reference. Clear derivation of the √n-feature-update problem; matches the §SP-vs-μP narrative."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 training configuration",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Recipe: AdamW β=(0.9, 0.95), wd=0.1, peak LR 2e-4 — inherited from Llama-3 / DeepSeek-V3, no documented μP transfer. Adds to the 'open frontier labs largely do not document μP' frontier-adoption table row."
+  }
+]} />

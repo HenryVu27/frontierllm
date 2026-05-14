@@ -1,0 +1,698 @@
+---
+slug: 01h-annealing-and-stability
+title: Midtraining, annealing, and stability
+description: The late-pretraining phase — WSD decay, data-quality ramp, FP8 training, gradient-spike management, and the 2024–2026 frontier stability stacks.
+order: 18
+chapter: 17
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 42
+depends_on: [01e-schedules-and-batch, 01f-data-curriculum, 00d-normalization-and-init, 00f-optimizers]
+provides: [annealing, midtraining, fp8-training, mxfp8, nvfp4, loss-spike, qk-norm-stability, z-loss, gradient-clipping]
+last_reviewed: 2026-05-11
+---
+
+## What this chapter covers {#orientation}
+
+A frontier pretraining run does not end the way it begins. The final 1–10% of tokens is usually executed under a different regime: a decaying learning rate, a data mix shifted toward higher-quality and capability-targeted sources, frequently a longer context window, and sometimes a different numerical precision. This *late phase* is where the model's downstream-benchmark profile is set, where the FP8 quantisation recipe pays off or fails, and where the run's reliability stack is finally judged. The same recipe acquires different names — *annealing*, *midtraining*, *decay*, *cooldown*, *Stage 2/3*, *high-quality phase* — depending on the lab and the year.
+
+This chapter has two intertwined goals. The first is to catalogue what is publicly known about the late phase: how Llama-3, DeepSeek-V3, Qwen3, Phi-4, Kimi K2, OLMo-2, and Gemma-2 actually structured their endgames, with the numbers quoted from the technical reports. The second is to assemble the operational stability stack: the gradient-clipping, AdamW $\epsilon$, z-loss, QK-norm, FP8 scaling, and checkpoint-surgery practices that allowed those runs to finish without loss spikes. The two threads converge in the worked example that closes the chapter — a 13B annealing recipe that inherits one numerical choice from each disclosed source.
+
+The literature has not converged on a *minimal* stability set. DeepSeek-V3, Kimi-K2, and OLMo-2 each claim a clean run with a comprehensive but very different combination of techniques; no published ablation falsifies any single component as necessary. The chapter therefore reports techniques as a menu, not a checklist.
+
+---
+
+## Terminology and phase boundaries {#terminology}
+
+The vocabulary surrounding the late phase is fragmented across labs and across years. Operationally, the following terms all refer to the same recipe: the last 5–20% of pretraining tokens, executed with a decaying (often linearly to zero) learning rate on a data mix shifted toward higher-quality or capability-targeted material.
+
+<Callout variant="note" title="Vocabulary disambiguation">
+The following are operational synonyms in the 2024–2026 literature:
+
+- **Annealing phase** — Meta (Llama-3, 2024); Ai2 (OLMo-2, 2025). Emphasises the schedule: the LR is *annealed* to zero on an HQ mix.
+- **Midtraining / mid-training** — Microsoft (Phi-4, 2024); Llama-4 release blog (2025). A broader umbrella that usually includes annealing *plus* long-context extension; sometimes synthetic-heavy.
+- **Decay phase** — MiniCPM (Hu et al., 2024) and the WSD-schedule literature. The decay segment of a Warmup–Stable–Decay schedule.
+- **Cooldown** — the continual-LR / infinite-schedule community (Ibrahim et al., TMLR 2024). Emphasises that after a long constant-LR plateau, the LR *cools* toward zero.
+- **Stage 2 / Stage 3** — Qwen3 ("General / Reasoning / Long-Context"); OLMo-2 ("Stage 1 / Stage 2"). Numeric labels used when the lab presents the phases as discrete training runs.
+- **High-quality phase** — OLMo-2's name for the Dolmino-Mix-1124 stage. Emphasises the data-shift dimension.
+
+The Wang et al. (arXiv:2510.06826) and Liu et al. (arXiv:2510.23081) October 2025 surveys both adopt *mid-training* as the umbrella term and define it as "an intermediate stage between general pre-training and task-specific supervised fine-tuning" in which models "undergo annealing-style phases that refine data quality, adapt optimization schedules, and extend context length." This chapter uses **annealing phase** for the LR-decay-plus-data-shift tail and **midtraining** for the broader phase that packages annealing with long-context extension and capability-targeted data.
+</Callout>
+
+Three structural points are worth fixing. First, the annealing phase is not a separate training run in any architectural sense — the optimiser state, parameter state, and dataloader are continuous with the preceding stable phase. The only discontinuities are the LR trajectory (which usually exits the stable plateau into a decay curve) and the data mix (which usually shifts at the same boundary). Second, long-context extension is a *separate* phase in the Llama-3 organisation but is sometimes *fused* with annealing (Phi-4, Qwen3) and sometimes deferred to a post-pretrain stage. The chapter discusses long-context extension only where it overlaps with annealing; it is treated in its own chapter elsewhere in the textbook. Third, the boundary between annealing and SFT/post-training has blurred: Phi-4's midtraining mix includes instruction-format data and Qwen3's Stage-2 mix includes synthetic chain-of-thought, both of which would have been considered post-training material a generation earlier.
+
+This chapter builds on the [WSD schedule](/textbook/01e-schedules-and-batch#wsd) and [data curriculum](/textbook/01f-data-curriculum#curriculum) chapters: the annealing phase is the operational realisation of the WSD decay segment paired with the curriculum's late-stage shift. The stability primitives it draws on — [QK-norm and Peri-LN](/textbook/00d-normalization-and-init#qk-norm), [AdamW $\epsilon$](/textbook/00f-optimizers#adamw), and the [spike-control optimisers MuonClip, ZClip, AdaGC, and SPAM](/textbook/00f-optimizers#muon) — are covered as part of the prerequisite architecture and optimiser chapters; the present chapter applies them in the late-phase context.
+
+---
+
+## Llama-3 / 3.1 / 4 annealing {#llama-annealing}
+
+Meta is the clearest open lab on annealing. The Llama-3 herd report (Dubey et al., arXiv:2407.21783, July 2024) describes three pretraining stages: initial pretraining, long-context pretraining, and annealing.
+
+The 405B's *initial pretraining* consumes $T = 15.6 \text{T}$ text tokens at sequence length 8192, with AdamW at $\beta_1 = 0.9$, $\beta_2 = 0.95$, weight decay 0.1. The LR schedule is a linear warmup of 8,000 steps to $\eta_{\max} = 8 \times 10^{-5}$, followed by cosine decay over 1,200,000 steps to $\eta_{\min} = 8 \times 10^{-7}$. The batch size schedule starts at 4M tokens, doubles to 8M, and doubles again to 16M as training progresses. The main-stage data mix is roughly 50% general knowledge, 25% math/reasoning, 17% code, and 8% multilingual. The *long-context pretraining* phase then runs for approximately 800B tokens across six discrete extension stages going from 8K to 128K context, each verified by needle-in-haystack evaluations before the next step.
+
+The *annealing phase* of the 405B is then short and sharp: $T_{\text{anneal}} = 40\text{M}$ tokens at the held 128K context. The LR is linearly annealed to zero; the data mix is "adjusted to upsample data sources of very high quality"; and the released base model is produced by **Polyak averaging** of several checkpoints across the annealing window (functionally equivalent to stochastic weight averaging without cyclic LR — the lab uses the older Polyak-1964 vocabulary).
+
+<Callout variant="warning" title="40M vs 40B: the Llama-3 textual ambiguity">
+The 405B's *annealing tail* is **40M tokens** (not 40B). The 40B figure that appears in some summaries refers to a separate procedure described in Llama-3 §3.4.3 — the *data-quality assessment protocol*. There, Meta took a 50%-trained Llama-3 **8B** checkpoint and annealed its LR linearly to zero on **40B tokens** of a candidate domain, using the resulting validation-loss change as a quality score for that domain. On 40B tokens of high-quality code+math data, the 8B's GSM8K improved by **+24.0%** and MATH by **+6.4%**; the same procedure showed negligible effects when applied to the 405B, "suggesting that the flagship model has strong in-context learning and reasoning capabilities and does not require specific in-domain training samples."
+
+The two numbers serve very different roles: 40M is the cooldown for the final checkpoint; 40B is the per-domain ablation that doubles as a data-quality metric. Conflating them is common in second-hand summaries and inflates the apparent annealing budget by three orders of magnitude.
+</Callout>
+
+Llama-3.1 (August 2024) is the same paper with the official 128K-context release and rebadged checkpoints; the pretraining recipe is unchanged. Llama-4 (April 2025) is announced via release blog and Hugging Face model cards; the only training detail Meta has disclosed is that Llama 4 was "pretrained in multiple stages, including both the standard pretraining phase and an additional training phase — referred to as 'mid-training' — with a different data mixture that emphasizes key domains and specific model capabilities (e.g., long context understanding)." Token totals are approximately 40T for Llama-4 Scout and 22T for Llama-4 Maverick. The LR schedule, peak LR, annealing-token budget, and precision format are not publicly disclosed at sufficient detail; both rows are marked as such in the frontier landscape table.
+
+The Llama-3 data-quality assessment procedure deserves a second comment: it is the closest thing in the literature to a clean within-paper ablation of *what annealing does*. Two interpretations of the +24% / +6.4% gain on the 8B are visible in the community: (a) the small model is *capacity-limited* at the relevant capabilities and benefits from final exposure to the targeted distribution; (b) the small model is *signal-limited* — its main-stage mix did not contain enough HQ math and code to saturate learning — and any procedure that surfaces this signal late would help. Meta's null result on the 405B is consistent with (a); the same procedure has been replicated by OLMo-2 and SmolLM2 at the smaller scales with similar directional gains.
+
+---
+
+## DeepSeek-V2 / V3 multistage WSD {#deepseek-multistage}
+
+DeepSeek publishes the most detailed schedule disclosures of any open lab; both V2 and V3 technical reports quote step counts and LR values verbatim.
+
+DeepSeek-V2 (arXiv:2405.04434, May 2024) uses a multistep decay rather than cosine. The schedule is a linear warmup over 2,000 steps from 0 to $\eta_{\max} = 2.4 \times 10^{-4}$, followed by a constant plateau, with two step-decay drops at approximately 60% and 90% of tokens consumed. Each drop multiplies the LR by $\sqrt{0.1} \approx 0.316$, so the end LR is $2.4 \times 10^{-4} \times 0.316^2 \approx 2.4 \times 10^{-5}$. AdamW uses $\beta_1 = 0.9$, $\beta_2 = 0.95$, and weight decay 0.1; pretraining consumes 8.1T tokens; the gradient batch grows from 2,304 to 9,216 over the first 225B tokens and is constant thereafter. The model is a 236B-total / 21B-active MoE. The 60%/90% step-decay is *functionally* a coarse WSD with three plateaus — appealing because checkpoints are interpretable: at any saved step the LR is exactly one of three known values.
+
+DeepSeek-V3 (arXiv:2412.19437, December 2024) is the canonical WSD-with-a-flat-tail recipe. The schedule and token budget are:
+
+<ComparisonTable
+  caption="DeepSeek-V3 multistage learning-rate schedule (arXiv:2412.19437 §4.2). Total: T = 14.8T tokens, peak LR ηmax = 2.2 × 10⁻⁴, sequence length 4K, AdamW β₁ = 0.9, β₂ = 0.95, weight decay 0.1."
+  columns={["Phase", "Tokens", "Learning rate"]}
+  rows={[
+    ["Warmup", "0 → 2,000 steps (≈0.1B)", "linear 0 → 2.2 × 10⁻⁴"],
+    ["Stable", "up to 10T", "constant 2.2 × 10⁻⁴"],
+    ["Cosine decay", "next 4.3T", "2.2 × 10⁻⁴ → 2.2 × 10⁻⁵"],
+    ["Constant tail 1", "next 333B", "2.2 × 10⁻⁵"],
+    ["Constant tail 2", "final 167B", "7.3 × 10⁻⁶"]
+  ]}
+/>
+
+The batch size schedule grows from 3,072 to 15,360 over the first 469B tokens and is constant at 15,360 thereafter. The stability claim is the strongest in the open literature at the relevant scale: §4 reports "throughout the entire training process, we did not experience any irrecoverable loss spikes or perform any rollbacks" — at 671B total parameters, 14.8T tokens, and FP8 mixed precision. The Multi-Token Prediction objective (MTP) — one shared trunk with two output heads, the second sequentially predicting the token after next — is enabled during pretraining and discarded at inference; this densifies the gradient signal and is one of the recipe's stability contributors, though it is not necessary for the no-spike claim (cross-reference [tokenization and objectives](/textbook/00g-tokenization-and-objectives#embedding-norms) for the MTP mechanism).
+
+The chapter returns to V3's FP8 numerical recipe in [§FP8 training](#fp8). For schedule purposes, the key features are the long flat plateau (10T tokens at $\eta_{\max}$), the relatively sharp cosine decay over only 4.3T tokens, and the two constant tails at progressively lower LRs that effectively act as a long Polyak-averaging window at small LR.
+
+---
+
+## Other published recipes {#other-recipes}
+
+Beyond Llama and DeepSeek, several open labs disclosed annealing recipes in 2024–2025 in enough detail to be reproducible. The schedules and token budgets vary considerably; what they share is a discontinuity at the boundary — either in the LR shape, the data mix, or both.
+
+**Qwen2.5** (Yang et al., arXiv:2412.15115, December 2024) scaled pretraining from 7T to 18T tokens between Qwen2 and Qwen2.5. The team describes pretraining as "staged" — different data mixtures between stages — but does not disclose peak LR per model size or an explicit annealing budget. Long-context extension at the end of pretraining moves 4K → 32K for the dense models via the ABF technique with RoPE base bumped from 10K to 1M; Qwen2.5-Turbo runs four progressive stages 32K → 65K → 131K → 262K with RoPE base 10M.
+
+**Qwen3** (Yang et al., arXiv:2505.09388, May 2025) is the clearest three-stage disclosure from the Qwen series. Stage S1 (General) runs >30T tokens at 4K sequence length across 119 languages. Stage S2 (Reasoning) is ~5T "higher-quality" tokens at 4K with the mix shifted toward STEM, code, reasoning, and synthetic content; the paper explicitly notes that "the learning rate decay is also accelerated during this stage" — S2 *is* the annealing phase by another name. Stage S3 (Long Context) is "hundreds of billions of tokens" at 32K via YaRN plus Dual Chunk Attention. The model line includes dense 0.6B/1.7B/4B/8B/14B/32B and MoE 30B-A3B and 235B-A22B. QK-norm is reported as the key stability intervention; the precision format is not disclosed in the paper text.
+
+**Phi-4** (Abdin et al., arXiv:2412.08905, December 2024) is the canonical example of *midtraining* as a packaged phase. The pretraining run is roughly 10T tokens with a linear warmup plus linear decay schedule, peak LR $\eta_{\max} = 3 \times 10^{-4}$, weight decay 0.1, and global batch 5,760. The pretraining mix (Table 5 of the report) is 15% web, 15% web rewrites, 40% synthetic, 20% code, and 10% acquired. Midtraining is then a 250B-token phase that simultaneously extends context (4K → 16K, RoPE base bumped to 250K) and shifts the mix to 30% newly curated long-context samples (preferring those >8K and especially 16K+) and 70% recall of pretraining tokens. The peak LR is dropped by a factor of ten relative to pretraining. Phi-4's recipe is the cleanest illustration of midtraining as the LR-drop-plus-data-shift-plus-context-extension package; it is also the cleanest illustration of how heavily the late phase can rely on synthetic data — 40% in pretraining, with further synthetic-heavy curation possible in midtraining.
+
+**Kimi-K2** (Moonshot AI, arXiv:2507.20534, July 2025) is the most schedule-rich 2025 open recipe and the strongest stability claim under a non-Adam optimiser. The model is a 1T-total / 32B-active MoE. Pretraining consumes 15.5T tokens at batch size 67M with peak LR $\eta_{\max} = 2 \times 10^{-4}$. The WSD-style main schedule is constant $2 \times 10^{-4}$ for the first 10T tokens, then cosine decay $2 \times 10^{-4} \to 2 \times 10^{-5}$ over 5.5T tokens. The *annealing phase* in §2.5 is a further LR decay $2 \times 10^{-5} \to 7 \times 10^{-6}$ over 400B additional tokens at 4K. A long-context extension phase then adds 60B tokens at 32K, followed by YaRN to 128K. The optimiser is MuonClip — Muon combined with QK-clip at logit cap $\tau = 100$ — and the paper reports "zero loss spikes throughout the entire 15.5T-token pretrain." Precision is BF16 parameters with FP32 gradient accumulation; FP8-E4M3 is used for activations in specific places (§2.4.3) but the bulk run is BF16. The MuonClip mechanism itself is covered in [the optimisers chapter](/textbook/00f-optimizers#muon).
+
+**OLMo-2** (Walsh et al., arXiv:2501.00656, January 2025; 32B follow-up March 2025) is the most exhaustively documented annealing recipe in 2025. Ai2 ships a two-stage structure. *Stage 1 (general pretraining)* runs the 7B for 3.9T tokens on OLMo-Mix-1124 (DCLM + Dolma + StarCoder + Proof Pile II) with peak LR $\eta_{\max} = 3.0 \times 10^{-4}$; the 13B runs for 5T tokens on the same mix with peak LR $\eta_{\max} = 9.0 \times 10^{-4}$ — note this is much higher than Llama-3 405B's $8 \times 10^{-5}$. OLMo runs hot relative to Meta. *Stage 2 (annealing / midtraining on Dolmino-Mix-1124)* uses the Dolmino-Mix-1124 HQ corpus (843B HQ tokens total) drawn into 50B / 100B / 300B annealing budgets. The 7B uses the 50B sample, the 13B uses the 100B sample, and the 32B is trained three independent times on the 100B sample and once on the 300B sample, with the resulting models averaged into a model soup. The LR is linearly annealed to zero from the Stage-1 endpoint. The annealing phase is 5–10% of total training FLOPs. OLMo-2's *stability stack* — z-loss, QK-norm, reordered norm, no-embedding-decay, $\epsilon = 10^{-8}$, and document-level n-gram filtering — is the most-cited 2025 reliability disclosure and is covered in detail in [§training stability](#stability).
+
+**Gemma-2** (Riviere et al., arXiv:2408.00118, July 2024) discloses model sizes and token budgets — 27B trained on 13T tokens, 9B on 8T, 2B on 2T, all English-primary — and the distillation structure (9B and 2B distilled from a larger teacher; 27B trained from scratch). Its distinctive stability technique is the **logit soft-cap**: $\text{logits} \leftarrow c \cdot \tanh(\text{logits}/c)$ with $c = 50$ for attention logits and $c = 30$ for the final LM head. This is an alternative to z-loss for output-logit bounding. No explicit annealing data-mix shift is disclosed; the LR schedule, optimiser, and precision format are not stated in the paper text.
+
+Mistral 7B (arXiv:2310.06825) and Mixtral 8×7B (arXiv:2401.04088) disclose architecture and benchmark numbers but not the data recipe, schedule, or annealing details; these rows are marked as not publicly disclosed. For closed labs — Anthropic (Claude), OpenAI (GPT-4, GPT-5), and Google (Gemini 2/3) — the annealing recipe, FP8-vs-BF16 choice, and stability stack are not publicly disclosed; system cards discuss post-training and alignment but skip pretraining-stage details. The frontier landscape table marks these accordingly.
+
+---
+
+## Annealing data mix {#annealing-data}
+
+The data-shift dimension of annealing is treated in depth in the [data curriculum chapter](/textbook/01f-data-curriculum#curriculum); the present section captures the boundary shift specifically. Six categories dominate the published annealing-phase mixes.
+
+**Filtered high-quality web** — quality-classifier subsets of CommonCrawl, in particular FineWeb-Edu, DCLM-baseline, RedPajama-V2, and Nemotron-CC. The annealing phase pushes the educational and encyclopaedic fractions higher relative to general crawl. **Code** is consistently upweighted: Phi-4 midtraining is 20% code, OLMo-2's Dolmino-Mix is code-rich, and Llama-3's annealing ablation specifically credits code+math. The corpora cited include StarCoder, StackV2, Stack-Edu, and permissive licensed code. **Math** is upweighted more sharply still, drawing on OpenWebMath, FineMath (including FineMath4+), Proof-Pile-II, AlgebraicStack, and synthetic math sources such as Cosmopedia and MathFlowDPO. The FineMath4+ subset versus its predecessor InfiMM-WebMath provides one of the cleaner ablation pairs: 2× improvement on GSM8K and 6× on MATH from a curation pass that preserves step-by-step reasoning over format-degrading filters. **Instruction and QA data** — UltraChat, OpenOrca, EvolInstruct, FLAN — is often included even before SFT (Phi-4, Qwen3), blurring the pretrain/post-train boundary. **Synthetic textbooks and reasoning chains** — Cosmopedia, TuluMath, synthetic CoT — make up the entirety of the synthetic share; Phi-4 is the extreme case with 40% of pretraining synthetic. **Long-context data** — books and code repositories filtered for length — make up 30% of the Phi-4 midtrain mix and are present at smaller fractions in other late-phase mixes.
+
+The empirical regularity across the disclosed mixes is consistent in direction even when the levels differ. Web share drops from 50–70% in main pretraining to 30–40% in annealing; code rises from 5–17% to 20–30%; math rises sharply from 1–5% to 10–25%; synthetic content rises from near zero to 10–30%; multilingual is usually frozen or slightly down.
+
+The cleanest within-paper ablation evidence that the shift works comes from Llama-3 §3.4.3: annealing the 8B on 40B tokens of HQ code+math improves GSM8K by +24.0% and MATH by +6.4%, with the procedure showing negligible effect at the 405B scale. OLMo-2 reports that "even a small fraction of domain-specific data (e.g., math and coding) within the mid-training mix can produce disproportionate performance gains"; Dolmino-Mix-1124 improves downstream benchmarks broadly over the OLMo-Mix-1124 baseline. SmolLM2 (Hugging Face, 2024–2025) reports "consistent gains by replacing low-signal web text with structured educational, math, and coding data" at the annealing stage. The cross-lab consistency makes this one of the more robust findings of the 2024–2026 window, even though no two labs share a budget or a mix.
+
+A complication worth flagging: ProLong-8B and Phi-4 both report that training solely on long data can hurt performance — a balanced mixture with high-quality short-context data is critical. This is why labs that fuse long-context extension into midtraining (Phi-4's 30% long / 70% pretrain-recall split) keep the long-context fraction bounded; running an annealing phase that is *only* long-context data would have shed short-context capability.
+
+---
+
+## Training stability {#stability}
+
+The published "no-spike" claims at the 14.8T-token / 671B-parameter scale (DeepSeek-V3), at the 15.5T-token / 1T-parameter scale (Kimi-K2), and at the 7B / 13B / 32B sizes (OLMo-2) all rely on a *stack* of techniques. None of the three runs reports the minimal subset that would have sufficed; the literature has not yet falsified any one component as unnecessary. This section walks through the spike-lineage history and the operational tools, with the caveat that the stack is empirically tunable and lab-specific.
+
+<Callout variant="info" title="Bekman's six-category loss-pattern taxonomy">
+Most practitioner-facing literature treats "loss spike" as a single phenomenon. Bekman's *Machine Learning Engineering* open book ([training-loss-patterns.md](https://github.com/stas00/ml-engineering/blob/master/training/instabilities/training-loss-patterns.md)) separates loss-curve pathologies into six categories distinguished by *shape*, each with a different recommended response. (1) **Fast-recovering spikes** — a single optimiser step elevates loss, the next few steps return to trend; no action required. (2) **Slow-recovering spikes** — loss takes tens to hundreds of steps to return to trend; monitor and proceed. (3) **Not-fully-recovering spikes** — the post-spike trajectory permanently sits above the pre-spike trend; rollback to a pre-spike checkpoint and skip the offending batches. (4) **Non-spike divergence** — loss drifts upward over thousands of steps with no single trigger; address the root cause (bf16/fp16 numerics, embedding-LN, optimiser-state corruption) rather than rewinding. (5) **Grokking events** — a sudden loss drop after a long plateau; no action required, this is the desired outcome of some training regimes. (6) **Resume-related misalignment** — a discontinuity at every checkpoint resume due to dataloader-state desynchronisation; fix the dataloader rather than the model. The taxonomy is operationally useful because the wrong response to each category (e.g. rewinding a fast-recovering spike, or treating non-spike divergence as a recoverable spike) wastes compute and obscures the actual failure mode.
+</Callout>
+
+### Loss spikes and their lineage {#loss-spikes}
+
+The canonical chronicle is **OPT-175B** (Zhang et al., arXiv:2205.01068, May 2022). Meta released a 114-page training logbook recording roughly **90 restarts** during the run. The pattern documented repeatedly: a gradient-norm spike a few optimiser steps *before* the perplexity divergence. Mitigations applied across the run included reducing peak LR to 2/3 of GPT-3's value, increasing the frequency of gradient clipping, lowering LR temporarily, and restarting from a checkpoint 100–500 steps before the spike while *skipping* the offending data batches.
+
+**PaLM 540B** (Chowdhery et al., arXiv:2204.02311, April 2022) §5.1 *Training Instability*: the 540B saw approximately 20 loss spikes despite gradient clipping. The diagnostic ablation that became foundational for the spike literature was to re-run the same batches from an earlier checkpoint; the spike did *not* reproduce. The conclusion is that spikes are a function of the (batch, parameter-state) joint configuration — neither the batch alone nor the state alone is sufficient. The PaLM recovery procedure — restart from $\sim$100 steps before the spike, skip $\sim$200–500 batches, then continue — is the canonical "skip-batch" recipe.
+
+**GLM-130B** (Zeng et al., arXiv:2210.02414, 2022) identified **abnormal embedding-layer gradients** several orders of magnitude larger than other layers' gradients early in training as the dominant spike source. The mitigation was the *embedding-gradient-shrink trick* — multiplying the embedding-layer gradient by 0.1 before the optimiser step — combined with FP16 (Apex O2) and FP32 master weights and optimiser state. This is the canonical bf16-vs-fp32-master-weights story for the FP16 era; the FP32 master-weight precaution survived into the BF16 era and is preserved in DeepSeek-V3 and OLMo-2 even though those runs use BF16 for the main weights.
+
+**Llama-2** (Touvron et al., arXiv:2307.09288, July 2023) acknowledges that standard training is "essentially unstable" and uses $\beta_2 = 0.95$ in AdamW (rather than the original Adam paper's $0.999$) explicitly to dampen the second-moment EMA's response to occasional huge gradients. A short EMA window means an outlier gradient is forgotten faster — the cost is that the variance estimate is noisier, but the benefit is that a single bad batch does not poison the $v_t$ buffer for hundreds of steps. This choice has since become the open-source default; Llama-3, DeepSeek-V3, Qwen2.5, and OLMo-2 all use $\beta_2 = 0.95$.
+
+**Spike No More** (Takase et al., arXiv:2312.16903, COLM 2025) systematises the mechanism into two routes. *Shortcut explosion*: residual norms amplify under plain $\mathcal{N}(0, 1)$ initialisation; the cumulative-residual norm grows roughly as $\sqrt{L}$ at depth $L$ in transformers with no scaling. *Pre-LN amplification*: the gradient norm through Pre-LN scales as $1/\text{std}(x)$, so small-variance inputs to LN cause exploding backward gradients. The recommended mitigations are scaled init ($W_2, W_O \sim \mathcal{N}(0, \sigma / \sqrt{2N})$ at depth $N$), Embed-LN (layer-norm applied to the embedding output), and Scaled-Embed (multiplying embeddings by $\sqrt{d}$). The paper cites PaLM, OPT, and GLM-130B as incident motivators.
+
+A second mechanism, distinct from gradient-side amplification, is the *embedding-norm growth* problem (cross-reference the [tokenisation and objectives chapter](/textbook/00g-tokenization-and-objectives#embedding-norms)): some token embeddings drift to large norms over the course of training, producing very large pre-softmax logits and high quantisation error. The output-side mitigation is z-loss or a logit soft-cap, discussed below.
+
+### Gradient clipping and norm management {#gradient-clipping}
+
+Global-norm clipping at threshold $\tau = 1.0$ is the de-facto LLM default since Llama-1. The rule is
+
+$$\text{if } \|g\|_2 > \tau: \quad g \leftarrow g \cdot \frac{\tau}{\|g\|_2}.$$
+
+The threshold $\tau = 1.0$ is not arbitrary — typical LLM training gradient norms cluster near 1.0 during the stable phase, so $\tau = 1.0$ clips only the anomalous top percentile of steps. Per-parameter (per-tensor) clipping is the textbook alternative, more conservative but less common at scale because it discards the cross-layer magnitude information that global clipping preserves.
+
+Three adaptive variants from 2024–2025 deserve mention; the mechanisms are detailed in the [optimisers chapter](/textbook/00f-optimizers#muon) and only the role in the annealing-period stability picture is summarised here.
+
+**ZClip** (Kumar et al., arXiv:2504.02507, April 2025) maintains an EMA of the gradient-norm mean $\mu_t$ and standard deviation $\sigma_t$ and clips when the z-score $z_t = (\|g_t\| - \mu_t)/\sigma_t$ exceeds a threshold $z_{\text{thr}}$ (default 2.5). The reciprocal clipping rule is $\|g_t^*\| = \mu_t + (z_{\text{thr}}^2 / z_t)\sigma_t$. The benchmark numbers at LR $1 \times 10^{-3}$ on a 50B-token run: no-clip baseline shows 12 spikes and test loss 2.90; fixed clip-1.0 shows 6 spikes and test loss 2.33; ZClip shows 0 spikes and test loss 2.18.
+
+**AdaGC** (Liang et al., arXiv:2502.11034, February 2025) applies per-tensor adaptive clipping. Each parameter tensor maintains its own EMA $\gamma_{t,i}$ of historical norms; the clip threshold is $\lambda_{\text{rel}} \cdot \gamma_{t-1,i}$ with $\lambda_{\text{rel}} = 1.04$ and EMA decay $\beta = 0.99$. The reported results on Llama-2 7B, Mixtral 8×1B, and ERNIE 10B-A1.4B all show the spike score reduced to zero, with downstream accuracy improving by +1.32%, +1.27%, and +2.48% over the global-clip baseline.
+
+**SPAM** (Hsu et al., arXiv:2501.06842, January 2025), discussed in [§checkpoint surgery](#checkpoint-surgery), is the post-spike *recovery* counterpart: rather than preventing the spike by clipping, it detects the spike, then resets Adam's first-moment buffer to break the momentum carryover.
+
+The pragmatic frontier-2026 default remains global-norm clipping at $\tau = 1.0$ on top of the stability stack; adaptive variants are validated at the 1–10B scale but have not been reported in published 100B+ frontier runs as of May 2026.
+
+### AdamW ε, β₂, embedding LayerNorm {#adamw-eps}
+
+The AdamW $\epsilon$ choice is the most consequential single-line hyperparameter in the stability stack. Frontier convention has converged on $\epsilon = 10^{-8}$ as the safe default. OLMo-2 raises this explicitly: lowering $\epsilon$ from the older $10^{-5}$ to $10^{-8}$ "lowers and stabilizes the norm of the gradient early in training." The mechanism is that with $\epsilon = 10^{-5}$ and a small $\sqrt{\hat{v}_t}$, the Adam denominator is dominated by $\epsilon$ rather than $\sqrt{\hat{v}_t}$, producing a near-SGD update that is much larger than intended; the larger update destabilises early training. Pulling $\epsilon$ down to $10^{-8}$ restores the adaptive normalisation.
+
+Some labs (community-reported, including unconfirmed reports about DeepSeek-mHC) experiment with much smaller values such as $\epsilon = 10^{-15}$ or $10^{-20}$, which approaches "Adam without epsilon" and gives more sign-following behaviour but loses the scale-invariance protection when gradients are genuinely tiny. The empirical lesson: $\epsilon = 10^{-8}$ is conservative-but-fine for BF16 master weights; values below $10^{-15}$ require FP32 moments to avoid underflow; raising $\epsilon$ to $10^{-3}$ (Nado, 2022 blog post) was a vision/RL prescription that has not transferred to frontier LLMs.
+
+The $\beta_2 = 0.95$ choice from Llama-2 is now universal in published recipes — Llama-3, DeepSeek-V3, Qwen2.5/3, OLMo-2, Phi-4, and Kimi-K2 all use it. The effective second-moment window at $\beta_2 = 0.95$ is $1/(1 - 0.95) = 20$ steps, which is short enough to forget an outlier within a few hundred optimiser steps but long enough to give a stable scale estimate against ordinary gradient noise.
+
+OLMo-2's specific stability stack adds three further interventions that the lab credits with reducing its gradient-norm *spike score* (a published metric of spike frequency and severity) from **0.40 (baseline) to 0.03** — a 13× reduction. (a) Weight decay is *excluded from embeddings*: decaying embeddings produced spike score 0.16 vs. 0.09 without decay, with detectable activation collapse. (b) Initialisation is $\mathcal{N}(0, 0.02)$ with no truncated normal and no embedding scaling. (c) Training documents with $\geq 32$ repeated n-grams are filtered, on the grounds that exact repetition is one identified spike trigger. The full stack — z-loss $10^{-5}$ on the output logits, QK-norm, reordered (Peri-LN-style) normalisation, $\epsilon = 10^{-8}$, no-embed-decay, and n-gram filtering — is the stack that achieves the 0.40 → 0.03 result.
+
+### Z-loss and QK-norm cross-references {#z-loss-qk-norm}
+
+The output-softmax z-loss originates with Mesh-TF / Shazeer (2018) and is canonised in **ST-MoE** (Zoph et al., arXiv:2202.08906, §3.3). The objective is
+
+$$\mathcal{L}_z = \frac{1}{B} \sum_{i=1}^{B} \left( \log \sum_{j=1}^{V} e^{x_{ij}} \right)^2,$$
+
+which penalises the squared log-partition-function of the output softmax — equivalently, it penalises large absolute pre-softmax logits, reducing the numerical roundoff in BF16 computations of $\log \text{softmax}$. The coefficient $c_z$ ranges over $10^{-5}$ to $10^{-3}$ across published recipes: PaLM uses $10^{-4}$, ST-MoE uses $10^{-3}$, OLMo-2 uses $10^{-5}$.
+
+Two distinct uses of z-loss should not be conflated. The *output-softmax* z-loss bounds final-layer logits (origin: Mesh-TF; deployed in PaLM, OLMo-2). The *router* z-loss bounds MoE-router logits (origin: ST-MoE 2022). The two are functionally analogous — they both penalise the log-partition-function of a softmax — but they target different parts of the network. The chapter on [tokenisation and objectives](/textbook/00g-tokenization-and-objectives#embedding-norms) discusses newer successors (OEC and $\mu$-loss) that have not yet displaced z-loss at scale.
+
+QK-norm — normalising $Q$ and $K$ before the attention dot product — is the architectural alternative to logit soft-capping. It bounds attention logits to a known range without softmax cap; it is adopted by Qwen3 (explicitly for stability), OLMo-2, and many 2024–2025 models. The mechanism and integration are covered in [the normalisation chapter](/textbook/00d-normalization-and-init#qk-norm). The chapter-level summary: as of May 2026, QK-norm is the dominant attention-side stability primitive in open recipes; the Gemma-2 logit-cap alternative is rarer but still actively shipped.
+
+A reordered or "Peri-LN" normalisation — applying LN around both the input and output of each sublayer — is a third architectural stability primitive used by Gemma-2 and OLMo-2. The cross-reference is [normalisation and initialisation](/textbook/00d-normalization-and-init#qk-norm). Combined with QK-norm and z-loss, this trio addresses three distinct failure modes: attention-logit blow-up (QK-norm), output-logit blow-up (z-loss), and residual-stream norm-growth (reordered LN).
+
+---
+
+## FP8 training {#fp8}
+
+The 2024–2026 window is when FP8 transitioned from a research curiosity (NVIDIA H100 plus Transformer Engine) into a production-quality recipe shipping in real frontier models. Three generations of recipe are visible in the literature.
+
+The *per-tensor FP8* recipe (FP8-LM, Peng et al., arXiv:2310.18313, 2023, NVIDIA-MS collaboration) was the first end-to-end FP8 pretraining recipe. Its three-level framework comprises FP8 gradient all-reduce, FP8 first-moment $m_t$ state with FP16 master weights, and FP8 distributed parallelism. Per-tensor scaling uses one FP32 scalar per tensor per step; to avoid per-GPU scale divergence the paper proposes a *global-minimum scaling factor* in which each rank computes its local amax-derived scale and an all-reduce takes the global minimum. On GPT-175B (H100) FP8-LM reports 39% memory reduction versus Megatron BF16, 75% speedup versus Megatron BF16, and 37% speedup versus NVIDIA Transformer Engine. The precision-decoupling lesson — master weights need at least FP16, first moment tolerates FP8, second moment $v_t$ should stay at least FP16 because squaring underflows — survives into later recipes.
+
+NVIDIA Transformer Engine offers two per-tensor FP8 *scaling recipes*: *delayed scaling* (`fp8_recipe="delayed"`) keeps a history of amax over recent steps and computes the next step's scale from that history; *current scaling* (`fp8_recipe="tensorwise"`) computes amax in the current step and uses it immediately. Delayed scaling has been the default since H100 launch; current scaling is better at sudden distribution shifts, requires no history buffer, and is favoured on Blackwell-era recipes.
+
+### DeepSeek-V3 recipe (1×128 / 128×128, E4M3) {#deepseek-fp8}
+
+DeepSeek-V3 §4.5 is the most-cited FP8 recipe of 2024–2026 and the recipe that made FP8 production-grade at frontier scale. Quoted verbatim from the technical report:
+
+- **Element format:** E4M3 (4-bit exponent, 3-bit mantissa) for all FP8 tensors — chosen over E5M2 because the fine-grained scaling provides enough dynamic range.
+- **Activation quantisation:** *per-tile*, 1×128 (per-token, per-128-channel sub-vectors). Each tile gets its own FP32 scale; the amax is computed online for each tile.
+- **Weight quantisation:** *per-block*, 128×128 sub-matrices of each weight matrix. Each block gets its own FP32 scale.
+- **High-precision retained:** embeddings, output head, MoE gating, normalisation, and attention all remain at BF16 or higher.
+- **Optimiser state:** moment buffers in BF16. Master weights in FP32.
+- **Accumulation precision:** the H800 GEMM kernel uses FP8 multiplications with "promotion to CUDA cores" for FP32 accumulation, because the native Tensor Core FP32 accumulator on Hopper-class FP8 "only uses the highest 14 bits." DeepSeek-V3 shows that approximately 34-bit precision is required for stable LLM training and implements the wider accumulation manually.
+- **No reported FP8 spikes.**
+
+The mechanism of the activation quantisation deserves a small diagram. Let $A \in \mathbb{R}^{B \times d}$ be the activation matrix at some layer, with $B$ the batch-times-sequence dimension and $d$ the hidden dimension. The 1×128 tiling partitions $A$ into $\lceil d / 128 \rceil$ contiguous column groups; for each row $i$ and each column group $g$, the tile $A_{i, g \cdot 128 : (g+1) \cdot 128}$ gets its own scale $s_{i,g} = \text{amax}(A_{i, g \cdot 128 : (g+1) \cdot 128}) / 448$, where 448 is the max representable E4M3 magnitude. The quantised tile is $A^{\text{FP8}}_{i, g \cdot 128 : (g+1) \cdot 128} = \text{round}(A_{i, g \cdot 128 : (g+1) \cdot 128} / s_{i,g})$. For a weight matrix $W \in \mathbb{R}^{d \times d}$, the 128×128 blocking is the analogous 2-D partition: $W$ is divided into $\lceil d / 128 \rceil^2$ blocks of size 128×128, and each block carries one FP32 scale derived from its own amax. The total scale storage overhead is $1/128$ of the original tensor size, plus the per-block amax-compute cost.
+
+The pay-off of fine-grained scaling is that FP8 quantisation noise stays roughly constant across the matrix regardless of outlier rows or columns — the dominant failure mode of naive per-tensor FP8 in the presence of a single large activation channel. The cost is a few percent of compute (each block needs its own amax, FP8↔FP32 dequant, and BF16 fallback for the high-precision ops), more than offset by the FP8 GEMM throughput on H100/H800 silicon.
+
+What is *not* in FP8 in DeepSeek-V3: embedding, output (LM-head) projection, MoE gating, attention (Q/K/V GEMMs are BF16), and normalisation. What *is* in FP8 (E4M3, fine-grained scaled): all dense GEMM weights and activations in the FFN and the routed MoE expert FFNs. Master weights remain FP32 and optimiser moments remain BF16. The downstream lesson for an engineer building their own FP8 stack: keep the high-dynamic-range operations (LN, softmax, gating) at BF16 or above, and quantise only the bulk-compute GEMMs.
+
+### MXFP8 and NVFP4 {#mx-formats}
+
+The OCP Microscaling (MX) Formats Specification v1.0 (Open Compute Project, September 2023; AMD, Arm, Intel, Meta, Microsoft, NVIDIA, Qualcomm co-signed) defines a hardware-native block-floating-point convention. The block size is 32 elements (small and hardware-friendly), with a shared 8-bit exponent **E8M0** (power-of-2 scale, no mantissa) per block. Element formats include **MXFP8** (E5M2 or E4M3 per element), **MXFP6** (E3M2 or E2M3), **MXFP4** (E2M1), and MXINT8. The MX convention trades the DeepSeek-style block size (128) for a smaller block (32), giving better quantisation accuracy at fixed precision but more storage overhead per element.
+
+MXFP8 on NVIDIA Blackwell is hardware-native (`fp8_recipe="mxfp8"` in Transformer Engine); Blackwell tensor cores natively dequantise the E8M0 scale during the GEMM, eliminating the software dequant overhead that Hopper FP8 incurs. NVIDIA's internal Nemotron-2B/8B training shows MXFP8 matching BF16 validation-loss curves through the full pretraining run; the developer-blog disclosure positions MXFP8 as the default Blackwell-era recipe.
+
+**MXFP4 training** is the active frontier. Two 2025 papers anchor the state of the art. *FP4 All the Way* (Wang et al., arXiv:2505.19115, May 2025) is the first claim of fully quantised FP4 training — weights, activations, and gradients — at LLM scale; it shows a small training-loss gap to BF16 closed with a short post-hoc BF16 backward pass. **NVFP4** (NVIDIA, arXiv:2509.25149, September 2025) introduces a 4-bit format with E2M1 elements, an E4M3 micro-block scale, and a per-tensor FP32 outer scale (two-level scaling), with block size 16 (smaller than MX's 32). NVIDIA pretrained a 12B model on 10T tokens — described as "the longest publicly documented training run in 4-bit precision to date." Validation loss tracks FP8 within 1% during the stable phase and within 1.5% during LR decay. The recipe applies NVFP4 to the middle-layer GEMMs (84% of linear layers), keeps BF16 for the first two layers and the final eight layers, and keeps FP32 for embeddings, attention, optimiser state, and normalisation. NVFP4 matches MXFP4 with 36% fewer tokens at the 8B scale, demonstrating that the smaller block size and the two-level scaling are not redundant.
+
+Not every FP8 attempt has been clean. Fujii et al. (arXiv:2411.08719, November 2024) report continued pretraining of Llama-3-70B on approximately 100B multilingual and code tokens under per-tensor FP8: the setting "led to unstable training loss and frequent loss spikes," with pronounced regressions on code-generation and math benchmarks. The speed gain was real (415 → 570 TFLOPS, approximately 37%) but the accuracy gain was not. The lesson is that naive per-tensor FP8 on a continued-pretraining run is fragile; the DeepSeek-V3 tile/block recipe is the recipe that made FP8 production-grade for fresh pretraining runs. Whether the same recipe transfers cleanly to continued pretraining at frontier scale has not been independently published.
+
+A calibration note: FP8 recipes age fastest in the textbook. Between mid-2025 (DeepSeek-V3 1×128 / 128×128) and late-2025 to early-2026 (NVFP4 with block 16, E4M3 micro-scale, FP32 outer), the format of choice for new pretraining runs has shifted toward MX and NVFP4 on Blackwell silicon. This chapter is calibrated to May 2026; the specific recipes here are expected to be obsolete within roughly twelve months.
+
+---
+
+## Checkpoint surgery {#checkpoint-surgery}
+
+When training breaks despite the prevention stack, frontier labs apply one of a small number of recovery procedures. This section gathers the operational playbook.
+
+The leading detection signal is the gradient-norm spike, which typically precedes loss divergence by 1–3 optimiser steps (PaLM §5.1, OPT chronicles, GLM-130B §3). Secondary signals include a sudden change in the activation-norm distribution, output-logit z-scores moving outside the stable band (caught by z-loss as a sharp spike in the auxiliary), and the AdamW second-moment $\sqrt{v_t}$ collapsing on some layer (signalling fading gradients elsewhere).
+
+The standard recipe — descended from PaLM §5.1 and the OPT chronicles — is straightforward to state:
+
+1. Detect the spike at step $T$.
+2. Restart from the checkpoint at step $T - K$, where $K \in [100, 1000]$.
+3. *Skip* the next $M$ data batches, where $M$ is large enough to include the offending batch ($M \approx 200$–$500$).
+4. Resume training from the restored optimiser state.
+
+The justification for step (3) is the PaLM finding that re-running the same batches against a different parameter state typically does not reproduce the spike — the spike is a (data, state) joint event, so changing the state alone is insufficient if the data is also re-presented.
+
+Several variants are documented. The *lower-LR restart* (OPT, mentioned in passing in Llama-2): restart from $T - K$, multiply peak LR by 0.5 or 0.67, then continue. This sacrifices throughput for stability. The *optimiser-state reset* (SPAM, Hsu et al., arXiv:2501.06842, 2025): keep parameters at $T - K$, zero the first-moment buffer to break the momentum carryover, and resume without skipping batches. *Architectural surgery* is rare but documented: OLMo-2 reports that several stability-stack components (z-loss, QK-norm, no-embed-decay, small AdamW $\epsilon$) were *not all decided up front* but added during the run as spikes appeared and were diagnosed. *MuonClip QK-clip* (Kimi-K2, July 2025) is a preventative inside-the-optimiser mechanism rather than a post-hoc restart: $W_Q$ and $W_K$ are rescaled after each Muon step if the maximum QK score exceeds a threshold $\tau = 100$.
+
+When restart does not work — repeated spikes within $K$ steps after restart — the issue is the parameter-state's susceptibility rather than the specific batch, and the response shifts to LR reduction or an architectural patch. The corollary, visible in the published "no-spike" runs of DeepSeek-V3, Kimi-K2, and OLMo-2 at large scale, is that when frontier 2024–2025 runs do not spike at all, it is because the stability stack at start-of-run was already comprehensive. The era of spike-driven 90-restart runbooks (OPT-175B) appears to be behind the open frontier.
+
+---
+
+## Worked example: 13B annealing recipe {#worked-example}
+
+The synthesis question for an engineer is: given the disclosed numbers, what is a plausible 2026 annealing recipe? The example below is a 13B dense decoder calibrated against OLMo-2, DeepSeek-V3, Llama-3, and Phi-4 — each numerical choice traces back to one of those sources.
+
+**Architecture.** 13B dense decoder with RMSNorm plus [QK-norm](/textbook/00d-normalization-and-init#qk-norm), SwiGLU FFN, RoPE with base 500K. Tokenizer: 128K BPE. The architectural primitives are the prerequisite-chapter defaults.
+
+**Total budget.** $T = 4\text{T}$ tokens. Annealing phase: $T_{\text{anneal}} = 100\text{B}$ tokens (2.5% of total — conservative; OLMo-2 13B uses 2% in its 100B / 5T configuration).
+
+**Hardware.** 256 H100 nodes; per-rank micro-batch 8; gradient accumulation 4; global batch approximately 16M tokens.
+
+**Main pretraining phase (3.9T tokens).** Optimiser: AdamW with $\beta_1 = 0.9$, $\beta_2 = 0.95$, weight decay 0.1, $\epsilon = 10^{-8}$, with weight decay *excluded from embeddings* (the OLMo-2 lesson). LR: linear warmup from 0 to $\eta_{\max} = 6 \times 10^{-4}$ over 5,000 steps, then constant at $6 \times 10^{-4}$ for the remainder of the 3.9T tokens (WSD stable phase). Sequence length 4K. Global-norm gradient clip at $\tau = 1.0$. Z-loss coefficient $10^{-5}$ on output logits. Precision: BF16 master weights and FP32 optimiser state as the conservative baseline; alternatively, FP8 with DeepSeek-style 1×128 activation tile and 128×128 weight block, E4M3 elements, with BF16 outside the FFN.
+
+**Annealing phase (final 100B tokens).** LR: cosine decay from $6 \times 10^{-4}$ to $\eta_{\min} = 6 \times 10^{-5}$ over the first 80B tokens; then linear decay $6 \times 10^{-5} \to 0$ over the final 20B tokens. All other hyperparameters unchanged.
+
+The annealing data mix shift, blended from the Wang-survey consensus and the Llama-3, OLMo-2, and Phi-4 disclosures:
+
+<ComparisonTable
+  caption="Worked 13B annealing data-mix shift. Percentages sum to 100% in each column."
+  columns={["Source", "Main pretrain", "Annealing"]}
+  rows={[
+    ["Filtered HQ web (FineWeb-Edu / DCLM)", "55%", "35%"],
+    ["Code (Stack-Edu / StarCoder)", "15%", "25%"],
+    ["Math (FineMath4+ / OpenWebMath)", "5%", "20%"],
+    ["Synthetic textbooks / reasoning (Cosmopedia)", "5%", "10%"],
+    ["Books and papers", "15%", "5%"],
+    ["Multilingual", "5%", "5%"]
+  ]}
+/>
+
+**Checkpoint averaging.** Save every 10B tokens during annealing, yielding 10 checkpoints. The released base model is the equal-weighted average of the last 5 (the Llama-3 Polyak-averaging lesson, equivalent to stochastic weight averaging without cyclic LR).
+
+**Optional long-context extension (additional 50B tokens).** Run *before* annealing (Llama-3 order) or *during* (Phi-4 packaging). RoPE base 500K → 5M; sequence length 4K → 32K either in one stage or via a Qwen-style progressive 4K → 8K → 16K → 32K. Data mix: 30% long-context (>8K) plus 70% recall of the main pretraining mix.
+
+**Stability monitoring.** Track training loss, per-tensor gradient norm, output-logit max-absolute-value, and embedding-norm growth. Alert thresholds: global gradient norm > 5× its EMA; any tensor's per-step norm > 3σ of its own EMA (the ZClip/AdaGC thresholds). Hot-restart playbook: keep the last 20 checkpoints; on spike, rewind 100 steps and skip 500 batches; if the spike recurs, lower peak LR by 30% and continue.
+
+The lineage of each component: DeepSeek-V3 supplies the WSD-with-flat-tail schedule shape and the optional FP8 numerical recipe; Llama-3 supplies the 3-stage organisation with explicit annealing and the data-quality ablation procedure; OLMo-2 supplies the z-loss coefficient, QK-norm, $\epsilon = 10^{-8}$, no-embed-decay, and the n-gram-filtering rule; Phi-4 supplies the LR-drop-by-factor-10 design when packaging long-context with HQ data; MiniCPM and the WSD literature supply the arbitrary stable-phase length and fixed-fraction decay; ZClip and AdaGC supply the adaptive-clip alert thresholds layered on top of fixed clip-1.0.
+
+The recipe is *not* a minimal recipe — by hypothesis, several components could be removed without observable loss. The published ablations do not yet identify which.
+
+---
+
+## Frontier-lab landscape, May 2026 {#frontier-landscape}
+
+The following table collects the publicly disclosed annealing recipes from the open labs as of May 2026. Where the original report does not state a value, the cell reads "not disclosed" — the chapter does not infer, speculate, or impute closed-lab values.
+
+<ComparisonTable
+  caption="Frontier-lab annealing recipes, May 2026. Cells marked 'not disclosed' reflect the absence of disclosure in the cited source. Closed labs (Anthropic, OpenAI, Google) are included for completeness."
+  columns={["Model", "Year", "Total tokens", "Annealing tokens", "Decay shape", "FP8?", "Key stability techniques", "Source"]}
+  rows={[
+    ["Llama-3 405B", "2024", "15.6T text + 800B long-ctx", "40M (cooldown)", "cosine in main + linear-to-0 in tail; Polyak avg", "No (BF16)", "AdamW β₂=0.95, clip 1.0, no spike-mitigation surgery reported", "arXiv:2407.21783"],
+    ["Llama-3.1 (rebadge)", "2024", "as Llama-3", "as Llama-3", "as Llama-3", "as Llama-3", "as Llama-3", "arXiv:2407.21783"],
+    ["Llama-4 Scout / Maverick", "2025", "~40T / ~22T", "not disclosed", "not disclosed (multi-stage with midtraining)", "not disclosed", "not disclosed", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["DeepSeek-V2 236B/21B-A", "2024", "8.1T", "step decay at ~60% and ~90%", "step × 0.316 twice", "No (BF16)", "AdamW β₂=0.95, clip 1.0", "arXiv:2405.04434"],
+    ["DeepSeek-V3 671B/37B-A", "2024", "14.8T", "4.3T cosine + 333B + 167B tails", "WSD: warmup → constant → cosine → constant × 2", "Yes (1×128 act / 128×128 wt, E4M3, BF16 moments, FP32 master)", "AdamW β₂=0.95, MTP, FP32-promotion accumulation, no reported spikes", "arXiv:2412.19437"],
+    ["Qwen2.5 72B", "2024", "18T", "staged, not quantified", "not disclosed", "not disclosed", "AdamW (standard); long-context ABF", "arXiv:2412.15115"],
+    ["Qwen3 235B-A22B", "2025", ">30T + ~5T + hundreds B", "~5T (Stage S2)", "accelerated decay in S2", "not disclosed", "QK-norm; Dual Chunk Attention + YaRN at S3", "arXiv:2505.09388"],
+    ["Phi-4 14B", "2024", "10T + 250B midtrain", "250B (midtrain)", "linear warmup + linear decay, peak LR ÷ 10 at midtrain", "not disclosed", "AdamW; 70% recall + 30% long-ctx", "arXiv:2412.08905"],
+    ["Kimi-K2 1T/32B-A", "2025", "15.5T + 400B + 60B long-ctx", "400B (η = 2e-5 → 7e-6)", "cosine decay; further decay in annealing", "partial (FP8-E4M3 activations); BF16 main", "MuonClip QK-clip τ=100, zero spikes claimed", "arXiv:2507.20534"],
+    ["OLMo-2 7B", "2025", "3.9T + 50B", "50B (Dolmino-Mix-1124)", "linear to 0", "No (BF16)", "z-loss 1e-5, QK-norm, reordered norm, ε=1e-8, no-embed-decay, n-gram filter; spike score 0.40 → 0.03", "arXiv:2501.00656"],
+    ["OLMo-2 13B", "2025", "5T + 100B", "100B", "linear to 0", "No (BF16)", "as 7B", "arXiv:2501.00656"],
+    ["OLMo-2 32B", "2025", "~6T + 3×100B + 300B", "300B (one run) + 100B × 3 (averaged soup)", "linear to 0, model-soup average", "No (BF16)", "as 7B/13B", "https://allenai.org/blog/olmo2-32b"],
+    ["Gemma-2 27B", "2024", "13T", "not disclosed", "not disclosed", "not disclosed", "Logit soft-cap (c=50 attn, c=30 final)", "arXiv:2408.00118"],
+    ["MiniCPM 2B", "2024", "varies (proxy)", "10% of run = decay", "exponential decay (original WSD)", "No", "math+code emphasis in decay", "arXiv:2404.06395"],
+    ["Mistral 7B / Mixtral 8×7B", "2023–24", "not disclosed", "not disclosed", "not disclosed", "not disclosed", "not disclosed", "arXiv:2310.06825 / arXiv:2401.04088"],
+    ["Claude 3.5 / 4.x", "2024–26", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "system cards"],
+    ["GPT-4 / GPT-5", "2023–25", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "system cards"],
+    ["Gemini 2 / 3", "2024–25", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "not publicly disclosed", "system cards"]
+  ]}
+/>
+
+<Sidenote>The table omits a column for total stability-incident counts because the published runs differ in how an "incident" is reported. Llama-3 405B does not report spike-driven restarts. DeepSeek-V3 and Kimi-K2 explicitly claim zero irrecoverable spikes at frontier scale. OLMo-2 reports a quantitative spike-score metric (0.40 → 0.03) under its stability stack. OPT-175B's ~90 restarts and PaLM's ~20 spikes are the high-water marks of the spike-driven era, predating the 2024–2026 stability stacks.</Sidenote>
+
+<Callout variant="info" title="Closed-lab inference is not warranted">
+Anthropic, OpenAI, and Google system cards consistently disclose post-training procedure (RLHF, constitutional AI, safety evaluations) but not pretraining-stage details. Annealing token budgets, schedule shapes, precision format, and stability stacks are not in the public domain for Claude (any version), GPT-4, GPT-5, or Gemini 2/3. The closed-lab rows in the table are deliberately marked "not publicly disclosed" rather than imputed; readers should resist the temptation to infer "they probably use cosine + BF16" — the chapter quotes nothing about them.
+</Callout>
+
+The biggest open uncertainty in the table is whether the published "no-spike" claims generalise. DeepSeek-V3, Kimi-K2, and OLMo-2 each publish their stability stack as comprehensive, but each combines a different subset — V3 uses tile/block FP8 plus BF16 moments plus standard clip; K2 uses MuonClip plus partial FP8 plus BF16 main; OLMo-2 uses z-loss plus QK-norm plus Peri-LN plus no-embed-decay plus small $\epsilon$ plus dedupe. Whether any of these recipes, applied in isolation, would have eliminated spikes on the original Llama-2 run is unknown. The honest position is that a comprehensive stability stack is now table-stakes, but the specific combination is lab-specific and not yet falsified into a minimal set.
+
+---
+
+## Chapter summary {#summary}
+
+- The late-pretraining *annealing phase* — also called midtraining, decay, cooldown, Stage 2/3, or the high-quality phase — is the final 1–10% of pretraining tokens, executed with a decaying LR (often to zero) on a data mix shifted toward high-quality web, code, math, synthetic textbooks, and instruction-format data. The vocabulary is fragmented; the operational recipe is largely shared.
+- The 405B Llama-3 cooldown is **40M tokens** (not 40B). The 40B figure refers to a separate within-paper data-quality assessment protocol on a 50%-trained 8B checkpoint, on which annealing on HQ code+math gives GSM8K +24.0% and MATH +6.4%. The two figures are systematically conflated in second-hand summaries.
+- DeepSeek-V3 ships the canonical WSD-with-a-flat-tail schedule (10T constant + 4.3T cosine + 333B + 167B) and the canonical fine-grained FP8 recipe (1×128 activation tiles, 128×128 weight blocks, E4M3 elements, BF16 moments, FP32 master weights, manual FP32-promotion accumulation to recover from the 14-bit Hopper Tensor Core limitation). The lab reports zero irrecoverable spikes at 671B parameters and 14.8T tokens.
+- OLMo-2's published stability stack — z-loss $10^{-5}$, QK-norm, reordered (Peri-LN) normalisation, AdamW $\epsilon = 10^{-8}$, no weight decay on embeddings, $\geq 32$-gram document filtering — reduces the gradient-norm spike score from **0.40 to 0.03**. Kimi-K2 reaches the same no-spike outcome with a different stack (MuonClip QK-clip at $\tau = 100$); DeepSeek-V3 reaches it with yet another (FP8 + BF16 moments + standard clip). No minimal sufficient set has been falsified.
+- The FP8 generation tree runs from per-tensor (FP8-LM, 2023) through DeepSeek-V3's 1×128 / 128×128 fine-grained scaling (the production-grade recipe of 2024–2025) to OCP MXFP8 (block 32, E8M0 scale, Blackwell-native) and NVIDIA's NVFP4 (block 16, E4M3 micro-scale, FP32 outer, 12B / 10T-token demo). FP8 recipes age fastest; this chapter is calibrated to May 2026.
+- The spike-management playbook descends from OPT-175B's ~90 restarts and PaLM's ~20 spikes: detect the gradient-norm spike 1–3 steps before loss divergence, rewind 100–500 steps, skip 200–500 batches, and continue. Adaptive variants (ZClip, AdaGC) preempt; SPAM resets Adam's first moment instead of rewinding; MuonClip prevents inside the optimiser. The 2024–2026 open frontier is moving from spike-driven runbooks to comprehensive prevention stacks.
+- Closed-lab annealing recipes (Anthropic, OpenAI, Google) are not publicly disclosed at sufficient detail. The frontier-lab landscape table includes them with "not publicly disclosed" rows to make the disclosure boundary explicit.
+
+<Sources items={[
+  {
+    authors: "Dubey, A. et al. (Meta Llama Team)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Three-stage pretraining: initial, long-context, annealing. 405B annealing tail = 40M tokens with Polyak averaging. §3.4.3 data-quality assessment via 8B+40B procedure: GSM8K +24.0%, MATH +6.4%."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "Llama 4 release blog",
+    venue: "ai.meta.com",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama-4 Scout and Maverick announcement. 'Multi-stage including a midtraining phase' but no token budgets, LR shape, or precision disclosed."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "§3.1.2: warmup 2k steps to ηmax=2.4e-4; step-decay × 0.316 at ~60% and ~90% tokens. 8.1T tokens, MoE 236B/21B-A."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "§4.2 multistage WSD schedule (10T constant + 4.3T cosine + 333B + 167B tails). §4.5 FP8 recipe: 1×128 act tile, 128×128 wt block, E4M3, BF16 moments, FP32 master, manual FP32-promotion accumulation. Zero irrecoverable spikes at 671B / 14.8T."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures",
+    venue: "ISCA 2025; arXiv:2505.09343",
+    url: "https://arxiv.org/abs/2505.09343",
+    note: "Hardware perspective on V3 recipe. 14-bit Hopper FP8 Tensor Core accumulator limitation and the 34-bit precision requirement."
+  },
+  {
+    authors: "Colfax Research",
+    year: 2025,
+    title: "DeepSeek-R1 and FP8 Mixed-Precision Training",
+    venue: "Colfax blog",
+    url: "https://research.colfax-intl.com/deepseek-r1-and-fp8-mixed-precision-training/",
+    note: "Independent analysis of DeepSeek-V3 FP8 mechanism. Block scaling and accumulation precision."
+  },
+  {
+    authors: "Graphcore Research",
+    year: 2025,
+    title: "DeepSeek-V3 & DeepSeek-R1 Technical Reports",
+    venue: "Graphcore Research blog",
+    url: "https://graphcore-research.github.io/deepseek/",
+    note: "Independent walkthrough of the V3 schedule, FP8 recipe, and MoE structure."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "18T-token staged pretraining. Long-context extension via ABF (RoPE base 10K → 1M); Qwen2.5-Turbo progressive 32K → 65K → 131K → 262K."
+  },
+  {
+    authors: "Yang, A. et al. (Qwen Team)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Three-stage S1/S2/S3: >30T general + ~5T reasoning + hundreds-B long-ctx. 'LR decay accelerated' in S2. QK-norm reported as key stability intervention."
+  },
+  {
+    authors: "Abdin, M. et al. (Microsoft Phi Team)",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "10T pretrain (15% web + 15% web-rewrites + 40% synthetic + 20% code + 10% acquired); 250B midtrain (30% long-ctx + 70% recall); LR ÷ 10 at midtrain; RoPE base 250K."
+  },
+  {
+    authors: "Moonshot AI (Kimi Team)",
+    year: 2025,
+    title: "Kimi K2: Open Agentic Intelligence",
+    venue: "arXiv:2507.20534",
+    url: "https://arxiv.org/abs/2507.20534",
+    note: "15.5T main + 400B annealing (η: 2e-5 → 7e-6) + 60B long-ctx. MuonClip QK-clip τ=100. Zero loss spikes claimed. BF16 main + FP8-E4M3 activations in places."
+  },
+  {
+    authors: "Walsh, P. et al. (Ai2 OLMo Team)",
+    year: 2025,
+    title: "2 OLMo 2 Furious",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "Two-stage recipe. Stage 1 on OLMo-Mix-1124; Stage 2 on Dolmino-Mix-1124 (50B/100B/300B). Stability stack: z-loss 1e-5, QK-norm, reordered norm, ε=1e-8, no-embed-decay, n-gram filter. Spike score 0.40 → 0.03."
+  },
+  {
+    authors: "Ai2",
+    year: 2025,
+    title: "OLMo 2 32B",
+    venue: "Ai2 blog, March 2025",
+    url: "https://allenai.org/blog/olmo2-32b",
+    note: "32B Stage-2 model-soup recipe: 3× 100B + 1× 300B Dolmino-Mix runs averaged."
+  },
+  {
+    authors: "Riviere, G. et al. (Google DeepMind)",
+    year: 2024,
+    title: "Gemma 2: Improving Open Language Models at a Practical Size",
+    venue: "arXiv:2408.00118",
+    url: "https://arxiv.org/abs/2408.00118",
+    note: "13T/8T/2T tokens (27B/9B/2B). Logit soft-cap c=50 attention, c=30 final layer. Distillation for 9B and 2B."
+  },
+  {
+    authors: "Jiang, A. et al. (Mistral)",
+    year: 2023,
+    title: "Mistral 7B",
+    venue: "arXiv:2310.06825",
+    url: "https://arxiv.org/abs/2310.06825",
+    note: "Architecture and benchmarks; pretraining recipe and schedule not disclosed."
+  },
+  {
+    authors: "Hu, S. et al.",
+    year: 2024,
+    title: "MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies",
+    venue: "arXiv:2404.06395",
+    url: "https://arxiv.org/abs/2404.06395",
+    note: "Original WSD schedule proposal. 10% decay phase sufficient. Branch-from-checkpoint strategy."
+  },
+  {
+    authors: "Ibrahim, A. et al.",
+    year: 2024,
+    title: "Simple and Scalable Strategies to Continually Pre-train Large Language Models",
+    venue: "TMLR 2024",
+    url: "https://openreview.net/forum?id=DimPeeCxKO",
+    note: "Constant-LR / 'infinite' schedule for continual pretraining; cooldown vocabulary; replay + flatter minima."
+  },
+  {
+    authors: "Wang, K. et al.",
+    year: 2025,
+    title: "Mid-Training of Large Language Models: A Survey",
+    venue: "arXiv:2510.06826",
+    url: "https://arxiv.org/abs/2510.06826",
+    note: "Umbrella survey adopting 'mid-training' as the term. Six-category data taxonomy (HQ web, code, math, instruction, synthetic, long-context)."
+  },
+  {
+    authors: "Liu, Y. et al.",
+    year: 2025,
+    title: "A Survey on LLM Mid-training",
+    venue: "arXiv:2510.23081",
+    url: "https://arxiv.org/abs/2510.23081",
+    note: "Concurrent survey using the same vocabulary."
+  },
+  {
+    authors: "Vintage Data",
+    year: 2024,
+    title: "What's the deal with mid-training?",
+    venue: "vintagedata.org blog",
+    url: "https://vintagedata.org/blog/posts/what-is-mid-training",
+    note: "Early-2024 community piece coining 'mid-training' usage."
+  },
+  {
+    authors: "Zhang, S. et al. (Meta)",
+    year: 2022,
+    title: "OPT: Open Pre-trained Transformer Language Models",
+    venue: "arXiv:2205.01068",
+    url: "https://arxiv.org/abs/2205.01068",
+    note: "OPT-175B logbook. ~90 restarts; LR reduction, clip-frequency increase, skip-batch + restart. Foundational chronicle."
+  },
+  {
+    authors: "Chowdhery, A. et al. (Google)",
+    year: 2022,
+    title: "PaLM: Scaling Language Modeling with Pathways",
+    venue: "arXiv:2204.02311",
+    url: "https://arxiv.org/abs/2204.02311",
+    note: "§5.1 training instability. ~20 spikes. Diagnostic: same batches against earlier checkpoint do not reproduce → spikes are (data, state) joint events. Skip-batch recipe."
+  },
+  {
+    authors: "Zeng, A. et al.",
+    year: 2023,
+    title: "GLM-130B: An Open Bilingual Pre-trained Model",
+    venue: "ICLR 2023; arXiv:2210.02414",
+    url: "https://arxiv.org/abs/2210.02414",
+    note: "Embedding-gradient-shrink trick (× 0.1). FP16 with FP32 master weights — canonical bf16-vs-fp32-master story."
+  },
+  {
+    authors: "Touvron, H. et al. (Meta)",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "β₂ = 0.95 to dampen second-moment EMA against outlier gradients. Acknowledges baseline LLM training is 'essentially unstable.'"
+  },
+  {
+    authors: "Takase, S., Kiyono, S., Kobayashi, S. & Suzuki, J.",
+    year: 2025,
+    title: "Spike No More: Stabilizing the Pre-training of LLMs",
+    venue: "COLM 2025; arXiv:2312.16903",
+    url: "https://arxiv.org/abs/2312.16903",
+    note: "Two mechanisms identified: shortcut explosion + Pre-LN amplification. Recommendations: scaled init, Embed-LN, Scaled-Embed."
+  },
+  {
+    authors: "Zoph, B. et al. (Google)",
+    year: 2022,
+    title: "ST-MoE: Designing Stable and Transferable Sparse Expert Models",
+    venue: "arXiv:2202.08906",
+    url: "https://arxiv.org/abs/2202.08906",
+    note: "§3.3 router z-loss. Attributes output-softmax z-loss to Mesh-TF / Shazeer 2018. cz coefficients 1e-3 to 1e-5."
+  },
+  {
+    authors: "Kumar, A. et al.",
+    year: 2025,
+    title: "ZClip: Adaptive Spike Mitigation for LLM Pre-Training",
+    venue: "arXiv:2504.02507",
+    url: "https://arxiv.org/abs/2504.02507",
+    note: "z-score-based adaptive clipping. zthr=2.5 default. 0 spikes / 2.18 test loss vs. fixed clip-1.0's 6 spikes / 2.33 at LR 1e-3 on 50B tokens."
+  },
+  {
+    authors: "Liang, Z. et al.",
+    year: 2025,
+    title: "AdaGC: Enhancing LLM Pretraining Stability via Adaptive Gradient Clipping",
+    venue: "arXiv:2502.11034",
+    url: "https://arxiv.org/abs/2502.11034",
+    note: "Per-tensor adaptive clipping. λrel=1.04, β=0.99. Spike score → 0 on Llama-2 7B / Mixtral 8×1B / ERNIE 10B-A1.4B; downstream accuracy +1.32% / +1.27% / +2.48%."
+  },
+  {
+    authors: "Hsu, K. et al.",
+    year: 2025,
+    title: "SPAM: Spike-Aware Adam with Momentum Reset",
+    venue: "arXiv:2501.06842",
+    url: "https://arxiv.org/abs/2501.06842",
+    note: "Detect spike, then reset Adam's first moment to break momentum chain. Alternative to skip-batch recovery."
+  },
+  {
+    authors: "Nado, Z.",
+    year: 2022,
+    title: "ε, A Nuisance No More",
+    venue: "zna.do blog",
+    url: "https://zna.do/epsilon",
+    note: "Vision/RL prescription to raise AdamW ε. Has not transferred to frontier LLMs."
+  },
+  {
+    authors: "Peng, H. et al. (NVIDIA-MS)",
+    year: 2023,
+    title: "FP8-LM: Training FP8 Large Language Models",
+    venue: "arXiv:2310.18313",
+    url: "https://arxiv.org/abs/2310.18313",
+    note: "First end-to-end FP8 LLM pretraining recipe. Three-level framework. Global-minimum scaling. GPT-175B H100: 39% memory, 75% speedup vs Megatron BF16."
+  },
+  {
+    authors: "Rouhani, B. et al. (MX Alliance)",
+    year: 2023,
+    title: "Microscaling Data Formats for Deep Learning",
+    venue: "arXiv:2310.10537",
+    url: "https://arxiv.org/abs/2310.10537",
+    note: "MX format introduction: block 32, E8M0 scale, MXFP8/MXFP6/MXFP4/MXINT8 element formats."
+  },
+  {
+    authors: "Open Compute Project",
+    year: 2023,
+    title: "OCP Microscaling Formats (MX) Specification v1.0",
+    venue: "OCP, September 2023",
+    url: "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf",
+    note: "Official MX spec co-signed by AMD, Arm, Intel, Meta, Microsoft, NVIDIA, Qualcomm."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Per-Tensor and Per-Block Scaling Strategies for Effective FP8 Training",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/per-tensor-and-per-block-scaling-strategies-for-effective-fp8-training/",
+    note: "Delayed-scaling vs current-scaling vs block-wise comparison. MXFP8 on Blackwell."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Transformer Engine FP8 Primer",
+    venue: "NVIDIA docs v2.14",
+    url: "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html",
+    note: "Reference for fp8_recipe options: delayed, tensorwise, blockwise, mxfp8."
+  },
+  {
+    authors: "Wang, B. et al.",
+    year: 2025,
+    title: "FP4 All the Way: Fully Quantized Training of LLMs",
+    venue: "arXiv:2505.19115",
+    url: "https://arxiv.org/abs/2505.19115",
+    note: "First fully quantised FP4 training claim at LLM scale. Small loss gap to BF16 closed by short BF16 backward pass."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Pretraining Large Language Models with NVFP4",
+    venue: "arXiv:2509.25149",
+    url: "https://arxiv.org/abs/2509.25149",
+    note: "NVFP4: block 16, E2M1 elements + E4M3 micro-scale + FP32 outer. 12B / 10T-token demo. Matches MXFP4 with 36% fewer tokens at 8B."
+  },
+  {
+    authors: "Fujii, K. et al.",
+    year: 2024,
+    title: "Balancing Speed and Stability: The Trade-offs of FP8 vs BF16 Training in LLMs",
+    venue: "arXiv:2411.08719",
+    url: "https://arxiv.org/abs/2411.08719",
+    note: "Continued-pretraining Llama-3-70B on ~100B tokens: per-tensor FP8 unstable with loss spikes; 415 → 570 TFLOPS (~37% speedup) but accuracy regressions."
+  },
+  {
+    authors: "Allen Institute / Meta facebookresearch",
+    year: 2022,
+    title: "OPT Chronicles",
+    venue: "GitHub: facebookresearch/metaseq/projects/OPT/chronicles",
+    url: "https://github.com/facebookresearch/metaseq/tree/main/projects/OPT/chronicles",
+    note: "Full 114-page training logbook of OPT-175B. The canonical operational record of spike-driven training in the FP16 era."
+  },
+  {
+    authors: "Zeng, F. P.",
+    year: 2024,
+    title: "Notes on Llama 3.1 technical report",
+    venue: "fanpu.io",
+    url: "https://fanpu.io/blog/2024/llama-3.1-technical-report-notes/",
+    note: "Community confirmation of 40M annealing-tail figure and the 40M-vs-40B distinction."
+  },
+  {
+    authors: "Wolfe, C. R.",
+    year: 2025,
+    title: "Llama 4: The Challenges of Creating a Frontier-Level LLM",
+    venue: "cameronrwolfe.substack.com",
+    url: "https://cameronrwolfe.substack.com/p/llama-4",
+    note: "Synthesis of public Llama-4 disclosures and the 'multi-stage with midtraining' language."
+  },
+  {
+    authors: "Bekman, S.",
+    year: "ongoing",
+    title: "Machine Learning Engineering — training instabilities",
+    venue: "github.com/stas00/ml-engineering",
+    url: "https://github.com/stas00/ml-engineering/blob/master/training/instabilities/README.md",
+    note: "Initialization formulas (Transformers Without Tears √(2/(5·H)); 530B-paper √(1/(3·H))); FP16 attention pre-scaling for numerical stability."
+  },
+  {
+    authors: "Bekman, S.",
+    year: "ongoing",
+    title: "Understanding training loss patterns",
+    venue: "github.com/stas00/ml-engineering",
+    url: "https://github.com/stas00/ml-engineering/blob/master/training/instabilities/training-loss-patterns.md",
+    note: "Six-category taxonomy of loss-curve patterns: fast-recovering / slow-recovering / not-fully-recovering / non-spike-diverging / grokking / resume-misalignment, with recommended response per category."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 full restart at 1T tokens (TP-bug incident)",
+    venue: "smol-training-playbook gist",
+    url: "https://gist.github.com/unclecode/e5da5fb6a1d37022b089e243e0d9e00e",
+    note: "2025 open-recipe example of full training restart from a silent tensor-parallelism bug; 46,080 GPU-hours sunk-cost; ~10% of total compute spent on debugging + restart."
+  }
+]} />

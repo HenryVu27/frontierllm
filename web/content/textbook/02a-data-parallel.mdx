@@ -1,0 +1,552 @@
+---
+slug: 02a-data-parallel
+title: Data parallelism (DP, DDP) and the synchronous gradient
+description: Replicate the model, shard the batch — AllReduce semantics, gradient accumulation, weak vs strong scaling, and the bandwidth math behind 64-H100 DP runs.
+order: 20
+chapter: 19
+module: 2
+module_title: Distributed training
+reading_minutes: 36
+depends_on: [01e-schedules-and-batch]
+provides: [data-parallel, allreduce, gradient-accumulation, weak-scaling, ddp-bucketing]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Module 1 treated pretraining as if a single device held the entire model and consumed the entire batch. That fiction was useful for setting up the optimizer, the schedule, and the data pipeline, but it is contradicted by every public frontier run since GPT-3. The Llama-3 405B pretraining ran on sixteen thousand H100s; DeepSeek-V3 ran on roughly two thousand H800s; even the AI2 OLMo-2 7B runs span hundreds of GPUs. Module 2 covers how those runs are actually distributed, and this chapter — the first chapter of Module 2 — covers the dimension that comes first historically, first pedagogically, and first in the parallelism cube of every modern recipe: data parallelism.
+
+The reader arrives here knowing what AdamW does at the per-parameter level (from the [optimizers chapter](/textbook/00f-optimizers#adamw)), how learning-rate schedules and batch sizes interlock (from [schedules and batch](/textbook/01e-schedules-and-batch)), and that gradient accumulation is one knob for raising the effective batch size at fixed memory ([01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum)). What that material did not provide is the meaning of the word "AllReduce" — what it actually computes, why its bandwidth cost is $2|g|(W-1)/W$ per rank, how PyTorch overlaps it with backward, and why DP-only training tops out at modest scales of a few hundred GPUs even though the AllReduce traffic per rank is nearly independent of world size.
+
+This chapter delivers those four pieces. The treatment proceeds in four layers. Sections on the DP idea and the PyTorch DDP design fix the semantics — what the synchronous gradient is, how the gradient bucket overlaps communication with backward, and what `no_sync()` does for gradient accumulation. Sections on weak versus strong scaling and the AllReduce algorithms develop the quantitative framework — Patarasuk and Yuan's $2(W-1)/W$ bandwidth lower bound, NCCL's switch from ring to double-binary-tree at large world sizes, and Gustafson's distinction between scaling regimes. A worked example with a 7B model on 64 H100s plugs the formulas into measured H100 NVLink and InfiniBand numbers. A frontier-recipe table reproduces what the public reports of Llama-3, DeepSeek-V3, OLMo-2, and Megatron-LM disclose about their DP configurations.
+
+What this chapter does *not* cover is signposted forward. ZeRO-1/2/3 and FSDP appear in [FSDP and ZeRO](/textbook/02e-fsdp-and-zero); the deep treatment of NCCL's algorithm matrix is reserved for [collectives and overlap](/textbook/02f-collectives-and-overlap); the composition of DP with the inner parallelism dimensions is treated in [3D/4D composition](/textbook/02h-3d-4d-composition). The present chapter stays inside the boundary of one parallelism dimension.
+
+<Callout variant="note" title="Notation">
+Throughout this chapter: $W$ is the DP world size, the number of ranks holding model replicas. $|g|$ is the gradient size in bytes — for a model with $N$ parameters in BF16, $|g| = 2N$ bytes. $\eta$ is the learning rate and $B$ the batch size; units are tokens or sequences depending on context, always specified on first use of a numerical recipe. $\mu$ is the number of gradient-accumulation micro-steps per optimizer step; the effective per-rank batch is $\mu b$ for per-micro-step batch $b$, and the effective global batch is $\mu b W$. Module-wide symbols $N$ for parameter count and $D$ for pretraining-token budget retain their meaning from [pretraining](/textbook/01-pretraining).
+</Callout>
+
+---
+
+## The DP/DDP idea {#dp-idea}
+
+### The synchronous-gradient algorithm
+
+Data-parallel synchronous SGD with world size $W$ is the following five-step iteration. First, each of $W$ workers holds a complete replica of the parameters $\theta$. Second, the global mini-batch $B$ is sharded across workers; rank $r$ sees $B/W$ samples. Third, each worker computes its local loss $\mathcal{L}_r(\theta)$ and its local gradient $g_r = \nabla_\theta \mathcal{L}_r$. Fourth, an **AllReduce** collective averages the gradients so that every worker ends with the same averaged gradient
+
+$$\bar{g} \;=\; \frac{1}{W} \sum_{r=1}^{W} g_r.$$
+
+Fifth, every worker applies the same optimizer update with the same $\bar{g}$. Because the workers started from identical parameters and applied an identical update, they remain bit-identical at the next step, modulo non-determinism in the reduction order — and modern training stacks pin the reduction order precisely to avoid even that source of drift.
+
+The mathematical equivalence to single-replica training is exact. Provided the loss is a per-sample average and the gradient reduction sums sample-wise gradients and divides by $B$, the DP update is *identical* to what a hypothetical single device with $W$ times the memory and FLOPs would compute on the full mini-batch. DP introduces no approximation. It is a parallel implementation of an inherently sequential algorithm, not a different algorithm. This is the operational meaning of the word "synchronous" in synchronous DP — it is synchronous because each worker waits for the collective to complete before stepping the optimizer, and the consequence of that waiting is exact equivalence to the un-parallelised reference.
+
+Goyal et al. (2017) gave the first large-scale demonstration that this synchronous discipline scales well in practice, training ResNet-50 on ImageNet with 256 GPUs and a global batch of 8,192 images, reporting roughly 90% scaling efficiency from 8 to 256 GPUs and matching the single-GPU validation accuracy. That result was the inflection point at which synchronous DP supplanted the asynchronous variants — Dean et al. (2012)'s Downpour SGD, hogwild!-style updates — that had dominated the previous era of deep learning systems. Asynchronous DP sacrifices the bit-equivalence to single-replica training in exchange for higher per-step throughput, on the theory that stale gradients are acceptable noise. At LLM scale the trade has gone the other way: every public frontier run since GPT-2 uses synchronous DP exclusively, because reproducibility, stability across thousands of optimizer steps, and the option to restart from checkpoints all depend on the synchronous discipline.
+
+### Why DP is the natural starting point
+
+Every other parallelism dimension covered later in this module — tensor parallelism, pipeline parallelism, context parallelism, expert parallelism — introduces *new* communication patterns *inside* the forward and backward of a single sample. DP introduces communication *between* samples. It is bolted on top of an unchanged single-replica training loop and requires no modification to the model code: the user-facing API is `model = DDP(model)`, and the model class itself is untouched. This is the historical reason DP comes first, and it is also the systems reason that DP sits as the **outermost** dimension of the modern 3D and 4D parallelism cubes (see the [frontier-configs](#frontier-configs) section below). The AllReduce that DP requires happens once per optimizer step, not once per layer, so its fixed costs amortize over the largest possible work unit and its messages are the largest possible — the entire gradient buffer — which is the regime where bandwidth-optimal collectives are most bandwidth-efficient.
+
+The semantics of the synchronous gradient that this section establishes do not change when inner parallelism dimensions are added — they only get harder to implement, because the gradient lives in pieces on different devices and the AllReduce must be coordinated with whatever inner-dimension reduction has produced those pieces. [FSDP and ZeRO](/textbook/02e-fsdp-and-zero) develops the sharding variants of DP; [tensor parallelism](/textbook/02b-tensor) and [pipeline parallelism](/textbook/02c-pipeline) develop the orthogonal dimensions.
+
+---
+
+## PyTorch DDP and gradient bucketing {#ddp-bucketing}
+
+### The naive design and why it fails
+
+A naive implementation of synchronous DP would run the entire backward pass to completion, then issue one large AllReduce over the full gradient buffer. The semantics are correct but the performance is poor for two reasons. The AllReduce runs serially after the backward, so total step time becomes $T_{\text{fwd}} + T_{\text{bwd}} + T_{\text{AR}}$. On large models with multi-gigabyte gradient buffers, the AllReduce can be twenty to forty percent of step time, and making it serial wastes that fraction. Separately, a single giant collective message has good bandwidth utilization but its end-to-end latency is determined by the slowest link in the topology and dominates step time at the message-size extreme; the many tiny per-parameter messages at the other extreme have terrible bandwidth utilization. The optimum lives in between, and a naive implementation occupies neither end of it.
+
+PyTorch's `torch.nn.parallel.DistributedDataParallel` — DDP — solves both problems with **gradient bucketing**. The design is documented in Li et al. (2020) and in the PyTorch DDP design note; the key behavioural fact is that the bucketing turns AllReduce into a stream of medium-sized collectives that the autograd engine can launch *while the backward is still running*. The result is that AllReduce ceases to be serialized after backward and instead overlaps with it.
+
+### The bucketing mechanics
+
+The DDP API documentation states the default plainly:
+
+> DistributedDataParallel will bucket parameters into multiple buckets so that gradient reduction of each bucket can potentially overlap with backward computation. `bucket_cap_mb` controls the bucket size in MebiBytes (MiB). If `None`, a default size of 25 MiB will be used.
+
+The mechanism, as described in the DDP design note, has four moving parts. *Bucket allocation*: at constructor time, the model's parameters are grouped into buckets each at or below `bucket_cap_mb`, with the default 25 MiB. The bucket order is approximately the *reverse* of `model.parameters()` order, because gradients become ready during backward in roughly the reverse of the forward order; on the first iteration, the actual ready-order observed on rank 0 is recorded and the bucket layout is rebuilt to match, then frozen for the rest of training. *Per-parameter autograd hooks*: the DDP `Reducer` registers one autograd hook per parameter, and the engine invokes that hook when the corresponding gradient becomes ready. *Bucket trigger*: when *all* gradients in a bucket are ready, the Reducer kicks off an asynchronous `allreduce` on that bucket to compute the mean of gradients across all processes; the remaining buckets continue accumulating gradient as the backward proceeds. *Identical order on every rank*: reducer instances on all processes must invoke `allreduce` in exactly the same order, which DDP enforces by always running `allreduce` in *bucket index* order rather than the actual ready order. A mismatch across ranks would corrupt results or hang the run, which is why the bucket-rebuild logic freezes the order after the first iteration and refuses to change it.
+
+The net effect on step time is that AllReduces for later layers' buckets are already running on the NCCL stream while gradients for the earlier layers are still being computed by the backward kernels on the compute stream. To first order, the step time becomes
+
+$$T_{\text{step}} \;\approx\; \max\!\big( T_{\text{fwd}} + T_{\text{bwd}}, \; T_{\text{fwd}} + T_{\text{AR}}\big) - T_{\text{overlap}},$$
+
+which in practice means the AllReduce hides *behind* the backward, and the observed step time is close to forward plus backward alone with the AllReduce mostly free. The remainder — the un-hidden tail of the AllReduce, the buckets that became ready too close to the end of backward — is the residual that an operator still pays.
+
+### The choice of 25 MiB
+
+The 25 MiB default is empirical rather than derived. The PyTorch issue tracker discusses raising it (issue #118421) but it has remained at 25 MiB through at least PyTorch 2.12 as of this writing. The trade-off has two ends. *Too small* and the run pays the NCCL kernel launch and synchronization latency — tens of microseconds — once per bucket, and the aggregate latency dominates AllReduce time at the small-bucket end of the spectrum. *Too big* and the last bucket cannot launch until the entire backward is nearly done, which leaves no room for overlap and reverts the schedule toward the naive design.
+
+At 25 MiB in BF16 each bucket holds roughly 12.5 million parameters, which corresponds approximately to one transformer block of a 7B-class model. So most blocks fit in one bucket, the bucket count tracks the block count, and the ratio of bucket count to backward duration is comfortable for modern GPUs. There is no formal derivation showing 25 MiB is optimal at any specific point — the closest reference is the Horovod tensor-fusion discussion in Sergeev and Del Balso (2018), which describes the qualitative trade-off but does not derive an optimal size. The practical guidance is to leave the default in place unless profiling shows either a large un-hidden AllReduce tail (raise `bucket_cap_mb`) or a long stream of small-message AllReduces consuming launch latency (also raise it, or set `gradient_as_bucket_view=True` to reduce copy overhead).
+
+### `no_sync()` and gradient accumulation
+
+The DDP API exposes one more context manager that matters for almost every frontier run, because almost every frontier run uses gradient accumulation:
+
+> Context manager to disable gradient synchronizations across DDP processes. Within this context, gradients will be accumulated on module variables, which will later be synchronized in the first forward-backward pass exiting the context.
+
+The reason `no_sync()` matters is developed in the next section, but the mechanism is local to the bucket design: inside the context, the autograd hooks still fire and gradients still accumulate into `.grad`, but the Reducer is told not to launch any AllReduce. Only the final backward in an accumulation cycle, performed outside the context, triggers the bucket-by-bucket AllReduce. Without `no_sync()`, an accumulation cycle of $\mu$ micro-batches would issue $\mu$ full AllReduces, of which the first $\mu - 1$ produce partial gradient sums that the optimizer never reads. The bandwidth wasted by those discarded AllReduces is the entire reason the API exists.
+
+<Sidenote>The DDP design has acquired several smaller knobs over the years. `gradient_as_bucket_view=True` aliases each parameter's `.grad` tensor to a view into the bucket's flat buffer, avoiding a copy when the Reducer assembles the bucket; this is now a default-recommended setting for large models. `find_unused_parameters=False` is the default and assumes the model graph is static — turning it on costs an extra traversal of the autograd graph per backward and is rarely needed for transformer pretraining. `static_graph=True` lets DDP cache the autograd graph after the first iteration and skip the traversal entirely; it is compatible with activation checkpointing in modern PyTorch but historically caused subtle hangs and is best validated empirically.</Sidenote>
+
+---
+
+## Gradient accumulation {#grad-accum}
+
+### The equivalence, recapitulated
+
+The equivalence between gradient accumulation and large-batch training was established in [01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum) for the single-device setting; the recap here is brief. With per-micro-step batch $b$ on each of $W$ workers and $\mu$ accumulation steps before the optimizer step, the effective per-worker batch is $\mu b$ and the effective global batch is $\mu b W$. The gradient passed to the optimizer is the average
+
+$$g_{\text{eff}} \;=\; \frac{1}{\mu} \sum_{i=1}^{\mu} g^{(i)},$$
+
+which is statistically identical to the gradient that a single $\mu b$-sample mini-batch would produce, for models without batch-statistics dependencies — i.e., for the LayerNorm and RMSNorm transformers that constitute the entire frontier-LLM lineage. This was sketched in [01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum), and the AdamW-momentum subtlety — that $m_t$, $v_t$, bias correction, and weight decay all act once per *optimizer step* rather than once per micro-batch — was developed there and is not re-derived here.
+
+### The DDP-specific subtlety
+
+What the single-device treatment did not need to say is what happens when this accumulation cycle is wrapped in DDP. Naively chaining $\mu$ `backward()` calls fires the autograd hooks $\mu$ times, and each hook firing triggers an AllReduce when its bucket becomes complete. The first $\mu - 1$ of those AllReduces produce partial gradient sums that the optimizer never uses — they are intermediate states of the accumulation, not the final averaged gradient. Their bandwidth is wasted. With per-step AllReduce cost $T_{\text{AR}}$ (developed quantitatively in the [AllReduce section below](#allreduce)), naive accumulation multiplies the communication cost by $\mu$ and pushes step time from approximately $\mu T_{\text{fwd+bwd}} + T_{\text{AR}}$ up to $\mu T_{\text{fwd+bwd}} + \mu T_{\text{AR}}$.
+
+`no_sync()` is the fix:
+
+```python
+import contextlib
+for i, micro_batch in enumerate(accumulation_chunks):
+    is_last = (i == len(accumulation_chunks) - 1)
+    ctx = contextlib.nullcontext() if is_last else model.no_sync()
+    with ctx:
+        loss = model(micro_batch)
+        (loss / mu).backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+The first $\mu - 1$ backwards accumulate gradient into the `.grad` buffers without firing the AllReduce, because the Reducer is muted by the context manager. Only the final backward, performed outside the context, triggers the bucket-by-bucket AllReduce on the now-accumulated gradient. The AllReduced gradient is the *sum* of the $\mu$ micro-batches' gradients, scaled by $1/\mu$ via the explicit `loss / mu` in the loss term so that the resulting averaged gradient has the same magnitude as a single $\mu b$-sample mini-batch would have produced. The pattern is the historical descendant of the "delayed updates" technique introduced by Ott et al. (2018) for scaling Transformer NMT to 128 GPUs, which reported a roughly fivefold speedup on a single 8-GPU machine and a 29.3 BLEU on WMT'14 En–De in 85 minutes.
+
+### Gradient clipping under accumulation
+
+One detail crosses the boundary between [01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum)'s treatment and the DDP-specific story here and deserves explicit re-statement, because it is a common bug source. Gradient clipping must be applied on the *accumulated* and *AllReduced* gradient, not on each individual micro-step. The reason is that clipping is a global operation on the gradient norm $\|\bar{g}\|$, and the norm of the average is not the average of the norms — clipping each micro-step separately and then averaging produces a different value of $\bar{g}$ than averaging first and then clipping, and only the latter is the gradient that the un-accumulated reference run would compute. The correct ordering is: accumulate $\mu$ micro-batches under `no_sync()`, do the final backward outside the context, let DDP AllReduce the accumulated gradient, then call `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)` *before* `optimizer.step()`. This places the clip after the AllReduce has completed and operates on the same $\bar{g}$ on every rank.
+
+---
+
+## Weak vs strong scaling {#scaling}
+
+### Definitions, transplanted from HPC
+
+The HPC community has spent four decades carefully separating two questions that LLM practitioners sometimes conflate. *Strong scaling* asks: with the problem size held fixed, how does time-to-solution change as more processors are added? *Weak scaling*, due to Gustafson (1988), asks: with the per-processor problem size held fixed, how does time-to-solution change as more processors are added with a proportionally larger problem? The ideal of strong scaling is $T_W = T_1 / W$ — perfect linear speedup with bounded Amdahl-law tail. The ideal of weak scaling is $T_W = T_1$ — constant time as both the problem and the processor count grow. Real systems sit below both ideals, with deficits due to communication and load imbalance.
+
+Translated into LLM-pretraining language: strong scaling fixes the global batch $B$ and varies $W$, so each worker's compute share is $B/W$ — it shrinks as $W$ grows while the AllReduce traffic per rank is nearly constant (the $(W-1)/W$ factor in the next section saturates at 1). Past a crossover point, AllReduce time exceeds compute time per step, MFU collapses, and adding more workers actively slows the run on a per-token basis. Weak scaling fixes the per-worker micro-batch $b$ and varies $W$, growing the global batch $B = bW$ together with the processor count. The compute time per step is constant; the AllReduce time per rank is also nearly constant; step time is roughly constant; throughput in tokens per second scales linearly with $W$ until the *learning dynamics* bound the run from above.
+
+### Why frontier labs care about weak scaling
+
+The frontier-pretraining regime is fundamentally a weak-scaling regime, for three reasons. First, hardware utilization is the binding economic constraint: per-GPU memory and per-GPU FLOPs are fixed, so the operator's question is "given the $W$ GPUs in the cluster, how many tokens per second can be processed at high MFU?" That is precisely the weak-scaling question, with $b$ chosen to fill GPU memory and $W$ taken as given. Second, the [Chinchilla-style compute-optimal trade](/textbook/01c-scaling-laws#chinchilla) ties pretraining-token count to parameter count, so larger clusters are meant to ingest more tokens per step rather than the same tokens faster per worker. Adding GPUs with the per-worker batch held constant is the natural use of more hardware. Third, the [critical batch size](/textbook/01e-schedules-and-batch#critical-batch-size) sets the ceiling: weak scaling raises the global batch with $W$ until $B$ reaches $B^*$, at which point further batch growth produces diminishing returns in tokens-of-progress per step. Beyond $B^*$, additional GPUs cannot be absorbed by DP and must be used for other parallelism dimensions or for parallel research runs.
+
+The empirical CBS measurements that anchor this constraint come from the OLMo line. Magnusson et al. (2025) report that for 1B and 7B OLMo pretraining, the critical batch size plateaus near 4,096 sequences of 4,096 tokens each, which is approximately 16.8 million tokens. The Zhang et al. (2024) study of Adam-aware CBS reaches a compatible conclusion. The Llama-3 405B run targeted 16 million tokens per step, comfortably the same order; the OLMo measurement is consistent with the operating choice that frontier labs had already converged on by independent means.
+
+### The frontier numbers, in brief
+
+The DP-related batch and world-size choices in recent public reports are concentrated within a narrow band. Llama-3 405B (Grattafiori et al. 2024) ran on 16,000 H100s with a global batch of approximately 16M tokens, achieved as 128-way DP over a 3D mesh of TP=8 × PP=16, with a per-DP-group micro-batch step of about 8.4M tokens and $\mu=2$ gradient accumulation; the paper reports 38–43% BF16 MFU at this scale, peaking at 41% on the full cluster. DeepSeek-V3 (DeepSeek-AI 2024) ran on 2,048 H800s with the global batch growing from 3,072 to 15,360 sequences during the first 469B tokens and then staying at 15,360 sequences of 4K tokens, or about 63M tokens per step — substantially larger than Llama-3, enabled by the lower per-token activation cost of the 671B-total, 37B-active MoE. OLMo-2 7B (AI2 2025) trained on hundreds to thousands of GPUs with a batch of about 4M tokens after the warmup ramp. The much earlier Megatron-LM trillion-parameter demonstration (Narayanan et al. 2021) ran on 3,072 A100s with TP=8, PP=64, and DP=6 — a DP world size of only six, with the rest of the parallelism budget spent on tensor and pipeline dimensions for the simple reason that the model did not fit in one node.
+
+The common pattern across these numbers is that DP world size is *not* the dominant dimension at frontier scale. It is the outer dimension of the cube, but the cube is large in the other dimensions too, and the DP factor is a relatively modest multiplier — 128 for Llama-3 405B at 8K context, around 16 for DeepSeek-V3, only 6 for the Megatron-LM 1T demonstration. The reason is that the inner dimensions (TP within a node, PP across nodes) take care of the *model-fits* problem, and the DP factor is then sized so that the global batch lands at or below $B^*$. Adding DP beyond that point yields no learning-rate benefit, however much aggregate FLOPs the cluster has.
+
+---
+
+## AllReduce algorithms and bandwidth {#allreduce}
+
+### The two algorithms that matter
+
+NCCL implements several AllReduce algorithms and selects between them at runtime based on message size, topology, and GPU count. Two matter conceptually. The **ring AllReduce** of Patarasuk and Yuan (2009) — popularised for deep learning by the Baidu 2017 blog post and the Horovod release shortly after — is bandwidth-optimal for large messages. The **double binary tree AllReduce** of Sanders, Speck, and Träff (2009), incorporated into NCCL 2.4 in 2019, is latency-optimal for small messages and large GPU counts. NCCL also supports NVLS / NVSwitch-SHARP on Hopper, which performs in-network reduction across the NVSwitch domain of a single 8-GPU node; multi-node behaviour is hierarchical, with NVLS inside the node and ring or tree across nodes over InfiniBand.
+
+### Ring AllReduce: the bandwidth lower bound
+
+Patarasuk and Yuan (2009) proved that for the AllReduce of a vector of size $S$ across $W$ ranks, the bandwidth lower bound on per-rank traffic is
+
+$$\text{bytes per rank} \;\ge\; 2\,S\,\frac{W-1}{W}.$$
+
+The intuition has two parts. The final result on each rank must depend on every other rank's input, so each rank must *receive* at least $S(W-1)/W$ bytes of new information — the locally-known $S/W$ share is excluded. AllReduce decomposes naturally into Reduce-Scatter followed by AllGather, each with the same $S(W-1)/W$ lower bound; their sum is $2S(W-1)/W$. The ring algorithm achieves this lower bound exactly.
+
+The ring algorithm proceeds as follows. The $W$ ranks are arranged in a logical ring. The gradient buffer is sliced into $W$ chunks. In each of $W-1$ reduce-scatter steps, each rank sends one chunk to its clockwise neighbour and receives and accumulates one chunk from its counter-clockwise neighbour; after $W-1$ steps, each rank holds one fully-reduced chunk that has visited every rank exactly once. Then in $W-1$ AllGather steps, those reduced chunks rotate around the ring so that every rank ends with the full reduced vector. The total is $2(W-1)$ steps, each transferring $S/W$ bytes, summing to the $2S(W-1)/W$ lower bound.
+
+The time decomposition introduces two latencies, $\alpha$ per step and $\beta = 1/B$ per byte for per-link bandwidth $B$. The ring AllReduce takes
+
+$$T_{\text{ring}} \;\approx\; 2(W-1)\,\Big(\alpha + \frac{S}{W}\,\beta\Big).$$
+
+For large $S$ the $\beta$ term dominates and $T_{\text{ring}} \to 2S\,(W-1)/(WB)$, which asymptotes to $2S/B$ — independent of $W$. This is the *bandwidth-bound* regime, the one in which DP at frontier scale operates. For small $S$ the $\alpha$ term dominates and $T_{\text{ring}} \approx 2(W-1)\alpha$, linear in $W$. This is the killer at scale, and it is the reason NCCL switches algorithms for small messages at large GPU counts.
+
+The NCCL test-suite documentation makes the ring-bandwidth formula canonical for the field. The `NVIDIA/nccl-tests/doc/PERFORMANCE.md` file states the relationship between algorithmic bandwidth and bus bandwidth verbatim:
+
+> busbw = algbw × (2(n−1)/n)
+
+and notes that "AllReduce requires 2(n−1) data transfers per element across n parallel communication links." Every NCCL-bandwidth number reported in vendor benchmarks is computed against this formula.
+
+### Tree AllReduce: the latency fix at large $W$
+
+The NCCL 2.4 release introduced double binary trees, with the engineering blog by Jeaugey (2019) stating the result directly:
+
+> Double binary trees offer full bandwidth and a logarithmic latency even lower than 2D ring latency. Each rank will at most receive half of the data twice and send half of the data twice, which is as optimal as rings in terms of data sent/received.
+
+A *single* binary tree gives logarithmic latency but only half-bandwidth, because leaf nodes participate in only one send and one receive while interior nodes participate in two of each. The Sanders, Speck, and Träff (2009) construction overlaps two complementary trees so that every node is a leaf in one tree and an interior node in the other; the result is full bandwidth and logarithmic latency simultaneously. The time becomes
+
+$$T_{\text{tree}} \;\approx\; 2\log_2(W)\cdot\alpha + 2S/B,$$
+
+logarithmic in $W$ for latency, full bandwidth for size. The bandwidth term has the same asymptotic shape as the ring; the latency term replaces the ring's linear $2(W-1)\alpha$ with the tree's $2\log_2(W)\alpha$. At the largest scales this is decisive. NVIDIA's blog announcement of the feature reports up to a 180× improvement at 24,576 GPUs relative to a ring on the same hardware — the Summit-class regime, far beyond any current LLM training cluster, but indicating the asymptotic shape of the curve.
+
+NCCL switches algorithms based on message size and GPU count. For small messages on many GPUs, tree wins because its latency is logarithmic in $W$. For large messages on few GPUs, ring wins because its bandwidth is optimal and there is no log-factor latency to amortize. NCCL also uses three "protocols" — Simple, LL (low-latency), and LL128 — which trade bandwidth for latency at finer grain; Simple is the most bandwidth-efficient, LL trades half the bandwidth for lower per-step overhead, and LL128 is a middle ground tuned for the NVLink topology. The full algorithm × protocol matrix is the subject of [collectives and overlap](/textbook/02f-collectives-and-overlap); for the DP at 7B-class scale considered in this chapter, AllReduce messages are hundreds of mebibytes to a few gibibytes and DP world sizes are in the hundreds, which puts the run comfortably in the ring regime with NVLS acceleration inside each node.
+
+### The bandwidth budget on H100
+
+The hardware bandwidths that bound the AllReduce time on a 2026-era cluster are easy to enumerate. **NVLink 4** on Hopper provides 18 links per GPU at 25 GB/s unidirectional, totalling **450 GB/s** unidirectional per GPU or 900 GB/s bidirectional; all eight GPUs in an HGX H100 baseboard communicate through NVSwitch-3 at full bisection bandwidth. **InfiniBand NDR / RoCE 400G** provides each DGX/HGX H100 with eight ConnectX-7 NICs, one per GPU, each running at 400 Gbps or 50 GB/s unidirectional, for an aggregate of 400 GB/s per node and a per-GPU out-of-node bandwidth of 50 GB/s. **NVLS / NVSwitch SHARP** performs in-network reduction inside the NVSwitch domain, with measured intra-node 8-GPU AllReduce busBW reaching approximately 480 GB/s — close to the NVLink ceiling.
+
+The ratio of these two budgets — intra-node bandwidth roughly ten times inter-node bandwidth — is the single fact that dictates every modern 3D parallelism topology. Heavy traffic stays on NVLink; light traffic crosses InfiniBand. DP AllReduce, happening once per optimizer step and tolerating the latency of inter-node hops, is the natural occupant of the InfiniBand layer. Tensor-parallel AllReduce, happening four times per layer and needing NVLink bandwidth to amortize the model's compute, is the natural occupant of the NVLink layer. The placement is not free choice; the bandwidth ratio enforces it.
+
+Published H100 AllReduce numbers are consistent with these ceilings to within ten or fifteen percent. A single tuned 8-GPU node achieves approximately 360 GB/s busBW for a 16 GiB message on vanilla NCCL, rising to 465–470 GB/s with NVLS enabled. Two-node measurements over NDR InfiniBand reach approximately 461 GB/s busBW for large messages in NCCL's peak case; practitioner guides cite around 370 GB/s on a 400 GB/s fabric as the realistic operational target, or roughly 92% of theoretical peak. The chapter's worked example uses the more conservative figure.
+
+### The per-rank traffic and time formula
+
+Combining the bandwidth lower bound with the bandwidth budget gives the formula that operators actually use to size DP runs. Per-rank bytes in AllReduce equal $2|g|(W-1)/W$. The per-rank time is therefore
+
+$$T_{\text{AR}} \;\approx\; \frac{2|g|}{B_{\text{eff}}} \cdot \frac{W-1}{W},$$
+
+where $B_{\text{eff}}$ is the effective bandwidth out of the rank — limited by whichever link the algorithm uses, NVLink intra-node, InfiniBand inter-node, or a hierarchical mix when NCCL chains an intra-node Reduce-Scatter with an inter-node AllReduce and an intra-node AllGather. For multi-node DP, $B_{\text{eff}}$ approaches $B_{\text{IB}}$ once the message crosses a node boundary, even if the intra-node NVLink would have been faster; the bottleneck dominates.
+
+---
+
+## Worked example: 7B on 64 H100s {#worked-example}
+
+### Setup
+
+The chapter's running example takes the simplest non-trivial DP configuration that resembles a real frontier setup. The model is a 7B-parameter dense Llama-3-8B-class transformer with no MoE. The hardware is 64 H100s spread across 8 HGX nodes, with NVLink 4 (450 GB/s) inside each node and 8 ConnectX-7 NICs per node providing 400 Gb/s each, or 50 GB/s per GPU out-of-node. The parallelism is DP=64 with no tensor or pipeline parallelism; the 7B model fits on one H100 with activation checkpointing, so the inner parallelism dimensions are not needed. The global batch is 4 million tokens. At sequence length 8K that is 488 sequences, and per DP rank it is 488 / 64 ≈ 8 sequences or roughly 64K tokens. Precision is BF16 forward and backward, with FP32 master weights and FP32 optimizer state but BF16 gradients on the AllReduce path — the modern-frontier default, halving the AR bytes compared to FP32 reduction.
+
+### Per-step gradient size
+
+The gradient buffer in BF16 is 2 bytes per parameter, so
+
+$$|g| \;=\; 2 \times 7\times 10^9 \;=\; 14\;\text{GB}.$$
+
+This is the AllReduce input size for a single DDP step at this configuration. The optimizer state — FP32 master weights, $m$, $v$ — adds another 12 bytes per parameter or 84 GB if held un-sharded, plus the FP32 master gradients at 4 bytes per parameter or another 28 GB. Total per-rank memory is roughly 27.6 GB for parameters, gradients (BF16 + FP32 master), and AdamW state — well under the H100's 80 GB cap, leaving room for activations and the AllReduce scratch buffers. The 27.6 GB figure is the relevant number for sizing single-rank memory; the gradient buffer alone at 14 GB is the relevant number for AllReduce bandwidth.
+
+### AllReduce time
+
+Each rank's outbound traffic in the AllReduce is
+
+$$\text{bytes per rank} \;=\; 2 \times 14\;\text{GB} \times \frac{63}{64} \;\approx\; 27.6\;\text{GB}.$$
+
+For a flat inter-node DP topology spread across 8 nodes of 8 GPUs each, the bottleneck is the single NIC per GPU at 50 GB/s. Assuming ring AllReduce achieves approximately 90% of NIC bandwidth in practice — 45 GB/s effective — the wall-clock time of a *flat* AllReduce is
+
+$$T_{\text{AR, flat}} \;\approx\; \frac{27.6\;\text{GB}}{45\;\text{GB/s}} \;\approx\; 613\;\text{ms}.$$
+
+Real systems do not run flat AllReduce across an 8-node cluster; NCCL automatically uses a *hierarchical* schedule. The intra-node step is a Reduce-Scatter on NVLink, the inter-node step is a global AllReduce on InfiniBand of the per-node-aggregate gradient, and the closing intra-node step is an AllGather on NVLink. The intra-node steps are essentially free at NVLink bandwidths; the inter-node step is the binding cost. Because the model is replicated and not sharded, the per-node-aggregate gradient is still 14 GB. The inter-node AllReduce time per rank is then approximately
+
+$$T_{\text{AR, hierarchical}} \;\approx\; \frac{14\;\text{GB}}{45\;\text{GB/s}} \;\approx\; 311\;\text{ms}.$$
+
+This is the realistic AllReduce time for a 7B model on a tuned 8-node H100 cluster — about 0.31 seconds of inter-node traffic per optimizer step, before considering overlap with backward.
+
+### Step time and the role of overlap
+
+Per-step forward and backward for a 7B model at the 64K-tokens-per-rank batch can be estimated with the standard $6ND$ rule for transformer FLOPs. The per-step FLOPs are roughly $6 \times 7\times 10^9 \times 4\times 10^6 \approx 1.7\times 10^{17}$. At a measured Llama-3-like 400 TFLOPs/GPU MFU on H100 and 64 GPUs, the available compute is $64 \times 4\times 10^{14} = 2.56\times 10^{16}$ FLOPs/s, so the compute time is
+
+$$T_{\text{compute}} \;\approx\; \frac{1.7\times 10^{17}}{2.56\times 10^{16}} \;\approx\; 6.5\;\text{s/step}.$$
+
+With DDP's gradient bucketing overlapping most of the 311 ms AllReduce with the backward, the step time is dominated by compute at approximately 6.5 seconds per step, with perhaps 50 milliseconds of un-hidden AllReduce tail at the end of backward. Without overlap, step time would be 6.5 + 0.31 = 6.81 seconds — a five-percent improvement from overlap alone, smaller than the textbook "20–40%" benefit because at this batch size compute already dominates communication by more than an order of magnitude. The textbook overlap-fraction figure applies most cleanly when batch is small relative to gradient size; at the 4M-token batch the run is squarely compute-bound, and the DDP bucketing primarily prevents the AllReduce from becoming a serial tail rather than producing a large fractional speedup. This is the regime that frontier training generally operates in.
+
+### Scaling to 1024 H100s at fixed batch
+
+Suppose the world size is increased to DP=1024 while the global batch stays at 4M tokens — a *strong-scaling* operating point. Per-rank traffic becomes $2 \times 14 \times 1023/1024 \approx 27.97$ GB, only marginally larger than the 64-rank case. The bandwidth bottleneck does not blow up; this is the structural property of ring AllReduce, with the $(W-1)/W$ factor saturating quickly. But the ring latency at $2(W-1)\alpha$ grows linearly with $W$, and at 1024 ranks the latency starts to matter; NCCL will switch to tree for the small-message bucket portion of the schedule. The deeper problem is on the compute side: per-rank batch shrinks to 4K tokens, then 2K, then 1K as $W$ grows. Per-step compute time drops roughly linearly while AllReduce time stays roughly constant, so the AllReduce fraction of step time rises. Past some crossover point, AllReduce dominates step time and per-GPU MFU collapses. The standard guidance — "do not strong-scale DP past the point where the per-rank micro-batch falls below the GPU's compute-efficient size" — is the operational form of this observation. Frontier labs scale *weakly* (raise the global batch with $W$) until $B^*$ is reached, then stop adding DP and start adding other parallel dimensions.
+
+### Connection back to 01e
+
+The 13B-parameter, 3-trillion-token, 512-H100 worked example in [01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum) uses essentially this same analysis as a building block, quoting a per-step time of approximately five seconds at a 16M-token batch on 512 GPUs including AllReduce. That number is consistent with the present calculation scaled up: 512 GPUs is 8× the present cluster, the model is roughly twice the parameter count, the batch is 4× the present batch, and the per-step time is comparable. The present calculation is the per-component decomposition that explains where the 01e number comes from.
+
+---
+
+## Frontier-lab DP configurations, May 2026 {#frontier-configs}
+
+### When DP-only suffices
+
+DP-only training — no tensor, pipeline, or sequence parallelism, just DP with optionally ZeRO-1 or FSDP sharding inside the DP group — is the right configuration when the entire model state fits on one device. For a model with $N$ parameters in BF16, the per-rank memory has four components: parameters at $2N$ bytes, BF16 gradients at $2N$ bytes, FP32 master weights and AdamW $m$, $v$ at $12N$ bytes, and a working set of activations and AllReduce scratch buffers. In aggregate this is roughly $16N$ bytes plus activations.
+
+For the H100's 80 GB cap, the back-of-envelope thresholds are: up to roughly 3B dense parameters fits comfortably in BF16 with un-sharded AdamW state and standard activation checkpointing; up to roughly 8B fits if FP32 master state is sharded across the DP group via ZeRO-1; up to roughly 13B fits with FP8 optimizer state of the DeepSeek-V3 variety. MoE models have an effective parameter count of roughly five times their active parameter count for memory purposes, so DP-only is infeasible for any MoE with more than about 7B active parameters. In practice, DP-only is the configuration for small-to-medium pretraining at or below 1B dense parameters, for all SFT runs on 7B-class models, and for most distillation runs. The frontier-scale pretraining of 13B-plus models uses ZeRO-1, ZeRO-2, ZeRO-3, or FSDP, which is the subject of [FSDP and ZeRO](/textbook/02e-fsdp-and-zero) and is "DP with sharded optimizer, gradient, or parameter state."
+
+### DP as the outermost dimension
+
+When the model does not fit on one device, the parallelism budget is split across multiple dimensions: tensor parallelism inside each node, pipeline parallelism across nodes, context parallelism for very long contexts, and DP wrapping the whole. The canonical modern recipe — used by Llama-3, DeepSeek-V3, and the Megatron-LM trillion-parameter SC21 demonstration — places DP as the *outermost* dimension of a 3D or 4D mesh, with the order $\text{DP} \times \text{CP} \times \text{PP} \times \text{TP}$ from outer to inner. The placement of DP as the outermost dimension is not arbitrary; three properties of DP communication enforce it.
+
+First, DP communication is the rarest. TP AllReduces happen four times per layer (column-parallel forward, row-parallel forward, and again in backward); PP point-to-point sends happen at every micro-batch boundary; DP AllReduce happens *once per optimizer step* over all accumulated micro-batches. Placing DP as the outermost dimension means each DP AllReduce uses the largest possible messages — the entire gradient buffer — and amortizes fixed costs over the longest possible work unit.
+
+Second, DP traffic is bandwidth-limited rather than latency-limited; outer-dimension placement matches it to inter-node InfiniBand, which has much lower bandwidth than NVLink but tolerable latency for a once-per-step collective. TP needs NVLink because its per-layer frequency multiplies any per-step overhead; DP can tolerate IB because there is only one AllReduce per step.
+
+Third, DP fits the optimizer-state sharding pattern of ZeRO. Once DP is the outer dimension, the optimizer state, gradients, and parameters can each be sharded across the DP group — ZeRO-1 shards only the optimizer state, ZeRO-2 also shards gradients, ZeRO-3 (the same idea as FSDP) shards parameters as well. All of these sharding patterns live inside the DP dimension and depend on its outer-most placement to compose cleanly with TP and PP. This is the design space treated in [FSDP and ZeRO](/textbook/02e-fsdp-and-zero).
+
+### The frontier table
+
+The following table reproduces what the public technical reports of recent frontier runs disclose about their data-parallel configurations. Where a paper does not disclose a number cleanly — DeepSeek-V3's DP factor is implicit, GPT-3's parallelism stack was not described in detail — the table marks the entry accordingly.
+
+<ComparisonTable
+  caption="Frontier-lab data-parallel configurations, 2017–2025. DP world size is the multiplicative factor in the outermost dimension of the parallelism mesh. Inner dimensions (TP, PP, CP, EP) are reproduced from the source technical reports. AllReduce algorithm column reflects the likely NCCL choice for the run's message size and GPU count; NCCL switches algorithms adaptively at runtime."
+  columns={["Model", "Year", "DP world size", "Other parallel dims", "AllReduce algo (likely)", "Source"]}
+  rows={[
+    ["ResNet-50 (Goyal 2017)", "2017", "256", "DP-only", "Ring (Patarasuk–Yuan)", "https://arxiv.org/abs/1706.02677"],
+    ["Scaling NMT (Ott 2018)", "2018", "128", "DP-only, delayed updates", "NCCL ring", "https://arxiv.org/abs/1806.00187"],
+    ["Horovod (Sergeev 2018)", "2018", "up to ~256", "DP-only, tensor fusion", "Ring + fusion", "https://arxiv.org/abs/1802.05799"],
+    ["GPT-3 175B (Brown 2020)", "2020", "thousands (implicit)", "implicit model parallelism", "NCCL ring", "https://arxiv.org/abs/2005.14165"],
+    ["PyTorch DDP (Li 2020)", "2020", "up to 256 V100", "DP-only, 25 MiB buckets", "NCCL ring", "https://arxiv.org/abs/2006.15704"],
+    ["Megatron-LM 1T (Narayanan 2021)", "2021", "6", "TP=8, PP=64", "NCCL ring", "https://arxiv.org/abs/2104.04473"],
+    ["OPT 175B (Zhang 2022)", "2022", "~124", "TP=8, FSDP", "NCCL", "https://arxiv.org/abs/2205.01068"],
+    ["Llama-2 70B (Touvron 2023)", "2023", "~256", "TP=8, PP", "NCCL ring/tree hybrid", "https://arxiv.org/abs/2307.09288"],
+    ["Llama-3 405B 8K (Grattafiori 2024)", "2024", "128", "TP=8, CP=1, PP=16", "NCCL ring + NVLS", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-3 405B 128K (Grattafiori 2024)", "2024", "4", "TP=8, CP=16, PP=16", "NCCL ring + NVLS", "https://arxiv.org/abs/2407.21783"],
+    ["DeepSeek-V3 671B (DeepSeek 2024)", "2024", "~16 + EP=64", "PP=16, ZeRO-1 DP, DualPipe", "NCCL + DualPipe overlap", "https://arxiv.org/abs/2412.19437"],
+    ["OLMo-2 7B (AI2 2025)", "2025", "hundreds", "FSDP / HSDP", "NCCL", "https://allenai.org/blog/critical-batch-size"],
+    ["Scaling Llama-3 ISCA 2025", "2025", "varies", "confirms TP=8, CP=16, PP=16, DP=4 at 128K", "NCCL ring + NVLS", "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf"],
+  ]}
+/>
+
+Several patterns are worth highlighting. First, DP world size has *not* grown monotonically with cluster size. The Megatron-LM 1T run on 3,072 A100s had DP=6; the Llama-3 405B run on 16,000 H100s has DP=128 at 8K context and DP=4 at 128K context. The reason is that the model parallelism dimensions — TP, PP, CP — eat the cluster first, and DP gets what is left over. As models grow, TP and PP grow with them; as context lengths grow from 8K to 128K, CP grows from 1 to 16 and consumes the dimensions that DP would otherwise have used. The Llama-3 long-context configuration is the clearest example: CP=16 eats four-fifths of what was previously DP, and the resulting DP=4 is the residual budget after the inner dimensions are sized.
+
+Second, the AllReduce algorithm column is informative about *what NCCL is doing under the hood*, but NCCL switches algorithms adaptively at runtime and the public reports do not pin a single choice. The classification in the table reflects which algorithm is most likely chosen for the typical message size and world size of each run, not a hard architectural commitment. At Llama-3 scale with 128 DP ranks and 14-to-28 GB gradient buffers, the per-bucket message is in the ring regime; at DeepSeek-V3 scale with smaller DP and ZeRO-1 sharding, the per-rank message is smaller and the algorithm choice is less obvious from the outside.
+
+Third, the DeepSeek-V3 entry combines DP with expert parallelism (EP=64) for its MoE routing, and uses the DualPipe pipelining scheme to overlap forward and backward passes across micro-batches. The "DP world size ~16" entry is implicit: with 2,048 H800s and PP=16, the remaining 128 GPUs per pipeline stage are split between expert parallelism and the residual DP dimension. The exact accounting is not stated cleanly in the technical report, and the table reflects that ambiguity.
+
+### Hybrid DP-PP-TP within and across nodes
+
+The motivation for the Llama-3 layout — TP=8 inside the node, PP=16 across nodes, DP across pods — emerges directly from the bandwidth ratio of [§AllReduce algorithms](#allreduce). The model does not fit one node; the model fits one pod. TP wants NVLink because its AllReduce frequency is high (four times per layer); PP wants point-to-point sends that tolerate InfiniBand latency; DP wants per-step AllReduce that also tolerates InfiniBand. The Llama-3 herd paper makes the design decision explicit:
+
+> We chose 3D parallelism over FSDP because the model parallelism dimensions (PP=16 and TP=8) were large enough to accommodate the 405B model and to avoid extra communication overheads.
+
+The interaction between DP and PP is the sizing-knob that ties this chapter to [pipeline parallelism](/textbook/02c-pipeline). DP AllReduce fires *between* optimizer steps, while PP pipelines micro-batches *within* one step. If PP runs $m$ micro-batches per step, the per-step DP overhead amortizes over those $m$ micro-batches, and the relative DP cost scales as $1/m$ of total compute. Conversely, the *pipeline bubble* — approximately $(\text{PP}-1)/m$ for naive 1F1B scheduling — sets a lower bound on the number of micro-batches $m$ that PP can tolerate, which then sets a minimum per-DP-group batch size, which sets a maximum DP world size before the global batch exceeds $B^*$. The interlock among PP, DP, and $B^*$ is the sizing puzzle of frontier 3D parallelism. The full quantitative version is the subject of the parallelism-sizing material later in this module, but the structure of the constraint is set here.
+
+<Callout variant="warning" title="DP world size at frontier scale is bounded above by the critical batch size, not by AllReduce bandwidth">
+The AllReduce traffic per rank is $2|g|(W-1)/W$, which approaches $2|g|$ as $W$ grows and is *bounded* — DP world size does not blow up the per-rank bandwidth. The binding constraint on DP world size at frontier scale is instead the [critical batch size](/textbook/01e-schedules-and-batch#critical-batch-size) ceiling: once global batch $\mu b W \ge B^*$, additional DP ranks produce diminishing returns in learning progress per token. The empirical $B^*$ for 1B–7B dense pretraining is approximately 16M tokens (Magnusson et al. 2025); for larger MoE models it appears to be larger, which is why DeepSeek-V3 can run at 63M-token batches without obvious diminishing returns. This is a learning-dynamics bound, not a systems bound, and it is the reason frontier runs spend additional GPUs on TP, PP, and CP rather than on more DP.
+</Callout>
+
+---
+
+## Chapter summary {#summary}
+
+Data parallelism is the oldest and most fundamental dimension of the modern frontier-LLM parallelism stack. The synchronous-gradient algorithm — replicate the model on $W$ workers, shard the batch, AllReduce the gradients, step the optimizer — is mathematically identical to single-replica training and introduces no approximation, only a communication overhead. The communication is an AllReduce collective over the gradient buffer, with per-rank bandwidth cost $2|g|(W-1)/W$ proved optimal by Patarasuk and Yuan (2009). PyTorch's DDP overlaps this AllReduce with the backward pass via gradient bucketing — default 25 MiB per bucket, registered autograd hooks, identical bucket order on every rank — so that the AllReduce hides behind the backward in well-tuned runs and the residual un-hidden tail is small.
+
+Gradient accumulation under DDP requires the `no_sync()` context manager to avoid paying $\mu\times$ the AllReduce cost for an accumulation cycle of $\mu$ micro-steps; the cycle's first $\mu - 1$ backwards accumulate gradient silently and only the final backward triggers the AllReduce. The AdamW-momentum subtleties — bias correction on optimizer-step count, weight decay applied once per step, gradient clipping on the AllReduced gradient — were developed in [01e §grad-accum](/textbook/01e-schedules-and-batch#grad-accum) and apply unchanged in the DDP setting.
+
+Weak scaling — raising the global batch with the world size — is the operating regime of frontier pretraining, bounded above by the [critical batch size](/textbook/01e-schedules-and-batch#critical-batch-size) ceiling at approximately 16M tokens for 1B–7B dense models per Magnusson et al. (2025). Strong scaling — fixing the global batch and adding ranks — eventually loses to the saturating $(W-1)/W$ bandwidth term and collapses MFU, and frontier runs do not enter that regime. NCCL implements both ring AllReduce (bandwidth-optimal for large messages) and double-binary-tree AllReduce (latency-optimal for small messages and large GPU counts), and switches between them at runtime; at the 7B-class, hundreds-of-GPUs regime, the ring algorithm dominates with NVLS acceleration inside each node.
+
+The bandwidth budget on a 2026-era H100 cluster is dictated by two numbers: NVLink 4 at 450 GB/s per GPU inside a node, and one ConnectX-7 NIC at 50 GB/s per GPU between nodes. The ten-to-one ratio fixes the placement of every parallelism dimension: TP inside the node, PP and DP across nodes. The worked example of a 7B model on 64 H100s with a 4M-token batch produces a 14 GB BF16 gradient buffer, a 27.6 GB-per-rank AllReduce traffic figure, an approximately 311 ms hierarchical inter-node AllReduce time, and a step time near 6.5 seconds at 400 TFLOPs/GPU MFU — with AllReduce mostly hidden behind backward thanks to DDP bucketing. Scaling this configuration to 1024 ranks at fixed batch enters the strong-scaling regime and degrades MFU; scaling weakly by raising the batch is bounded by $B^*$. Both bounds explain why frontier runs use DP as the outermost dimension of a 3D or 4D mesh and spend most of the parallelism budget on the inner dimensions.
+
+The next chapters open up those inner dimensions: [tensor parallelism](/textbook/02b-tensor) for the AllReduce-within-a-layer pattern that needs NVLink, [pipeline parallelism](/textbook/02c-pipeline) for the layer-stack sharding that tolerates InfiniBand point-to-point sends, [context parallelism](/textbook/02d-sequence-context) for the sequence-dimension sharding that ate Llama-3's DP factor at long context, and [FSDP and ZeRO](/textbook/02e-fsdp-and-zero) for the optimizer-state, gradient, and parameter sharding that lives *inside* the DP group set up here.
+
+---
+
+<Sources items={[
+  {
+    authors: "Goyal, P., Dollár, P., Girshick, R. et al.",
+    year: 2017,
+    title: "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour",
+    venue: "arXiv:1706.02677",
+    url: "https://arxiv.org/abs/1706.02677",
+    note: "Canonical large-scale synchronous DP demonstration. ResNet-50 on 256 GPUs, global batch 8192, ~90% scaling efficiency from 8→256 GPUs."
+  },
+  {
+    authors: "Dean, J., Corrado, G., Monga, R. et al.",
+    year: 2012,
+    title: "Large Scale Distributed Deep Networks",
+    venue: "NeurIPS 2012",
+    url: "https://papers.nips.cc/paper/2012/hash/6aca97005c68f1206823815f66102863-Abstract.html",
+    note: "Introduces Downpour SGD (asynchronous DP) and Sandblaster (synchronous DP). LLM-era practice abandoned async DP in favour of synchronous."
+  },
+  {
+    authors: "Li, S., Zhao, Y., Varma, R. et al.",
+    year: 2020,
+    title: "PyTorch Distributed: Experiences on Accelerating Data Parallel Training",
+    venue: "VLDB 2020 / arXiv:2006.15704",
+    url: "https://arxiv.org/abs/2006.15704",
+    note: "DDP design paper. Bucketing, autograd hooks, near-linear scalability up to 256 V100s."
+  },
+  {
+    authors: "Ott, M., Edunov, S., Grangier, D., Auli, M.",
+    year: 2018,
+    title: "Scaling Neural Machine Translation",
+    venue: "WMT 2018 / arXiv:1806.00187",
+    url: "https://arxiv.org/abs/1806.00187",
+    note: "Delayed-update technique (gradient accumulation with deferred sync). 5× single-machine speedup; 29.3 BLEU on WMT'14 En-De in 85 min on 128 GPUs."
+  },
+  {
+    authors: "McCandlish, S., Kaplan, J., Amodei, D., OpenAI Dota Team",
+    year: 2018,
+    title: "An Empirical Model of Large-Batch Training",
+    venue: "arXiv:1812.06162",
+    url: "https://arxiv.org/abs/1812.06162",
+    note: "Original gradient-noise-scale framework for critical batch size. Cross-ref 01e §critical-batch-size."
+  },
+  {
+    authors: "Zhang, S., Bahri, Y., Choromanska, A. et al.",
+    year: 2024,
+    title: "How Does Critical Batch Size Scale in Pretraining?",
+    venue: "arXiv:2410.21676",
+    url: "https://arxiv.org/abs/2410.21676",
+    note: "Modern Adam-aware CBS measurement. Compatible with the OLMo 4096-sequence plateau."
+  },
+  {
+    authors: "Magnusson, I. et al.",
+    year: 2025,
+    title: "Revisiting critical batch size for large-batch OLMo pretraining",
+    venue: "AI2 blog",
+    url: "https://allenai.org/blog/critical-batch-size",
+    note: "Empirical CBS ≈ 4096 sequences × 4096 tokens ≈ 16.8M tokens for 1B–7B OLMo pretraining."
+  },
+  {
+    authors: "Patarasuk, P., Yuan, X.",
+    year: 2009,
+    title: "Bandwidth optimal all-reduce algorithms for clusters of workstations",
+    venue: "J. Parallel Distrib. Comput. 69(2):117–124",
+    url: "https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf",
+    note: "Derives the 2S(W-1)/W lower bound and the contention-free ring algorithm. The canonical citation for ring-AllReduce bandwidth analysis."
+  },
+  {
+    authors: "Sanders, P., Speck, J., Träff, J. L.",
+    year: 2009,
+    title: "Two-tree algorithms for full bandwidth broadcast, reduction and scan",
+    venue: "Parallel Computing",
+    url: "https://doi.org/10.1016/j.parco.2009.09.001",
+    note: "Double binary tree construction. Full bandwidth with logarithmic latency."
+  },
+  {
+    authors: "Jeaugey, S.",
+    year: 2019,
+    title: "Massively Scale Your Deep Learning Training with NCCL 2.4",
+    venue: "NVIDIA Technical Blog",
+    url: "https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/",
+    note: "Introduces double-binary-tree AllReduce to NCCL. Reports up to 180× improvement at 24K GPUs vs ring."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Understanding NCCL Tuning to Accelerate GPU-to-GPU Communication",
+    venue: "NVIDIA Developer Blog",
+    url: "https://developer.nvidia.com/blog/understanding-nccl-tuning-to-accelerate-gpu-to-gpu-communication/",
+    note: "Algorithm selection (tree/ring) × protocol (Simple/LL/LL128) matrix."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "nccl-tests Performance Considerations",
+    venue: "GitHub: NVIDIA/nccl-tests",
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md",
+    note: "Canonical statement of algBW vs busBW with the 2(n−1)/n factor."
+  },
+  {
+    authors: "Sergeev, A., Del Balso, M.",
+    year: 2018,
+    title: "Horovod: fast and easy distributed deep learning in TensorFlow",
+    venue: "arXiv:1802.05799",
+    url: "https://arxiv.org/abs/1802.05799",
+    note: "Popularized ring-AllReduce in deep learning; introduced tensor fusion as the qualitative predecessor of DDP bucketing."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2022,
+    title: "H100 Tensor Core GPU Product Brief PB-11133-001",
+    venue: "NVIDIA product literature",
+    url: "https://www.nvidia.com/content/dam/en-zz/Solutions/gtcs22/data-center/h100/PB-11133-001_v01.pdf",
+    note: "NVLink 4 specification: 18 links × 25 GB/s = 450 GB/s unidirectional per GPU."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2023,
+    title: "DGX SuperPOD H100 Reference Architecture",
+    venue: "NVIDIA documentation",
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-h100/latest/",
+    note: "8× ConnectX-7 NICs per HGX H100 node, NDR 400 Gb/s each."
+  },
+  {
+    authors: "Together AI",
+    year: 2024,
+    title: "Operational H100 NCCL bandwidth tuning",
+    venue: "Together AI engineering guide",
+    url: "https://www.together.ai/blog/nccl-performance",
+    note: "Practitioner target of ≈ 370 GB/s on a 400 GB/s IB fabric — 92% of theoretical peak."
+  },
+  {
+    authors: "Brown, T. et al.",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020 (GPT-3) / arXiv:2005.14165",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "Global batch 3.2M tokens, ~10,000-V100 cluster, parallelism stack only described in Appendix B."
+  },
+  {
+    authors: "Narayanan, D. et al.",
+    year: 2021,
+    title: "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM",
+    venue: "SC21 / arXiv:2104.04473",
+    url: "https://arxiv.org/abs/2104.04473",
+    note: "Trillion-parameter run on 3072 A100s: TP=8, PP=64, DP=6. 502 PFLOPs/s, 52% of theoretical peak. Original 'TP innermost, DP outermost' taxonomy."
+  },
+  {
+    authors: "Touvron, H. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "Llama-2 70B trained on 2K A100s with TP=8 and approximately 256-way DP."
+  },
+  {
+    authors: "Grattafiori, A. et al.",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "405B model on 16K H100s, RoCE 400G three-layer Clos. (TP=8, PP=16, DP=128) at 8K context; (TP=8, CP=16, PP=16, DP=4) at 128K. 38–43% BF16 MFU."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "671B-total / 37B-active MoE on 2048 H800s, PP=16, EP=64, ZeRO-1 DP. Batch ramp 3072 → 15360 sequences over first 469B tokens."
+  },
+  {
+    authors: "Aisystem Codesign et al.",
+    year: 2025,
+    title: "Scaling Llama 3 Training with Efficient Parallelism Strategies",
+    venue: "ISCA 2025",
+    url: "https://aisystemcodesign.github.io/papers/Llama3-ISCA25.pdf",
+    note: "Confirms (TP=8, CP=16, PP=16, DP=4) for 128K-context Llama-3 405B. 400 TFLOPs/GPU at 8K, 380 at 131K."
+  },
+  {
+    authors: "Huang, Y. et al.",
+    year: 2019,
+    title: "GPipe: Easy Scaling with Micro-Batch Pipeline Parallelism",
+    venue: "NeurIPS 2019",
+    url: "https://arxiv.org/abs/1811.06965",
+    note: "Original pipeline parallelism × DP combination. Sets up the PP × DP × micro-batch interlock."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2025,
+    title: "PyTorch DDP Design Note",
+    venue: "PyTorch documentation",
+    url: "https://docs.pytorch.org/docs/stable/notes/ddp.html",
+    note: "Reducer, autograd-hook flow, bucket-rebuild logic, identical-order requirement across ranks."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2025,
+    title: "torch.nn.parallel.DistributedDataParallel API reference",
+    venue: "PyTorch 2.12 documentation",
+    url: "https://docs.pytorch.org/docs/2.12/generated/torch.nn.parallel.DistributedDataParallel.html",
+    note: "Constructor defaults: bucket_cap_mb=None → 25 MiB; gradient_as_bucket_view; find_unused_parameters; static_graph. no_sync() context manager."
+  },
+  {
+    authors: "Wang, Y.",
+    year: 2021,
+    title: "PyTorch DistributedDataParallel Internals",
+    venue: "Medium",
+    url: "https://yi-wang-2005.medium.com/pytorch-distributeddataparallel-internals-c01c30a41192",
+    note: "Internals article by a PyTorch distributed engineer. Reducer, mark_variable_ready, bucket-rebuild logic on iteration 0."
+  },
+  {
+    authors: "Gustafson, J.",
+    year: 1988,
+    title: "Reevaluating Amdahl's Law",
+    venue: "CACM 31(5)",
+    url: "https://dl.acm.org/doi/10.1145/42411.42415",
+    note: "Original weak-scaling formulation. Distinguishes fixed-problem-size from fixed-work-per-processor regimes."
+  },
+]}/>

@@ -1,0 +1,562 @@
+---
+slug: 02f-collectives-and-overlap
+title: NCCL primitives and communication overlap
+description: The five collectives, ring vs tree algorithm selection, SHARP in-network aggregation, and the arithmetic-intensity floor below which a layer becomes communication-bound.
+order: 25
+chapter: 24
+module: 2
+module_title: Distributed training
+reading_minutes: 38
+depends_on: [02a-data-parallel, 02b-tensor-parallel]
+provides: [allreduce, allgather, reducescatter, alltoall, ring-algorithm, tree-algorithm, sharp, comm-overlap, intensity-floor]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Distributed training decomposes into two questions. The first is *what state lives on which GPU* — the parallelism strategy, treated separately under data parallelism, tensor parallelism, pipeline parallelism, sequence parallelism, expert parallelism, and context parallelism. The second is *what data the GPUs exchange and when* — the collective communication primitives and their overlap with compute. The remainder of the 02-distributed module answers the first question for each strategy. This chapter answers the second.
+
+NCCL — NVIDIA's Collective Communication Library — is the backend for every open-source frontier training stack. PyTorch [DDP](/textbook/02a-data-parallel), FSDP, Megatron-Core, DeepSpeed, JAX/Pax under XLA-on-GPU, and TorchTitan all dispatch into NCCL. AMD's RCCL is API-compatible. Understanding what NCCL is doing under the hood is what separates engineers who can debug a model-flops-utilisation regression from those who cannot.
+
+The chapter has three jobs. The first is to establish the collective vocabulary: what the five primitives (AllReduce, AllGather, ReduceScatter, Broadcast, AlltoAll) compute, and the algebraic relations between them — particularly the identity *AllReduce* ≡ *ReduceScatter* + *AllGather*, which underwrites sequence parallelism, ZeRO-3, and most modern memory-saving tricks. The second is the performance model: per-rank bandwidth formulas (the $2(W-1)/W$ factor for ring AllReduce, $(W-1)/W$ for AllGather), the latency-versus-bandwidth regime, NCCL's algorithm and protocol selection, and the SHARP in-network reduction story on H100/H200/B200 NVSwitch hardware. The third is communication–computation overlap: PyTorch DDP gradient bucketing, FSDP prefetch, Megatron's `--tp-comm-overlap` userbuffer pipeline, and the arithmetic-intensity threshold below which a layer simply cannot be hidden.
+
+This chapter is the single cross-reference target for the rest of the 02-distributed module. Every other chapter — DP, TP, PP, SP, ZeRO/FSDP, EP, 3D/4D composition — cites this one for bandwidth math and overlap mechanics. Backward, it cites [FP8](/textbook/01h-annealing-and-stability#fp8) for what FP8 communication does to the per-rank byte count. Forward, it feeds into [mixed precision and recompute](/textbook/02g-mixed-precision-and-recompute) and [3D/4D composition](/textbook/02h-3d-4d-composition).
+
+---
+
+## The five collectives {#collectives}
+
+NCCL's user guide enumerates five collectives plus point-to-point send/receive primitives. Let $W$ denote the world size, $|D|$ the per-rank input size in bytes, and assume sum reduction unless stated otherwise.
+
+### AllReduce
+
+Every rank ends with the elementwise sum of the $W$ inputs: $\text{out}[i] = \sum_{r=0}^{W-1} \text{in}_r[i]$. The output buffer on each rank has size $|D|$. This is the workhorse of synchronous data parallelism: the gradient on each rank is reduced (summed) and the sum is broadcast back. DDP averages by dividing each rank's gradient by $W$ before or after the AllReduce.
+
+The user guide explicitly notes the algebraic relations: "A `Reduce`, followed by a `Broadcast`, is equivalent to the `AllReduce` operation." More importantly for what follows: "Executing `ReduceScatter`, followed by `AllGather`, is equivalent to the `AllReduce` operation." That second identity is the basis for sequence parallelism and ZeRO.
+
+### AllGather
+
+Each rank contributes a buffer of size $|D|$; every rank ends with the concatenation of all $W$ buffers, of size $W \cdot |D|$, ordered by rank index. This is the gather phase in ZeRO-3 and FSDP: shards of a parameter are scattered across $W$ ranks during steady state and gathered into the full parameter just before the layer that consumes it.
+
+### ReduceScatter
+
+The reduction of AllReduce, but each rank receives only one *chunk* of the result, indexed by its rank. Inputs total $W \cdot |D|$ across the group (or $W$ slices of $|D|$ supplied as one buffer per rank); per-rank output is $|D|$. This is the scatter phase in ZeRO-3 and FSDP: per-rank gradient shards are summed across ranks, with each rank keeping only its slice for the optimiser step.
+
+### Broadcast
+
+One root rank holds an input buffer of size $|D|$; every rank ends with a copy. Used to disseminate freshly-initialised weights at job start or to push a configuration value mid-run. Rare in steady-state training compared with AllReduce.
+
+### AlltoAll
+
+Each of $W$ ranks holds a buffer of $W \cdot |D|$ pre-partitioned into $W$ chunks of size $|D|$. After the call, each rank ends with a buffer of $W \cdot |D|$ where the $i$-th chunk came from rank $i$. Documented as: "the $j$-th chunk of $N$ values is sent to destination rank $j$" and "the $i$-th chunk of $N$ values comes from source rank $i$."
+
+This is the primitive that dominates MoE expert parallelism: dispatching tokens to expert ranks and combining outputs back. The DeepSeek-V3 expert-parallel library (DeepEP) consists almost entirely of optimised AlltoAll kernels for dispatch and combine; expert parallelism is covered separately under `02e-expert-parallel`.
+
+### The algebraic identity that matters
+
+The identity *AllReduce* ≡ *ReduceScatter* + *AllGather* is not a NCCL-specific quirk. It is how every modern bandwidth-optimal AllReduce is *implemented*. Both the original Patarasuk–Yuan ring AllReduce and NCCL's ring implementation literally perform a reduce-scatter phase followed by an all-gather phase. The system-design implication, exposed by Korthikanti et al. (2022), is that anywhere training code calls AllReduce on a replicated tensor, it can be replaced with a ReduceScatter on a sharded tensor *for free in total bytes*, provided there is a downstream AllGather that can be hoisted or fused. Megatron-LM sequence parallelism does exactly this, splitting the activations along the sequence dimension and replacing the per-layer AllReduce with a ReduceScatter on the backward pass and an AllGather on the forward pass. Total communication volume is identical to the AllReduce form, but per-rank activation memory drops by the tensor-parallel degree.
+
+<Sidenote>Send/Recv (the two point-to-point primitives) are not collectives but are issued through the same `ncclGroupStart` / `ncclGroupEnd` group mechanism. They are used for pipeline-parallel activation transfers between adjacent stages and for the chunked ring exchanges that underpin Megatron's `--tp-comm-overlap` pipelined mode.</Sidenote>
+
+---
+
+## Per-rank bandwidth math {#bandwidth-math}
+
+### The ring algorithm derivation
+
+Patarasuk and Yuan's 2009 result is the foundation of modern AllReduce. Arrange $W$ ranks in a ring. Each rank divides its $|D|$-byte buffer into $W$ equal chunks of size $|D|/W$. The algorithm runs in $2(W-1)$ steps. In the reduce-scatter phase, at step $k$, rank $r$ sends chunk $(r-k) \bmod W$ to its right neighbour and receives chunk $(r-k-1) \bmod W$ from its left neighbour, accumulating into local memory. After $W-1$ steps each rank holds the *complete reduction* of one chunk. In the all-gather phase, at step $k$, rank $r$ sends the fully-reduced chunk it holds to its right neighbour. After $W-1$ further steps every rank has every fully-reduced chunk.
+
+Per-rank traffic: each step sends $|D|/W$ bytes, for $2(W-1)$ steps. Total bytes sent per rank are
+
+$$B_{\text{ring AllReduce}} = \frac{2(W-1)}{W} \cdot |D|.$$
+
+For large $W$ this approaches the optimal bound of $2|D|$: each byte must leave and return to each rank exactly once. The same derivation gives
+
+$$B_{\text{AllGather}} = B_{\text{ReduceScatter}} = \frac{W-1}{W} \cdot |D|,$$
+
+approaching $|D|$ in the large-$W$ limit. NCCL's own performance documentation defines its *bus bandwidth* metric using these exact factors. AllReduce reports $\text{BW} = \text{algBW} \times 2(W-1)/W$; AllGather and ReduceScatter report $\text{BW} = \text{algBW} \times (W-1)/W$; Broadcast and Reduce report $\text{BW} = \text{algBW} \times 1$ (the root is the bottleneck); and AlltoAll uses $(W-1)/W$.
+
+The *bus bandwidth* number is what to compare against the hardware peak. If an engineer measures 460 GB/s busBw on AllReduce across 8 H100s on NVLink-4 (peak 450 GB/s unidirectional), the run is at peak; the raw *algorithmic bandwidth* $|D|/t$ will read approximately 520 GB/s, which is the bus bandwidth scaled up by $W/(2(W-1))$. Misreading algBW as a "1.16× over peak" measurement is one of the most common confusions in nccl-tests output.
+
+### The alpha–beta cost model
+
+The standard performance model writes the time for a message of size $m$ on a single link as $\tau + m/\beta$, where $\tau$ is the per-message latency floor (often given in microseconds) and $\beta$ is the per-byte bandwidth (often expressed as GB/s, so the per-byte cost is $1/\beta$). For a $2(W-1)$-step ring algorithm with message size per step $|D|/W$,
+
+$$T_{\text{ring AllReduce}} \;\approx\; 2(W-1)\,\tau \;+\; \frac{2(W-1)}{W} \cdot \frac{|D|}{\beta}.$$
+
+The $\tau$ term scales **linearly** in $W$. For $W = 1024$ and a per-hop latency of roughly 1 μs on intra-NVLink or 10 μs on inter-node InfiniBand, the latency contribution alone is on the order of 2 ms or 20 ms before any payload bytes are sent. The bandwidth term asymptotes to $2|D|/\beta$ and is independent of $W$.
+
+This is the fundamental tension that drives algorithm selection in NCCL.
+
+### The double binary tree: NCCL's latency answer
+
+For small messages the $\tau$ term dominates and a ring is wasteful. Sanders, Speck, and Träff (2009) showed that two complementary binary trees can simultaneously achieve full bandwidth and **logarithmic latency** by arranging nodes so that each tree's leaves are the other tree's interior nodes. NCCL 2.4 (2019) shipped this as its tree algorithm. The latency cost becomes $2 \log_2(W) \cdot \tau$ instead of $2(W-1) \cdot \tau$; NVIDIA reported a 180× latency improvement at 24,576 GPUs on Summit.
+
+The cost is that tree AllReduce is not quite bandwidth-optimal. Each rank still sees approximately $2|D|$ bytes in flight, but the bandwidth on the network is not uniformly utilised because tree edges have unequal load. In practice NCCL switches between Tree (small messages) and Ring (large messages) using its internal cost model.
+
+### NVLS and CollNet: getting under $2|D|$
+
+The $2|D|$ lower bound holds only when reduction happens on endpoint GPUs. If the switch can reduce, the bound drops to approximately $|D|$ per rank — every byte leaves the GPU once, the reduced result returns once. NVIDIA's **SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol) does exactly that, in two variants. **NVLS** (NVLink-SHARP) uses the third-generation NVSwitch on H100, H200, and B200 boards, which contains hardware-multicast and hardware-reduction engines; it has been available since NCCL 2.18 and is enabled by default when topology supports it. **CollNet** (CollNet Direct and CollNet Chain) extends SHARP to InfiniBand switches; it requires a SHARP-aware InfiniBand topology.
+
+With SHARP, AllReduce delivers what NCCL's documentation describes as "bandwidth equivalent to a full-bandwidth AllReduce" — the per-rank byte count halves and SM consumption drops. The NCCL 2.27 release blog reports 16 SMs per GPU for the ring algorithm versus 6 SMs for SHARP AllReduce, a 2.7× reduction that frees compute for overlapping kernels.
+
+---
+
+## NCCL algorithm selection: ring vs tree {#ring-vs-tree}
+
+NCCL has two orthogonal selection axes. **Algorithm** is the high-level data flow (Ring, Tree, CollNet Direct, CollNet Chain, NVLS, NVLS Tree, PAT). **Protocol** is the low-level data path within a channel (Simple, LL, LL128). The cost model picks one of each at every collective call, parametrised by message size, topology, GPU type, and the available NICs. NCCL caches the resulting choice per (collective, count, datatype) tuple within a communicator, so the cost model fires only once per shape.
+
+### Algorithms
+
+**Ring** offers the best peak bandwidth but latency linear in $W$. It wins on large messages and in bandwidth-bound regimes.
+
+**Tree** is the double binary tree of Sanders et al.: latency $\log_2(W)$, bandwidth slightly below ring. It wins on small to medium messages and at high $W$.
+
+**CollNet Direct** and **CollNet Chain** use SHARP on the InfiniBand fabric to perform reductions in network switches. CollNet Direct is the canonical SHARP path; CollNet Chain is a fallback used when switch counts are limited, and was temporarily disabled for groups larger than 8 GPUs in some releases.
+
+**NVLS** and **NVLS Tree** use NVLink-SHARP on the NVSwitch domain. NVLS handles AllReduce; from NCCL 2.20 it additionally supports ReduceScatter and AllGather. NVLS Tree extends NVLS hierarchically for multi-node systems with NVSwitch nodes connected by InfiniBand.
+
+**PAT** (Parallel Aggregated Trees) was introduced in NCCL 2.23 (2024). It tunes the tree algorithm for AllGather and ReduceScatter specifically; it helps in regimes where tree AllReduce was already winning but the underlying AllGather and ReduceScatter operations were sub-optimal. The 2025 *Demystifying NCCL* paper observed that PAT "has yet to achieve widespread adoption."
+
+The default algorithm preference list, which can be overridden via `NCCL_ALGO`, is `Tree, Ring, CollnetDirect, CollnetChain` for AllReduce; NVLS is selected automatically when the topology supports it.
+
+### Protocols
+
+**Simple** is bandwidth-optimised. Each chunk is written by the producer, synchronised, then read by the consumer. Highest throughput; highest per-chunk latency.
+
+**LL** (Low Latency) skips synchronisation by interleaving a 4-byte flag with every 4 bytes of payload, halving usable bandwidth but eliminating the synchronisation cost. Wins for tiny messages (typically below ~16 KB).
+
+**LL128** is a compromise that exploits NVLink's 128-byte cache line. Every 128-byte transfer carries 120 bytes of payload and 8 bytes of flag, so usable bandwidth is $120/128 = 93.75\%$. Wins on Hopper / NVLink-4 for medium messages.
+
+The *Demystifying NCCL* benchmarking (figure 6 in the paper) shows LL and LL128 outperforming Simple below roughly 64 KiB for inter-node traffic and slightly larger thresholds for intra-node; the exact crossover is system-specific and there is no universal rule.
+
+### Algorithm and protocol crossover
+
+Two qualitative regimes follow. In the *latency-bound* (small-message) regime, Tree + LL is the right combination: the $\tau$ term dominates, and the algorithm and protocol with the lowest fixed cost win. In the *bandwidth-bound* (large-message) regime, Ring + Simple is the right combination (or NVLS + Simple if SHARP is available): the bandwidth term dominates, and the algorithm with the lowest per-byte cost wins.
+
+Explicit thresholds vary by system. As rules of thumb, validated in the worked example below, on a DGX H100 single-node 8-way AllReduce on NVLink-4, Tree+LL is best below approximately 256 KB; Ring+LL128 wins from roughly 256 KB to 4 MB; Ring+Simple wins above 4 MB; and NVLS+Simple beats Ring+Simple at all sizes when enabled. For 64-node H100 jobs over InfiniBand, Tree+LL is preferred up to several MB, Ring+Simple above, and CollNet or SHARP wins where deployed. The exact crossover sizes are system-specific and the *Demystifying NCCL* paper deliberately avoids tabulating fixed values.
+
+### NCCL version timeline
+
+<ComparisonTable
+  caption="NCCL release timeline for behaviours relevant to frontier training, 2023–2026. Versions past 2.28 have introduced device-API and inspector tooling whose effect on training-time overlap is not yet definitively measured."
+  columns={["Version", "Date", "Headline changes"]}
+  rows={[
+    ["2.18", "mid-2023", "Improved PXN connection code; PXN fix with CUDA_VISIBLE_DEVICES; SHARP/bfloat16 fix; NVLS path stabilised. [Source](https://github.com/NVIDIA/nccl/releases)"],
+    ["2.19", "late 2023", "Local user-buffer registration for NVLink-SHARP; net API v7 with device-side packet reordering; Hopper performance improvements; network flush disabled by default on H100. [Source](https://docs.nvidia.com/deeplearning/nccl/release-notes/rel_2-19-3.html)"],
+    ["2.20", "early 2024", "Reduced NVLS memory footprint; LL128 protocol enabled in heterogeneous Hopper scenarios; NVLS supports ReduceScatter and AllGather (not just AllReduce). [Source](https://github.com/NVIDIA/nccl/releases)"],
+    ["2.22", "mid-2024", "Lazy connection establishment for collective operations; accelerated intra-node NVLink detection; init profiling API; cost-estimation API; IB router support. [Source](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2234/release-notes/rel_2-22-3.html)"],
+    ["2.23", "2024", "PAT algorithm introduced; new scaling algorithm; init scalability past 10k ranks. [Source](https://developer.nvidia.com/blog/new-scaling-algorithm-and-initialization-with-nvidia-collective-communications-library-2-23/)"],
+    ["2.25", "early 2025", "GB200 multi-node-NVLink (MNNVL) support; multi-node SHARP topology. [Source](https://github.com/NVIDIA/nccl/releases)"],
+    ["2.26–2.27", "2025", "SHARP for AllGather and ReduceScatter over NVLink and IB; 2.7× SM reduction for SHARP AllReduce; AllGather and ReduceScatter now preferred over AllReduce for better overlap. [Source](https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/)"],
+    ["2.28+", "late 2025 / 2026", "Device API; symmetric-memory improvements; Inspector plugin. Behavioural impact for 2026 training stacks not yet definitively measured. [Source](https://github.com/NVIDIA/nccl/releases)"]
+  ]}
+/>
+
+The trajectory is clear. Every recent version has pushed more work into the network via SHARP, reduced SM consumption to free compute for overlap, and lowered initialisation cost so that frontier-scale jobs with 10k+ ranks start in seconds rather than minutes. Specific 2.30+ features remain unverified at the time of writing; the worked examples below use behaviour confirmed in 2.27.
+
+---
+
+## SHARP and in-network aggregation {#sharp}
+
+The third-generation NVSwitch on H100 boards contains two new components beyond its prior bandwidth-only role: hardware **multicast** and hardware **reduction** engines. Concretely, for an AllReduce on an 8-GPU DGX-H100 NVSwitch domain, each GPU pushes its data once into the switch, which sums and multicasts the result back. Per-GPU outbound traffic is $|D|$; per-GPU inbound traffic is $|D|$; total wire bytes per rank are $2|D|$ — but with no further forwarding hops. Compared with ring AllReduce's $2(W-1)/W \cdot |D| \approx 1.75 \cdot |D|$ per rank for $W = 8$, that is a roughly 13% wire-byte reduction in the limit. The larger operational wins come from two places: GPU SMs are freed from performing the reduction (NCCL 2.27 reports 6 SMs versus 16 for ring), and the latency becomes constant in $W$ rather than linear.
+
+Multi-node NVLS uses an InfiniBand-side SHARP tier on top of intra-node NVSwitch SHARP. The Lambda Labs report on the production 1024-GPU H100 1CC cluster with NDR400 InfiniBand records IB-SHARP AllReduce gains of up to 1.6× over ring on real workloads.
+
+NCCL 2.27 (mid-2025) extended SHARP from AllReduce to AllGather and ReduceScatter. This is a non-obvious feature because these collectives have no reduction step; the mechanism uses the switch's multicast unit for the AllGather phase. The 2.27 announcement explicitly recommends "AllGather (AG) and ReduceScatter (RS) over AllReduce for better overlap between compute and communication" at 1k+ GPUs — a reversal of two decades of folk wisdom in which AllReduce was the canonical primitive. Operationally, this aligns the comm story with the algebraic identity *AllReduce* ≡ *ReduceScatter* + *AllGather*: sharded-state methods like FSDP and ZeRO-3 are now strictly preferred over their replicated-state predecessors not only for memory reasons but for raw communication efficiency.
+
+<Callout variant="info" title="When SHARP is and is not selected">
+SHARP requires both the hardware path (NVLink-3 NVSwitch or SHARP-enabled InfiniBand switches) and the right NCCL version. Practitioners should not assume SHARP is in use without verifying. Setting `NCCL_DEBUG=INFO` causes NCCL to print the selected algorithm and protocol per call; the line `via NCCL_ALGO=NVLS` or `CollnetDirect` confirms the path. AlltoAll does not benefit from SHARP directly because there is no reduction step that maps to switch hardware; this is the reason MoE expert-parallel communication remains expensive even on SHARP-equipped clusters.
+</Callout>
+
+---
+
+## Latency vs bandwidth regimes {#latency-bw-regimes}
+
+The alpha–beta model from the bandwidth-math section explains the qualitative shape of NCCL's choices, but the practical regime structure is worth fixing in a single picture.
+
+For each collective size, the time is approximately $T \approx N_{\text{steps}} \cdot \tau + B \cdot |D| / \beta$, where $N_{\text{steps}}$ is the algorithm-specific step count and $B$ is the corresponding bandwidth factor (the $2(W-1)/W$ or $(W-1)/W$ from the bus-bandwidth formulas). Three regimes follow.
+
+**Latency regime, $|D|/\beta \ll \tau$**: $T \approx N_{\text{steps}} \cdot \tau$. Tree's $\log_2(W)$ step count wins. Throughput scales poorly because each call carries little payload. Mitigations include batching multiple gradients into a single call (DDP bucketing, discussed below) and selecting the LL protocol to remove per-chunk synchronisation cost.
+
+**Transition regime, $|D|/\beta \approx \tau$**: neither term dominates. The cost-model crossovers live here. NCCL's choice depends on system specifics; LL128 typically wins among protocols.
+
+**Bandwidth regime, $|D|/\beta \gg \tau$**: $T \approx B \cdot |D| / \beta$. Ring's $B = 2(W-1)/W$ approaches $2$ for AllReduce; NVLS/SHARP cuts this factor toward 1. Throughput scales with link bandwidth; latency floor is negligible.
+
+The chapter's worked example sits firmly in the bandwidth regime: a 14 GB gradient buffer divided across 64 GPUs is large enough that the $\tau$ contribution is negligible against the bandwidth term, and ring versus tree turns mostly on the slight bandwidth penalty of trees. Sequence-parallel TP collectives, by contrast, often sit in the transition regime — a per-layer activation buffer at sequence length 8192, hidden 8192, BF16 is around 134 MB, large enough to be bandwidth-dominated on NVLink but small enough that the $\tau$ cost matters on InfiniBand.
+
+---
+
+## Communication overlap: DDP bucketing + FSDP prefetch {#overlap}
+
+On a modern GPU, communication takes microseconds-to-milliseconds and compute takes microseconds-to-milliseconds. If they are sequenced, roughly half the machine is wasted. If they are overlapped, none of it is. Three frameworks accomplish this differently; each illustrates a key design pattern.
+
+### PyTorch DDP: gradient bucketing
+
+PyTorch's `DistributedDataParallel` is the simplest and oldest of the patterns. The mechanism has three steps. First, at wrap time, the `Reducer` allocates parameters into *buckets* sized to `bucket_cap_mb`, default 25 MB. Parameters are allocated in roughly the *reverse* order of `model.parameters()`, because backward fills gradients in roughly that order. Second, during the backward pass, every parameter has an autograd post-accumulation hook; when the last gradient in a bucket is ready, the hook fires an asynchronous `ncclAllReduce` on that bucket. The remaining backward computation proceeds while the AllReduce streams in a separate CUDA stream. Third, before `optimizer.step()`, DDP waits on all outstanding AllReduces.
+
+The performance pattern is straightforward: the *last* bucket reduced is the largest unhidden tail, because there is no computation left to overlap with. Bucket sizing is a tradeoff. Smaller buckets reduce the tail but pay more per-collective latency overhead; larger buckets give better bandwidth per call but a larger tail. The 25 MB default was tuned around 2019-era V100 NVLink; community measurements (PyTorch issue #118421) suggest that on modern Hopper systems 100–200 MB is closer to optimal, but the default has not changed. Setting `gradient_as_bucket_view=True` (available since PyTorch 1.7) eliminates a per-bucket copy and is recommended for any new code.
+
+DDP is the canonical "1D data parallel" overlap pattern. Its limitation is that AllReduce volume scales with the *full* model size per step; it does not save on parameter memory. That motivates FSDP.
+
+### FSDP / FSDP2: prefetched AllGather and ReduceScatter
+
+Fully-Sharded Data Parallel is ZeRO-3 reimplemented in PyTorch. The mechanism rests on the *AllReduce* ≡ *ReduceScatter* + *AllGather* identity. Parameters are sharded across the $W$ ranks of the FSDP group: each rank holds $1/W$ of every parameter. On the forward pass, just before each layer, the framework issues an AllGather on its parameters, runs the layer, and then immediately releases the unsharded copy. On the backward pass, parameters are AllGathered again (the same parameters as on forward), the local gradient is computed on the AllGathered weights, a ReduceScatter sums the gradient across ranks with each rank keeping only its slice, and the unsharded copy is released.
+
+Total communication volume per step is one AllGather forward + one AllGather backward + one ReduceScatter backward, summing to $3 \cdot |D_{\text{model}}|$. Compared with DDP's $2 \cdot |D_{\text{model}}|$ (since AllReduce volume is $2(W-1)/W \cdot |D_{\text{model}}| \approx 2 \cdot |D_{\text{model}}|$ for large $W$), FSDP pays roughly 50% more communication for the memory savings. That extra communication must be hidden.
+
+Prefetch is the answer. FSDP2 (the `fully_shard` API that supersedes the older `FullyShardedDataParallel`) offers three mechanisms. *Implicit prefetching*, the default, issues the AllGather for layer $i+1$ in a separate CUDA stream while layer $i$ computes in the default stream; two streams run concurrently, one for compute and one for AllGather. *Backward prefetch policies* expose two settings: `BACKWARD_PRE` prefetches the next set of parameters *before* the current gradient computation finishes — maximum overlap, highest memory — while `BACKWARD_POST` prefetches *after*, overlapping the current ReduceScatter with the next gradient computation at lower memory cost. *Explicit prefetching APIs* `set_modules_to_backward_prefetch` and `set_modules_to_forward_prefetch` are available for advanced users with non-standard module orderings.
+
+<Sidenote>FSDP1 (`FullyShardedDataParallel`) and FSDP2 (`fully_shard`) both still exist in PyTorch as of May 2026. New code should use FSDP2; the older class remains supported for legacy checkpoints but no longer receives feature updates. The prefetch mechanisms are similar in spirit but the APIs differ.</Sidenote>
+
+### Megatron-LM TP communication overlap
+
+Tensor parallelism, covered separately in [tensor parallelism](/textbook/02b-tensor-parallel), inserts an AllReduce at the end of each attention and MLP block, or an AllGather + ReduceScatter pair under sequence parallelism. These cannot be bucketed across layers because each block has a hard dependency on the comm result before the next block can start. Megatron's solution is to overlap *within* the block, via three switches. `--overlap-grad-reduce` overlaps the data-parallel ReduceScatter of weight gradients (the DP-side comm) with the *backward* compute, analogous to DDP bucketing. `--overlap-param-gather` overlaps the DP-side AllGather of parameters (used in distributed-optimiser configurations) with *forward* compute. `--tp-comm-overlap` is the clever one and requires `sequence_parallel=True`; it operates in two modes covered in detail in the dedicated section below.
+
+The implementation uses **userbuffers** from NVIDIA's Transformer Engine: pre-registered, statically-sized buffers that NCCL and TE can write to and read from with minimal synchronisation. The cost is that activation shapes must be fixed at startup; the gain is near-complete hiding of TP communication.
+
+---
+
+## Arithmetic-intensity floor {#intensity-floor}
+
+A layer's compute and communication can be perfectly overlapped *only if* the layer is compute-bound for long enough to hide the communication. Roofline reasoning makes this precise.
+
+Let $C$ denote the compute time of the layer, equal to (layer FLOPs) divided by (peak FLOP/s $\times$ MFU). Let $T_{\text{comm}}$ denote the communication time, equal to (per-rank comm bytes) divided by (effective bus bandwidth). The layer is communication-bound, and cannot be hidden, iff $T_{\text{comm}} > C$. Rearranging,
+
+$$\frac{\text{layer FLOPs}}{\text{comm bytes}} \;<\; \frac{\text{peak FLOP/s} \times \text{MFU}}{\text{bus BW}}.$$
+
+The left side is the layer's *arithmetic intensity on communication* — analogous to memory arithmetic intensity but with the comm bus replacing HBM. The right side is the hardware ratio. For an H100 SXM5: peak BF16 throughput is 989 TFLOP/s; at MFU 0.55 this is approximately $544$ TFLOP/s. NVLink-4 bus bandwidth per GPU is 450 GB/s unidirectional, with approximately $360$ GB/s effective AllReduce busBw for an 8-way ring. The intensity floor for intra-node NVLink is therefore
+
+$$\text{floor}_{\text{NVLink}} \;=\; \frac{544 \times 10^{12}}{360 \times 10^{9}} \;\approx\; 1{,}500 \text{ FLOP/byte}.$$
+
+For inter-node InfiniBand at 50 GB/s per GPU,
+
+$$\text{floor}_{\text{IB}} \;=\; \frac{544 \times 10^{12}}{50 \times 10^{9}} \;\approx\; 10{,}900 \text{ FLOP/byte}.$$
+
+A layer with arithmetic intensity below the floor cannot fully hide its communication, even with perfect prefetch. Consider a transformer MLP at hidden dimension $d = 8192$, feed-forward hidden $d_{\text{ff}} = 28672$, sequence length $s = 8192$: FLOPs are approximately $2 \cdot b \cdot s \cdot d \cdot d_{\text{ff}} \cdot 3$ for the column-then-row GEMM pair, and comm bytes under TP=8 sequence parallelism are approximately $4 \cdot b \cdot s \cdot d$ for the AllGather plus ReduceScatter pair in BF16. The intensity is roughly $d_{\text{ff}} \cdot 1.5 \approx 43{,}000$ FLOP/byte. This is well above the NVLink floor and comfortably above even the IB floor — which is precisely why TP within a node works.
+
+By contrast, a small attention head with $d_{\text{head}} = 128$ over short sequences ($s = 512$) has intensity roughly 256, an order of magnitude below the NVLink floor. This explains why splitting attention across nodes (long-context CP) is brittle in practice and why most TP groups stay within one NVSwitch domain.
+
+The same calculation explains why **FP8 communication wins twice**. FP8 halves the per-byte cost of every collective (see [FP8](/textbook/01h-annealing-and-stability#fp8)), which doubles the effective comm bandwidth available to each layer-byte; equivalently it halves the intensity floor. A layer that was just barely comm-bound under BF16 becomes hideable under FP8, *and* the FLOPs per byte remain constant. DeepSeek-V3 quantises the dispatch leg of its MoE AlltoAll to FP8 for exactly this reason, while keeping the combine leg in BF16 to preserve gradient quality, halving the dispatch comm volume and reporting full overlap with attention compute.
+
+<Callout variant="note" title="The floor is necessary, not sufficient">
+Clearing the arithmetic-intensity floor is a necessary condition for hiding communication, not a sufficient one. Even when the per-layer intensity exceeds the floor, overlap depends on the framework actually issuing comm and compute on different streams, the compute kernel admitting independent SM occupancy, and the producer-consumer dependency chain admitting reordering. The pipelined overlap in Megatron's `--tp-comm-overlap` works precisely because it engineers all three conditions simultaneously.
+</Callout>
+
+---
+
+## Worked example: 64 H100s, 7B gradients {#worked-example}
+
+The 7B-class model has roughly $7 \times 10^{9}$ parameters. In BF16 the gradient buffer is $7 \times 10^{9} \cdot 2 = 14$ GB.
+
+**Topology.** Eight nodes, each with eight H100 SXM5 GPUs, for 64 GPUs total. Within a node, NVLink-4 + NVSwitch3 gives 450 GB/s per-GPU unidirectional NVLink bandwidth (900 GB/s bidirectional, but a ring AllReduce uses one direction). Across nodes, ConnectX-7 NDR400 InfiniBand gives 400 Gb/s = 50 GB/s per GPU.
+
+### Pure ring AllReduce (no SHARP)
+
+The ring spans all 64 GPUs. The *bottleneck link* is the inter-node InfiniBand at 50 GB/s. Per-rank traffic for ring AllReduce is
+
+$$|D|_{\text{ring}} \;=\; \frac{2 \cdot 63}{64} \cdot 14 \text{ GB} \;=\; 27.56 \text{ GB}.$$
+
+Time at ideal effective bandwidth is $27.56 \text{ GB} / 50 \text{ GB/s} \approx 550$ ms. In practice nccl-tests on an 8-node H100 cluster over InfiniBand sustains a ring busBw of approximately 38 GB/s, so the realistic time is closer to $14 \text{ GB} / (38 \text{ GB/s}) \cdot 2 \cdot 63/64 \approx 730$ ms.
+
+### Hierarchical AllReduce (intra-node ring × inter-node tree/ring)
+
+NCCL automatically uses a hierarchical pattern when topology is non-uniform: an intra-node ring on NVLink and an inter-node ring or tree on InfiniBand. Effectively, the 64-way AllReduce decomposes into an 8-way ReduceScatter inside each node (reducing to $1/8$ of the data per GPU), an 8-way AllReduce across nodes (one rank per node speaking), and an 8-way AllGather inside each node.
+
+The three legs:
+
+- *Intra-node ReduceScatter*: per-rank traffic $(7/8) \cdot 14 \text{ GB} / 8 \approx 1.53$ GB on NVLink at 360 GB/s busBw, taking 4.3 ms; under the brief's accounting of $1.75/8 \cdot 14 \approx 3.06$ GB the cost is approximately 8.5 ms.
+- *Inter-node AllReduce*: $14/8 = 1.75$ GB per node-rank, world size 8, total per-rank traffic $2 \cdot 7/8 \cdot 1.75 \approx 3.06$ GB on InfiniBand at 38 GB/s, taking 80 ms.
+- *Intra-node AllGather*: same as ReduceScatter, approximately 8.5 ms.
+
+Summing gives approximately **97 ms** — roughly a **7× speedup** over the flat ring. This is why NCCL's default behaviour, hierarchical decomposition, is the right behaviour: the costly leg is the slow inter-node link, and the hierarchical pattern reduces inter-node traffic to $1/8$ of what flat-ring would have sent.
+
+### With NVLS + IB-SHARP (NCCL 2.27)
+
+SHARP cuts the inter-node leg's per-rank traffic by approximately 2×, since the switch performs the reduction in network. Intra-node NVLS reduces the SM cost and slightly improves bandwidth utilisation. The resulting estimate is in the **50–55 ms** range — another roughly 2× over the hierarchical baseline, and approximately 14× over the flat ring.
+
+### Hiding it with DDP bucketing
+
+A 7B model has on the order of 600 transformer-layer backward operators. Each H100 backward step at MFU 0.5 runs the full backward in approximately FLOPs $\approx 4 \cdot 7 \times 10^{9} \cdot 1 \cdot 8192 \approx 4.6 \times 10^{14}$ (the factor 4 reflects backward $\approx 2 \times$ forward FLOPs over $b \cdot s = 1 \cdot 8192$ tokens), giving compute time $4.6 \times 10^{14} / (989 \times 10^{12} \cdot 0.5) \approx 930$ ms.
+
+If the AllReduce takes 100 ms (the hierarchical case) and the backward takes 930 ms, bucketing easily hides the AllReduce. Only the *final* bucket — the embedding-layer gradients, since DDP reduces in reverse parameter order — is exposed. A 25 MB final bucket on the 64-GPU hierarchical AllReduce ships approximately $25 \text{ MB} \cdot 27.56 / 14000 \approx 0.05$ GB at a hierarchical effective bandwidth of around 145 GB/s, costing approximately 0.3 ms. Negligible.
+
+The same numbers explain why FSDP is feasible at this scale. FSDP's per-step communication is $3 \cdot |D_{\text{model}}| = 42$ GB total, but split across 600 layers it is approximately 70 MB per layer per direction — comfortably hideable by the corresponding per-layer compute of approximately 1.5 ms at MFU 0.5.
+
+<ComparisonTable
+  caption="AllReduce time on a 14 GB BF16 gradient buffer across 64 H100s (8 nodes × 8 GPUs, NVLink-4 intra-node, NDR400 IB inter-node). Hierarchical decomposition reduces inter-node traffic to 1/8 of flat ring; SHARP halves the inter-node reduction cost."
+  columns={["Configuration", "Per-rank traffic", "Wall time", "Speedup vs flat"]}
+  rows={[
+    ["Flat ring AllReduce", "27.56 GB", "≈ 730 ms", "1.0× (baseline). [Source](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md)"],
+    ["Hierarchical (intra-node ring × inter-node ring)", "RS + AR + AG ≈ 3.06 + 3.06 + 3.06 GB across legs", "≈ 97 ms", "≈ 7.5×. [Source](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html)"],
+    ["Hierarchical + NVLS + IB-SHARP (NCCL 2.27)", "approx halved inter-node leg", "≈ 50–55 ms", "≈ 13–14×. [Source](https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/)"]
+  ]}
+/>
+
+### What changes at 1024 H100s
+
+At 1024 GPUs the flat-ring AllReduce time on the bandwidth term scales nearly with traffic (the $W$ in the denominator of $2(W-1)/W$ asymptotes to 1), but the latency term $2(W-1) \cdot \tau$ becomes problematic for small messages. Hierarchical AllReduce with SHARP becomes essential, not optional. NCCL 2.27's preference for AllGather + ReduceScatter over AllReduce (with SHARP support) becomes meaningful here: FSDP-style sharding becomes both memory-cheaper and communication-cheaper than DDP. The Lambda Labs report on the 1024-GPU 1CC cluster (with NDR400 InfiniBand and IB-SHARP) confirms the expected 1.6× win of SHARP AllReduce over the ring path on production workloads at this scale.
+
+---
+
+## Megatron-LM TP-AllReduce overlap {#megatron-tp-overlap}
+
+The Megatron-LM 530B paper (Korthikanti et al., 2022) demonstrates the canonical recipe for hiding TP communication. The setup is 2240 NVIDIA A100 GPUs with TP=8, PP=35, DP=8, and sequence parallelism enabled. Each transformer block runs through the following sequence on the forward pass: RMSNorm and column-parallel QKV projection (no TP comm); attention; row-parallel output projection, which under sequence parallelism becomes a ReduceScatter on the forward pass (activations are sharded along the sequence dimension on output); RMSNorm on sequence-sharded activations; column-parallel FFN-up, which needs the full activation along the sequence dimension and so inserts an AllGather; activation function; row-parallel FFN-down, whose output is sequence-sharded again and so inserts a ReduceScatter.
+
+Per layer per forward pass: one AllGather + one ReduceScatter in the attention block and one AllGather + one ReduceScatter in the MLP block, four collectives in total. Per layer per backward pass: four more. Each operates over the TP=8 group.
+
+With `--tp-comm-overlap` and userbuffers enabled, the overlap mechanism has two modes. *Bulk overlap* handles TP communications with no direct compute dependency: they are issued in a separate stream, trivially overlapping with whatever happens to be on the main stream. *Pipelined overlap* is the more interesting mode and handles TP communications with direct dependencies. The AllGather is decomposed into 8 ring-exchange steps; step $i$ produces the $i$-th chunk of the gathered activation, and the GEMM kernel is launched in a separate stream that consumes chunks as they arrive. The dependency chain becomes: P2P receive of chunk $i$ → partial GEMM on chunk $i$ → accumulate into output. Total wall time is approximately $\max(8 \cdot \text{P2P time per chunk}, 8 \cdot \text{partial GEMM time per chunk})$, not their sum. The ReduceScatter after a row-parallel GEMM is decomposed symmetrically: each output chunk of the GEMM is immediately P2P-sent to the appropriate destination rank where it accumulates; by the time the last chunk's GEMM finishes, the first chunks have already arrived and been reduced.
+
+The 530B paper reports 54.2% MFU with this approach, versus 42.1% with activation recomputation alone — a 29% throughput improvement on a 2240-GPU run. The same approach is the basis of every Megatron-Core training recipe today and is integrated into NeMo, Megatron-Bridge, and TorchTitan.
+
+Microsoft's **Domino** (Wang et al., 2024) generalises this idea by tensor-slicing the input row-wise and the weights column-wise, then pipelining the GEMM and the AllReduce across micro-slices. Domino reports a 1.3× speedup over Megatron-LM on DGX-H100 for LLM training by achieving "near-complete" TP comm hiding, and is now integrated into DeepSpeed. The head-to-head Megatron `--tp-comm-overlap` versus Domino comparison has not been definitively re-measured against current userbuffer-based pipelined overlap; the more recent userbuffer path may close part of that 1.3× gap, but no public benchmark has settled the question.
+
+The operational lesson is that TP communication is *not* unavoidable overhead. It can be reduced to a near-zero tail when the GEMM is large enough to absorb the 8 ring-exchange steps. The arithmetic-intensity floor calculation above already showed that per-layer compute sits well above the comm intensity floor; Megatron's pipelined overlap is the operational mechanism that converts that analytical headroom into measured overlap.
+
+---
+
+## Chapter summary {#summary}
+
+- The five NCCL collectives are AllReduce, AllGather, ReduceScatter, Broadcast, and AlltoAll. The identity *AllReduce* ≡ *ReduceScatter* + *AllGather* is how every bandwidth-optimal AllReduce is implemented and underpins sequence parallelism, ZeRO-3, and FSDP.
+- Ring AllReduce per-rank bus bandwidth is $B = 2(W-1)/W \cdot |D|$; AllGather and ReduceScatter both use $(W-1)/W \cdot |D|$. NCCL's reported *bus bandwidth* number scales algorithmic bandwidth by these factors and is the right quantity to compare against hardware peak.
+- The alpha–beta model $T \approx N_{\text{steps}} \tau + B |D|/\beta$ explains algorithm selection: Tree (latency $\log_2 W$) wins on small messages, Ring (bandwidth-optimal) on large, and NVLS or CollNet SHARP wins whenever switch-side reduction is available.
+- SHARP halves the wire-byte count for AllReduce (and from NCCL 2.27 for AllGather and ReduceScatter) and frees SMs (16 → 6 for ring vs SHARP AllReduce). The NCCL 2.27 release explicitly recommends AllGather + ReduceScatter over AllReduce at 1k+ GPUs.
+- DDP overlaps communication via gradient bucketing with a default 25 MB bucket size (likely under-tuned for Hopper-era hardware). FSDP overlaps via implicit prefetching across CUDA streams with `BACKWARD_PRE` / `BACKWARD_POST` policies. Megatron's `--tp-comm-overlap` with userbuffers pipelines the AllGather and ReduceScatter inside the TP GEMM.
+- The arithmetic-intensity floor — peak FLOP/s × MFU / effective bus BW — gives roughly 1,500 FLOP/byte on NVLink-4 and 10,900 FLOP/byte on NDR400 IB for an H100 at MFU 0.55. Transformer MLPs at frontier-scale dimensions clear this floor by an order of magnitude on NVLink and a comfortable margin on IB; small attention heads at short sequences fall below it, which is why long-context CP is brittle and TP groups stay within an NVSwitch domain.
+- The worked example: a 14 GB BF16 gradient AllReduce across 64 H100s takes approximately 730 ms as a flat ring, approximately 97 ms hierarchically, and approximately 50–55 ms with NVLS + IB-SHARP under NCCL 2.27 — a 13–14× span between the worst and best feasible configurations on the same hardware.
+- Open uncertainties: exact Tree-to-Ring crossover sizes are system-specific (the *Demystifying NCCL* paper deliberately avoids tabulating thresholds); CollNet versus NVLS-Tree contention on hybrid clusters lacks a clean authoritative description; Domino versus Megatron `--tp-comm-overlap` has not been re-measured against current userbuffer pipelining; and NCCL 2.30+ device-API features remain unverified in their training-time effect at the time of writing.
+
+<Sources items={[
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "NCCL User Guide — Collective Operations",
+    venue: "docs.nvidia.com",
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html",
+    note: "Canonical semantics for AllReduce, AllGather, ReduceScatter, Broadcast, AlltoAll. States the AllReduce ≡ ReduceScatter + AllGather identity explicitly."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "nccl-tests PERFORMANCE.md",
+    venue: "github.com/NVIDIA/nccl-tests",
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md",
+    note: "Bus-bandwidth formulas: AllReduce BW = algBW × 2(n-1)/n; AllGather and ReduceScatter BW = algBW × (n-1)/n; Broadcast/Reduce × 1; AlltoAll × (n-1)/n."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2026,
+    title: "NCCL Environment Variables",
+    venue: "docs.nvidia.com (NCCL 2.30)",
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html",
+    note: "NCCL_ALGO, NCCL_PROTO, NCCL_DEBUG, NCCL_NVLS_ENABLE. Reference for algorithm and protocol overrides."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "NCCL 2.22.3 Release Notes",
+    venue: "docs.nvidia.com",
+    url: "https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2234/release-notes/rel_2-22-3.html",
+    note: "Lazy connection establishment, accelerated NVLink detection, init profiling and cost-estimation APIs, IB router support."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2023,
+    title: "NCCL 2.19.3 Release Notes",
+    venue: "docs.nvidia.com",
+    url: "https://docs.nvidia.com/deeplearning/nccl/release-notes/rel_2-19-3.html",
+    note: "User-buffer registration for NVLink-SHARP, net API v7, Hopper improvements, network flush disabled by default on H100."
+  },
+  {
+    authors: "NVIDIA",
+    year: "ongoing",
+    title: "NCCL GitHub releases",
+    venue: "github.com/NVIDIA/nccl",
+    url: "https://github.com/NVIDIA/nccl/releases",
+    note: "Authoritative release-notes timeline for behavioural changes 2.18 through 2.28+."
+  },
+  {
+    authors: "Patarasuk, P. & Yuan, X.",
+    year: 2009,
+    title: "Bandwidth optimal all-reduce algorithms for clusters of workstations",
+    venue: "J. Parallel Distrib. Comput. 69(2):117–124",
+    url: "https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf",
+    note: "Original ring AllReduce derivation. Establishes the 2(W−1)/W per-rank traffic factor and the 2|D| lower bound."
+  },
+  {
+    authors: "Sanders, P., Speck, J. & Träff, J.",
+    year: 2009,
+    title: "Two-tree algorithms for full bandwidth broadcast, reduction and scan",
+    venue: "Parallel Computing 35(12):581–594",
+    url: "https://www.researchgate.net/publication/220275634",
+    note: "Double binary tree construction that achieves full bandwidth and logarithmic latency. Basis for NCCL Tree algorithm."
+  },
+  {
+    authors: "Korthikanti, V. et al.",
+    year: 2022,
+    title: "Reducing Activation Recomputation in Large Transformer Models",
+    venue: "arXiv:2205.05198",
+    url: "https://arxiv.org/abs/2205.05198",
+    note: "Megatron sequence parallelism. Exposes the AllReduce → ReduceScatter + AllGather decomposition for free, plus --tp-comm-overlap. Reports 54.2% MFU on 2240-A100 530B run."
+  },
+  {
+    authors: "Li, S. et al.",
+    year: 2020,
+    title: "PyTorch Distributed: Experiences on Accelerating Data Parallel Training",
+    venue: "VLDB 2020",
+    url: "https://www.vldb.org/pvldb/vol13/p3005-li.pdf",
+    note: "DDP architecture paper. Bucket-based AllReduce overlap with reverse-order gradient hooks; default 25 MB bucket_cap_mb."
+  },
+  {
+    authors: "Zhao, Y. et al.",
+    year: 2023,
+    title: "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel",
+    venue: "VLDB 2023",
+    url: "https://www.vldb.org/pvldb/vol16/p3848-huang.pdf",
+    note: "FSDP architecture paper. Per-step comm volume 3·|model|, implicit prefetching across CUDA streams, BACKWARD_PRE / BACKWARD_POST policies."
+  },
+  {
+    authors: "Wang, G. et al.",
+    year: 2024,
+    title: "Domino: Eliminating Communication in LLM Training via Generic Tensor Slicing and Overlapping",
+    venue: "arXiv:2409.15241",
+    url: "https://arxiv.org/abs/2409.15241",
+    note: "Tensor-slice the input row-wise and weights column-wise; pipeline GEMM and AllReduce across micro-slices. 1.3× over Megatron-LM on DGX-H100, integrated into DeepSpeed. Head-to-head against current userbuffer overlap not definitively re-measured."
+  },
+  {
+    authors: "Lyu, Z. et al.",
+    year: 2025,
+    title: "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms",
+    venue: "arXiv:2507.04786",
+    url: "https://arxiv.org/html/2507.04786v1",
+    note: "Independent measurement of NCCL algorithm/protocol crossovers; notes PAT (2.23) has yet to achieve widespread adoption; deliberately avoids exact Tree-Ring thresholds as system-specific."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "FP8 dispatch in MoE AlltoAll, BF16 combine. Halved dispatch comm volume, full overlap with attention compute."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2019,
+    title: "Massively Scale Your Deep Learning Training with NCCL 2.4",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/",
+    note: "Double binary tree shipped in NCCL 2.4. 180× latency improvement at 24,576 GPUs on Summit."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "Understanding NCCL Tuning to Accelerate GPU-to-GPU Communication",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/understanding-nccl-tuning-to-accelerate-gpu-to-gpu-communication/",
+    note: "Algorithm × protocol selection axes. NCCL_ALGO and NCCL_PROTO usage. Default algorithm preference list."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2024,
+    title: "New Scaling Algorithm and Initialization with NCCL 2.23",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/new-scaling-algorithm-and-initialization-with-nvidia-collective-communications-library-2-23/",
+    note: "PAT algorithm introduced. Init scalability past 10k ranks. Cost-estimation API."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "Enabling Fast Inference and Resilient Training with NCCL 2.27",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/",
+    note: "SHARP for AllGather and ReduceScatter. 6 SMs (SHARP) vs 16 SMs (ring) for AllReduce. Recommendation to prefer AG + RS over AllReduce at 1k+ GPUs."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2022,
+    title: "Upgrading Multi-GPU Interconnectivity with the Third-Generation NVIDIA NVSwitch",
+    venue: "NVIDIA developer blog",
+    url: "https://developer.nvidia.com/blog/?p=53977",
+    note: "Hardware multicast and reduction engines in NVSwitch3. Foundation for NVLS path."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2022,
+    title: "NVIDIA NVSwitch at HotChips 2022",
+    venue: "Hot Chips 34",
+    url: "https://hc34.hotchips.org/assets/program/conference/day2/Network%20and%20Switches/NVSwitch%20HotChips%202022%20r5.pdf",
+    note: "Hardware-level slides on NVSwitch3 SHARP engines. 450 GB/s per-GPU NVLink-4 unidirectional bandwidth."
+  },
+  {
+    authors: "NVIDIA",
+    year: 2025,
+    title: "GB200 NVL Multi-Node NCCL Tuning Guide",
+    venue: "docs.nvidia.com",
+    url: "https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/nccl.html",
+    note: "Multi-node-NVLink (MNNVL) topology and NCCL 2.25+ behaviour on GB200 NVL systems."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2025,
+    title: "PyTorch DDP Design Notes (v2.7)",
+    venue: "docs.pytorch.org",
+    url: "https://docs.pytorch.org/docs/2.7/notes/ddp.html",
+    note: "DDP Reducer architecture: bucket construction in reverse parameter order, autograd post-accumulation hooks, gradient_as_bucket_view=True."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2025,
+    title: "PyTorch FSDP2 Tutorial",
+    venue: "docs.pytorch.org",
+    url: "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html",
+    note: "fully_shard API; implicit prefetching across CUDA streams; BACKWARD_PRE / BACKWARD_POST policies; set_modules_to_*_prefetch APIs."
+  },
+  {
+    authors: "PyTorch Team",
+    year: 2025,
+    title: "PyTorch Tensor Parallel Tutorial",
+    venue: "docs.pytorch.org",
+    url: "https://docs.pytorch.org/tutorials/intermediate/TP_tutorial.html",
+    note: "Sequence-parallel TP collectives. AllGather+ReduceScatter replaces AllReduce when activations are sequence-sharded."
+  },
+  {
+    authors: "NVIDIA NeMo / Megatron-Bridge Team",
+    year: 2025,
+    title: "Communication Overlap — Megatron-Bridge 0.2.0",
+    venue: "docs.nvidia.com",
+    url: "https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/training/communication-overlap.html",
+    note: "--overlap-grad-reduce, --overlap-param-gather, --tp-comm-overlap (bulk and pipelined modes); userbuffer mechanism from Transformer Engine."
+  },
+  {
+    authors: "Microsoft DeepSpeed Team",
+    year: 2024,
+    title: "DeepSpeed-Domino: Eliminating LLM Training Communication via Tensor-Slice Overlap",
+    venue: "github.com/microsoft/DeepSpeed",
+    url: "https://github.com/microsoft/DeepSpeed/blob/master/blogs/deepspeed-domino/README.md",
+    note: "Integration of Domino tensor-slice overlap into DeepSpeed. 1.3× over Megatron-LM reference run."
+  },
+  {
+    authors: "Lambda Labs",
+    year: 2025,
+    title: "Introducing NVIDIA SHARP on Lambda 1CC",
+    venue: "lambda.ai/blog",
+    url: "https://lambda.ai/blog/nvidia-sharp-on-lambda-1cc",
+    note: "IB-SHARP AllReduce gains of up to 1.6× over ring on a production 1024-GPU H100 cluster with NDR400 InfiniBand."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DeepEP: an Expert-Parallel Communication Library",
+    venue: "github.com/deepseek-ai/DeepEP",
+    url: "https://github.com/deepseek-ai/DeepEP",
+    note: "Optimised AlltoAll kernels for MoE dispatch and combine. Demonstrates that AlltoAll does not benefit from SHARP directly and requires bespoke kernels."
+  },
+  {
+    authors: "Austin, J. et al. (JAX team)",
+    year: 2024,
+    title: "All About Rooflines",
+    venue: "JAX Scaling Book",
+    url: "https://jax-ml.github.io/scaling-book/roofline/",
+    note: "Roofline framework adapted for distributed training. Source for the arithmetic-intensity-on-communication construction used here."
+  }
+]} />

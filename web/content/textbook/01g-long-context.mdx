@@ -1,0 +1,852 @@
+---
+slug: 01g-long-context
+title: Long-context extension as a pretraining phase
+description: How frontier labs go from 8k to 128k–10M context — staged continued pretraining, RoPE base-frequency adjustment, iRoPE, and the 2024–2026 effective-context gap.
+order: 17
+chapter: 16
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 38
+depends_on: [00c-positional-encodings, 00b-attention-variants]
+provides: [long-context, abf, ntk-aware, yarn-cpt, longrope, irope, effective-context]
+last_reviewed: 2026-05-11
+---
+
+## Orientation {#orientation}
+
+Frontier language models are advertised with context windows from 128 k tokens (DeepSeek-V3, Mistral Large 2) to 10 M tokens (Llama-4 Scout). None of these models were *pretrained from scratch* at their advertised length. The dominant production recipe in 2024–2026 is to train the bulk of the model at a short context — typically 4 k or 8 k tokens — and then run a dedicated **long-context phase** that progressively extends to the target length. This phase is sometimes called *long-context continued pretraining* (long-context CPT), *context extension*, or — in the broader 2025 vocabulary — *mid-training* (Wang et al., 2025, arXiv:2510.06826).
+
+The chapter is in nine sections. § [The phase](#phase) explains why long context is a CPT phase rather than a from-scratch design, and lays out the typical staged schedule. § [Position-encoding integration](#pe-integration) walks through how the four canonical RoPE-extension methods — Adjusted Base Frequency (ABF), NTK-aware base rescaling, YaRN with CPT, and LongRoPE — slot into a training recipe, and presents Llama-4 Scout's [iRoPE](#irope) as the 2025-era exception. § [Data for long-context training](#long-data) covers where natural long documents come from, how labs synthesise them, and the per-source upsampling rule from Fu et al. (2024). § [Loss-mask strategies](#loss-mask) discusses what to back-propagate when most tokens in a sequence are short-range "easy" continuations. § [Compute and inference tradeoffs](#tradeoffs) explains why the 8 k-pretrain + late-extension recipe wins on FLOPs and why deployment length increasingly diverges from training length. § [Effective vs nominal context](#effective-context) presents the eval gap measured by RULER, LOFT, ZeroSCROLLS, and Lost-in-the-Middle. § [Worked example](#worked-example) walks through an 8 k → 128 k recipe end-to-end with concrete numbers. § [Frontier landscape, May 2026](#frontier-landscape) tabulates the public state of long-context across Anthropic, OpenAI, Google DeepMind, Meta, DeepSeek, Alibaba, Mistral, and Moonshot. § [Chapter summary](#summary) closes with the five operational takeaways.
+
+<Callout variant="note" title="Notation and one disambiguation">
+The symbol $L$ is overloaded across this module: in earlier chapters it denotes per-token cross-entropy loss in nats. *In this chapter only*, $L$ refers to **context length** in tokens; where the discussion could be ambiguous, $L_{\text{ctx}}$ is used explicitly. Other symbols: $\theta_i$ is the per-dimension RoPE rotation frequency; $b$ is the RoPE base frequency (default $10\,000$); $d$ is the per-head dimension; $s = L_{\text{target}} / L_{\text{train}}$ is the scaling factor for context extension. The chapter assumes the math of RoPE, YaRN, and LongRoPE from [positional encodings](/textbook/00c-positional-encodings#rope); it covers the *training-side* recipe.
+</Callout>
+
+---
+
+## The phase: continued pretraining for length {#phase}
+
+<Figure caption="Staged continued-pretraining timeline. Most tokens are spent at the base context (commonly 8 k); short extension phases bump the context by 4×–8× at a time, each requiring a RoPE base-frequency adjustment (ABF, YaRN, or LongRoPE). Token budgets are illustrative of Llama-3.1-style recipes.">
+  <LongContextStaging />
+</Figure>
+
+### Why long context is a CPT phase and not a from-scratch design
+
+The reasons the field separated long-context training from base pretraining are economic, not architectural. Three forces are in play.
+
+The first is the quadratic cost of attention. For a transformer block processing a sequence of length $L_{\text{ctx}}$ with a per-token compute cost dominated by the attention matrix, doubling $L_{\text{ctx}}$ at fixed batch size doubles attention compute *per token*. A token trained at $L_{\text{ctx}} = 128 \text{ k}$ is roughly $16\times$ more expensive than one trained at $L_{\text{ctx}} = 8 \text{ k}$ once attention dominates. FlashAttention-2 (Dao, 2023; covered in [attention variants](/textbook/00b-attention-variants#flash-attention)) reduces the constant factor by recomputing softmax statistics in HBM-friendly tiles, but it does not change the asymptotic profile. At 8 k context, attention is roughly 10–15 % of total FLOPs for a 7 B–70 B dense model; at 128 k it is 50–70 %; at 1 M it dominates outright, which is why every published >1 M-context recipe relies on sparse, chunked, or sliding-window attention rather than dense quadratic attention.
+
+The second is GPU memory and pipeline imbalance. Even with FlashAttention, KV-cache and activation memory during training scale linearly with $L_{\text{ctx}}$; document-length skew across a microbatch then creates stragglers in tensor-parallel and pipeline-parallel shards. The Llama-3 report (Dubey et al., 2024, arXiv:2407.21783) notes a measurable slowdown when stepping the long-context phase up to 128 k purely from this imbalance.
+
+The third is the empirical observation that long-context capability can be added cheaply at the end of training. Llama-3.1 used approximately 800 B tokens of long-context CPT out of a 15.6 T total token budget — about 5 %. ProLong (Gao, Wettig, Yen, Chen, 2024, arXiv:2410.02660) extended Llama-3-8B to 512 k using roughly 5 % of Llama-3.1's long-context data budget, or about 40 B tokens. Cerebras's extension recipe (Cerebras blog, 2024) extended Llama-3-8B-Instruct to 32 k with approximately 10 B tokens, **80× less than Llama-3.1's 800 B budget** for a less aggressive target length. These numbers establish a clear empirical claim: long-context capability is *not* something that needs to be designed into the entire pretraining run; it is a capability that can be added in a final phase costing single-digit percentages of total compute.
+
+The fourth force is positional. With RoPE, the base-frequency parameter $b$ (default $10\,000$) determines the wavelengths of the rotational embeddings. As the chapter on [positional encodings](/textbook/00c-positional-encodings#rope-base-frequency) derives, the lowest-frequency dimension pair completes one rotation over $2\pi b$ position steps, and the model cannot reliably distinguish two positions separated by more than that. Raising $b$ before the long-context phase gives the model "room" to learn longer-range dependencies without catastrophic interference with the short-range positions it already represents (Xiong et al., 2023, arXiv:2309.16039). This single configuration change — a base bump from $10\,000$ to something like $5 \times 10^5$ — combined with a small CPT budget is the workhorse 2024–2026 recipe for everything from Llama-3.1 to ProLong.
+
+### Typical staging
+
+Almost every public report uses a **staged** schedule rather than a single jump from short to target length. The pattern is to extend in roughly geometric increments and check both long-range and short-range evals at each stage before advancing.
+
+<ComparisonTable
+  caption="Public staging schedules for long-context CPT. 'Stages' counts the number of distinct context lengths trained at; intermediate lengths are explicit where reported, approximate where the lab disclosed only the count."
+  columns={["Lab / model", "Base ctx", "Intermediate stages", "Final ctx", "Long-ctx CPT tokens", "Source"]}
+  rows={[
+    [
+      "Llama-3 / 3.1 (Meta, 2024)",
+      "8 K",
+      "6 successive stages 8K → 16K → ... → 128K",
+      "128 K",
+      "~800 B",
+      "Dubey et al., arXiv:2407.21783"
+    ],
+    [
+      "DeepSeek-V3 (Dec 2024)",
+      "4 K",
+      "4K → 32K → 128K (YaRN, 1 000 steps each)",
+      "128 K",
+      "~2 000 steps total",
+      "DeepSeek-AI, arXiv:2412.19437"
+    ],
+    [
+      "Qwen2.5-1M (Jan 2025)",
+      "4 K",
+      "4K → 32K → 256K",
+      "256 K trained; 1 M deployed",
+      "progressive; not fully disclosed",
+      "Qwen Team, Qwen2.5-1M Technical Report"
+    ],
+    [
+      "ProLong (Llama-3-8B base, Oct 2024)",
+      "8 K",
+      "8K → 64K → 512K",
+      "512 K",
+      "~40 B (≈ 5% of Llama-3.1's budget)",
+      "Gao et al., arXiv:2410.02660"
+    ],
+    [
+      "Llama-4 Scout (Apr 2025)",
+      "256 K trained",
+      "256K mid-training, length generalisation to 10 M at inference (iRoPE)",
+      "10 M (advertised)",
+      "'mid-training phase' (budget not split out)",
+      "Meta AI Llama 4 blog, Apr 2025"
+    ]
+  ]}
+/>
+
+There are two reasons to stage rather than jump.
+
+The first is the *curriculum effect*. Each stage lets the model adapt to the new length distribution before the next extension. Skipping straight to 128 k from an 8 k base tends to produce instability — loss spikes during the first batches at the new length, and longer recovery time on short-context evals. The Llama-3 paper documents this directly: "the context length was increased in increments until the model … solved needle-in-the-haystack queries with as close to 100 % accuracy as possible."
+
+The second is *per-stage validation*. Labs check NIAH (needle-in-a-haystack) accuracy and short-context evals (MMLU, GSM8K, code) after each stage and only advance once both have recovered. The discipline is necessary because the same training procedure that adds long-range capability degrades short-range capability if pushed too hard. A failed validation at stage $k$ produces useful information — that stage $k$ needs more tokens, or a different data mixture — without the cost of having committed the rest of the run.
+
+<Sidenote>The exact intermediate stage lengths for Llama-3.1 are not enumerated in the paper, which says only "6 stages from 8 K to 128 K". Daniel Han's community analysis on X and Oxen.ai's Arxiv Dive reconstruct the lengths as 16 K → 32 K → 48 K → 64 K → 96 K → 128 K, but this is interpolation from public commentary, not from Meta's primary disclosure. The chapter uses these numbers as illustrative, not authoritative.</Sidenote>
+
+---
+
+## Position-encoding integration {#pe-integration}
+
+The previous chapter on [positional encodings](/textbook/00c-positional-encodings#context-extension) covers the *math* of every major RoPE-extension method. This section discusses *how each method interacts with continued pretraining*. The four canonical methods are ABF, NTK-aware base rescaling, YaRN with CPT, and LongRoPE. Llama-4 Scout's iRoPE is a fifth, structurally different option that is best understood as a separate architectural choice rather than a continuation of the RoPE-extension lineage.
+
+### Adjusted Base Frequency (ABF) {#abf}
+
+**Reference: Xiong, Liu, Wu, Wang, Zhang et al., "Effective Long-Context Scaling of Foundation Models", arXiv:2309.16039, NAACL 2024.**
+
+ABF is the dominant production recipe. The method is to *increase the RoPE base $b$* before continued pretraining at the target length. There is no architectural change; no per-dimension blending; no inference-time temperature adjustment. The recipe is a one-line configuration flip followed by CPT on long data.
+
+Recall from [the RoPE math](/textbook/00c-positional-encodings#rope) that the rotational frequencies are $\theta_i = b^{-2i/d}$ for $i = 0, 1, \ldots, d/2 - 1$, with the original Llama default $b = 10\,000$. Xiong et al. found that going from $b = 10\,000$ to $b = 5 \times 10^5$ — a $50\times$ increase — was sufficient to extend Llama-2 from 4 k to 32 k after a small amount of CPT. Increasing the base slows the angular rotation of every dimension. The low-frequency components, which carry long-range positional information, now have wavelengths much longer than the original training context; this gives the model headroom to learn dependencies at the new length scale without catastrophic interference with short-range positions. Xiong et al. show empirically that ABF + CPT beats position interpolation (Chen et al., 2023, arXiv:2306.15595) at the same CPT budget, while preserving short-context performance substantially better.
+
+The dominant production base-frequency values reported across the field are summarised below. The pattern is that labs choose *empirically*, often picking values well above any theoretical lower bound. There is no single principled formula for the choice; the discipline is to pick a base, run an ablation at small scale, and use what works.
+
+| Model | Final context | RoPE base used | Source |
+|---|---|---|---|
+| Llama-2 (original) | 4 k | $10\,000$ | Touvron et al., arXiv:2307.09288 |
+| Llama-2-Long (Xiong et al.) | 32 k | $5 \times 10^5$ | arXiv:2309.16039 |
+| Llama-3 / 3.1 (8 k base → 128 k final) | 128 k | $5 \times 10^5$ | arXiv:2407.21783 |
+| Qwen2.5 (32 k native) | 32 k | $10^6$ | arXiv:2412.15115 |
+| Qwen2.5-1M (256 k training) | 1 M extrapolated | up to $10^7$ | Qwen2.5-1M tech report |
+| Cerebras Llama-3 extension | 32 k | $5 \times 10^5 \to 8 \times 10^6$ stage-wise | Cerebras blog 2024 |
+
+**Why ABF is the dominant recipe.** It requires zero architectural changes; it is a one-line config flip; and combined with a small CPT budget it matches or beats more elaborate schemes at the 128 k regime. The dominant frontier open-weight long-context models — Llama-3.1, Qwen2.5, ProLong, and the Cerebras-extended variants — all use ABF as their first move. YaRN and LongRoPE are added on top when the target length exceeds what ABF alone delivers, but they are extensions of, not replacements for, the ABF base bump.
+
+### NTK-aware scaling {#ntk-aware}
+
+**Reference: `bloc97`, Reddit r/LocalLLaMA, HuggingFace TGI Issue #512, June 30 2023; formalised in YaRN appendix.**
+
+NTK-aware base rescaling is sometimes conflated with ABF in the literature because both raise the RoPE base $b$ before extending the context. They are distinct. ABF picks a new base *empirically* (often well above any closed-form bound); NTK-aware scaling supplies a *formula* for what base to use as a function of the desired extension ratio.
+
+The NTK-aware formula, drawing on Neural Tangent Kernel theory and originating in bloc97's community post, is:
+
+$$
+b' = b \cdot s^{\, d/(d-2)}, \qquad s = \frac{L_{\text{target}}}{L_{\text{train}}},
+$$
+
+where $d$ is the per-head dimension. For $d = 128$ (the standard Llama-2 / Llama-3 head dimension) the exponent $d/(d-2) = 128/126 \approx 1.0159$, so to first approximation $b' \approx b \cdot s$.
+
+<Callout variant="warning" title="The NTK-aware formula is not the ABF recipe">
+The brief originally cited the formula $s = (L_{\text{new}}/L_{\text{train}})^{|d/(d-2)|}$ as Xiong et al.'s ABF. This is incorrect. The formula above is the **NTK-aware** heuristic (bloc97, with formalisation by Peng et al. in the YaRN paper, arXiv:2309.00071). Xiong et al.'s ABF is not a formula at all — it is the empirical choice of a new base value (e.g. $5 \times 10^5$), validated by ablation, not derived from $s$ and $d$. In production, the NTK-aware formula is treated as a useful *lower bound* on the base required for length $L_{\text{target}}$ in the *training-free* regime; once CPT is added, larger empirical bases work better. The two methods are best taught as related but distinct.
+</Callout>
+
+A concrete check: for an 8 k → 128 k extension, $s = 16$, $b = 10\,000$, the NTK-aware formula gives $b' \approx 16 \cdot 10\,000 \cdot 16^{2/126} \approx 1.6 \times 10^5$. In practice, Meta used $b' = 5 \times 10^5$ for Llama-3 — about $3\times$ higher than the NTK lower bound. This margin is not wasted: the NTK formula is derived for the *zero-shot* setting (extend the context with no fine-tuning, accept some perplexity degradation); with CPT, the empirically optimal base sits well above the formula's prediction.
+
+NTK-aware scaling appears in production primarily through its descendant *Dynamic NTK*, in which the scaling factor $s$ is computed at inference time from the actual input length and applied only when the input exceeds the training window. Several inference frameworks support Dynamic NTK as a drop-in extension; it provides 2–4× context extension with no training cost at modest perplexity penalty. Beyond roughly 4× the model degrades and fine-tuning becomes necessary.
+
+### YaRN with continued pretraining {#yarn-cpt}
+
+**Reference: Peng, Quesnelle, Fan, Shippole, "YaRN: Efficient Context Window Extension of Large Language Models", arXiv:2309.00071, ICLR 2024.**
+
+YaRN combines two ideas that the [positional encodings chapter](/textbook/00c-positional-encodings#yarn) derives in full. First, *NTK-by-parts* interpolation applies a smooth ramp function $\gamma(r)$ to blend three regimes — full extrapolation for high-frequency dimensions, full interpolation for low-frequency dimensions, and a smooth blend in between. Second, an *attention-temperature correction* of the form $\sqrt{1/t} = 0.1 \ln(s) + 1$ sharpens the softmax distribution to compensate for the angular-spread compression introduced by frequency rescaling.
+
+YaRN with CPT is the standard recipe at DeepSeek and at Alibaba for context above 32 k. DeepSeek-V3 (DeepSeek-AI, 2024, arXiv:2412.19437) uses YaRN with $s = 40$, $\alpha = 1$, $\beta = 32$ for its 4 K → 32 K → 128 K extension, in two phases of roughly 1 000 steps each. Qwen2.5 uses YaRN combined with Dual Chunk Attention (DCA) to reach 128 k from a 32 k native window; Qwen3-Coder uses YaRN to extend to 1 M (Qwen Team, 2025).
+
+The headline claim of the YaRN paper is *10× fewer tokens and 2.5× fewer training steps* than position interpolation to reach equivalent perplexity at the target length. For the 7 B-class base model of the paper, that translates to roughly 400 fine-tuning steps at 64 k to reach a perplexity of 2.37 at 131 k context. The advantage shrinks at the 128 k frontier — ABF + CPT is competitive at modest 16× extension — but YaRN is the dominant recipe whenever the extension ratio exceeds roughly 32× or the target perplexity is tight.
+
+### LongRoPE {#longrope}
+
+**Reference: Ding, Zhang, Zhang, Xu, Shang, Xu, Yang, Yang, "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens", arXiv:2402.13753, Microsoft Research, February 2024.**
+
+LongRoPE generalises YaRN's per-dimension treatment. Where YaRN derives the per-dimension rescaling from a fixed ramp function, LongRoPE *searches* over per-dimension factors using an evolutionary algorithm, optimising long-context perplexity on a held-out set without any fine-tuning. The search exploits two non-uniformities ignored by YaRN: different dimensions need different scaling, and the first few positional indices (the beginning of each sequence) behave differently from positions in the middle of the sequence.
+
+LongRoPE's progressive recipe is:
+
+1. Apply the search-derived non-uniform factors at the base model's training length, yielding an 8× context extension *without fine-tuning*.
+2. Fine-tune at 256 k context using these factors (roughly 1 000 gradient steps).
+3. Apply a second interpolation step to reach 2 048 k = 2 M.
+4. Re-adjust the rescaling at the original short-context window to restore short-context performance.
+
+The combined recipe extends LLaMA-2 7 B and Mistral 7 B to 2 M tokens of advertised context. In production, LongRoPE is the engine behind Phi-3-medium-128k (Microsoft, 2024). LongRoPE2 (Shang et al., 2025, arXiv:2502.20082) refines the search criterion to use *needle-driven perplexity* — perplexity weighted toward retrieval-relevant positions rather than uniform sequence perplexity — and adds mixed-context-window training to preserve short-context performance by construction. LongRoPE2 claims 80× fewer training tokens than Meta's Llama-3.1 extension at comparable long-context quality on Llama-3-8 B, but the comparison is to Llama-3.1's full 800 B budget at a more aggressive context target than LongRoPE2 attempts.
+
+### iRoPE (Llama-4 Scout) {#irope}
+
+**Reference: Meta AI, "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation", Meta AI blog, April 5 2025.**
+
+Llama-4 Scout's 10 M-token advertised context is the most extreme deployment number on any frontier model as of May 2026. The recipe is structurally different from ABF-and-CPT, and the distinction is important.
+
+Scout was *pretrained and post-trained at 256 k tokens*. The 10 M number is a **deployment length** reached by length generalisation at inference time — that is, the model is *not* trained on 10 M-token sequences at any point. The recipe Meta describes has three components, collectively branded *iRoPE* (where the "i" carries both *interleaved* and *infinite*):
+
+1. **Interleaved positional encoding.** Three out of every four attention layers use RoPE with chunked (sliding-window) attention; every fourth layer uses **NoPE** — no positional encoding — with full causal attention. The intuition is that the chunked-RoPE layers handle precise local ordering at limited cost, while the NoPE layers aggregate global semantic context across the whole sequence without any positional bias that would saturate or fail at extreme lengths.
+2. **Chunked attention.** The RoPE layers attend only within a fixed-size window, capping the effective per-layer attention cost at a constant independent of the total sequence length. This is what allows inference at 10 M to remain tractable; without chunking the quadratic cost would be prohibitive.
+3. **Inference-time temperature scaling.** Attention logits are scaled by a temperature factor at inference, sharpening the distribution at lengths beyond the training context.
+
+<Callout variant="warning" title="Training length ≠ deployment length is now a recurring 2025–2026 pattern">
+Scout's 256 k-trained, 10 M-deployed is the most extreme case but not the only one. Qwen2.5-1M is trained at 256 k and deployed at 1 M (3.9× extrapolation). LongRoPE-based Phi-3 is fine-tuned at 256 k and advertised at 2 M. The chapter's recommendation is to read advertised context numbers in three parts: *training length*, *evaluation length*, and *deployment length*. These can differ by an order of magnitude or more. The marketing surface conflates all three; the technical reports usually disclose only two.
+</Callout>
+
+Meta has not disclosed the chunk size used in Scout's RoPE layers, the ratio of RoPE to NoPE layers (community analysis converges on 3:1 but this is not confirmed), or the specific inference-time temperature schedule. The blog post is the only primary source; the recipe is therefore at the same disclosure level as the closed-lab recipes discussed in [the landscape section](#frontier-landscape).
+
+---
+
+## Data for long-context training {#long-data}
+
+### Where do long documents come from?
+
+A 128 k-token training example corresponds to roughly 100 k English words — far longer than the average web page, social media post, or news article. Truly long natural documents are scarce, so labs curate aggressively and synthesise where necessary.
+
+The natural long sources fall into five categories. **Books** (Project Gutenberg, the books portion of The Pile or SlimPajama, commercial book corpora) typically run 80 k–150 k tokens and are the workhorse for the 32 k–128 k range. **Long academic papers** (full-text arXiv, survey papers especially) fall in the 5 k–20 k range and feed the 8 k–32 k stage. **Code repositories**, concatenated by directory traversal or import order, produce 20 k–500 k-token examples and are the largest single source ProLong, Stable Code, and Llama-4 mid-training rely on. **Long-form fiction**, especially fan-fiction archives such as Archive of Our Own, provides high-coherence narrative spans. **Legal documents, scientific monographs, and government reports** round out the domain coverage and matter for downstream specialised behaviour at long context.
+
+### Synthetic construction
+
+A widespread trick is to deliberately *construct* documents that require long-range attention. The cheapest version is to concatenate short documents, but Fu et al. (2024, arXiv:2402.10171) report that mechanical concatenation does not reliably produce the long-distance referential patterns that natural long documents contain. The model trained on concatenation learns to attend to nearby tokens within each sub-document and ignore the seams; nothing in the training signal demands long-range reference.
+
+More sophisticated approaches build explicit long-range structure. *Long-distance referral synthesis* (OpenReview, 2024) inserts entities and events early in a synthetic document and refers back to them dozens of thousands of tokens later. *Packed needle-in-haystack* data takes a fact $F$, inserts it early, and asks about $F$ much later, training the model on retrieval-style behaviour at the cost of overfitting to that exact pattern if used too heavily. *Multi-document QA construction* and *retrieval-augmented fine-tuning* (the RAFT recipe from NVIDIA's ChatQA 2, applied at long context) build long-input documents from concatenated retrieved passages with a question at the end, training the model to find and integrate distributed information.
+
+### The Fu et al. (2024) per-source upsampling rule
+
+The most important data-engineering finding for long-context CPT is from Fu, Yang, Hu, Sun, Liu (2024), *"Data Engineering for Scaling Language Models to 128K Context"*, arXiv:2402.10171. Three claims:
+
+1. **Five hundred million to five billion tokens of well-curated long data is sufficient to enable 128 k retrieval ability** — far less than the >100 B-token budgets that some publicly reported recipes use, suggesting that data quality dominates raw token count above a modest threshold.
+
+2. **Naive upsampling of long documents distorts the domain mix.** Books are over-represented at long lengths; if a recipe simply upsamples "everything >100 k tokens", it ends up training on a books-heavy mixture and hurts code and math performance at long context. This is the long-context analogue of the within-domain proportion problem discussed in the data-mixing chapter.
+
+3. **Upsample within each domain.** Long books, long code, long arXiv each get their own upsampling factor designed to preserve the original domain ratio while increasing length within domain. The recipe is: identify long examples in each source, upsample them in proportion, mix sources at the original pretraining ratio.
+
+ProLong (Gao et al., 2024) confirmed and refined this. Two recommendations from the ProLong recipe: code repositories and books are the best long sources, and training sequence length should *exceed* the eval context — train at 512 k to evaluate well at 128 k, because the model's effective context at inference is consistently shorter than its training context (a phenomenon quantified in the [effective vs nominal context](#effective-context) section).
+
+### The packed-needle vs diversity tradeoff
+
+A 128 k training document is one example per batch slot. A batch of 1 M tokens at $L_{\text{ctx}} = 128 \text{ k}$ has only 8 documents in it, against 1 024 documents at $L_{\text{ctx}} = 1 \text{ k}$. This $128\times$ collapse in per-batch document diversity has several consequences: gradient signal is less varied, the effective sample size for optimisation purposes is smaller, and the risk of overfitting to a single document's idiosyncrasies grows.
+
+The mitigations are standard. **Larger batches help** by increasing the number of documents per gradient step, at the cost of memory and effective learning rate adjustment. **Mixing long and short documents in the same batch**, with appropriate padding and document masking, restores diversity. **Document-level loss masking and packing** — treating multiple shorter documents in a single sequence as separate examples for attention purposes — is the standard packing strategy and is supported directly by FlashAttention's variable-length kernel (`flash_attn_varlen_func`); see [attention variants](/textbook/00b-attention-variants#flash-attention) for the kernel API.
+
+### Data-mixture proportions in production
+
+The publicly disclosed mixes converge on roughly *25 % long-context, 75 % normal-length pretrain*, with the long-context portion upsampled per-source.
+
+| Recipe | Long-context data mix |
+|---|---|
+| Llama-3.1 long-context CPT | ~25 % natural long-context (books, code) + ~75 % normal-length pretrain data |
+| Qwen2.5 long-context stage | 75 % sequences at the current max length + 25 % shorter sequences (Qwen2.5 tech report) |
+| Fu et al. 2024 recommended mix | Per-source length-upsampled SlimPajama, preserving domain ratio |
+| ProLong | Code repos + books for long; high-quality short data retained throughout |
+| DeepSeek-V3 | Two-phase YaRN extension; data composition not fully disclosed |
+
+The 25/75 split is not magic. The reason it appears repeatedly is that it preserves enough short-context exposure to prevent regression on short-context benchmarks (MMLU, GSM8K) while providing enough long-context examples that the model develops the long-range attention patterns. Recipes that go above ~40 % long-context exposure tend to regress on short-context evals; recipes below ~15 % tend to fail NIAH at the target length.
+
+---
+
+## Loss-mask strategies {#loss-mask}
+
+When training at $L_{\text{ctx}} = 128 \text{ k}$, *which positions get loss?* Most recipes default to next-token cross-entropy on every position, but several variations exist and are worth understanding.
+
+### Standard next-token loss on every position
+
+The default is the simplest: predict every position, average loss over all positions. For book-like data this is well-behaved because the model receives both short-range continuation losses (predicting the next word in a paragraph) and long-range coherence losses (predicting how a chapter resolves a plot point set up earlier). The training signal is dense and unbiased.
+
+### Loss only on long-range positions
+
+A heuristic some recipes use is to zero the loss for the first $L_0$ positions of each example — say, the first 4 k or 8 k tokens — and only train on positions beyond $L_0$. The intent is to force the gradient signal toward long-range behaviour and away from short-range continuations the model has already learned. This is mentioned in passing in several recipes (the Llama-3 paper notes the importance of long-range loss signal during the long-context phase) but is not universally adopted, and the Llama-3 paper does not explicitly state that it zeroes early positions. The risk is short-context regression: a model that never receives loss on positions 1–4 k may forget how to continue them well. The mitigation is to mix in short-only documents (without masking) in the same batch, restoring short-range signal without the long-document overhead.
+
+### Document boundary masking
+
+When packing multiple documents into one sequence to use compute efficiently, attention masks must respect document boundaries. Otherwise, tokens in document 2 attend to noise from document 1, training the model on cross-document attention patterns that have no analogue at inference time. FlashAttention-2's variable-length API handles this cleanly: each document is identified by its length, and the attention kernel computes only within-document attention. ProLong's training code explicitly notes support for "FlashAttention-2's variable-length attention" and "in-batch length-sorting dataloader". The combined effect is that a packed sequence of $L_{\text{ctx}} = 128 \text{ k}$ can contain (say) one 80-k-token book, one 30-k-token code repository, and a handful of 1–5-k-token documents, all attending only within their own boundaries, at roughly the same FLOP cost as one 128-k example.
+
+### Instruction masking for the long-SFT phase
+
+For supervised fine-tuning at long context — typically applied *after* the long-context CPT phase as part of post-training — the standard pattern is to mask the loss on the prompt (instruction, retrieved context, system messages) and compute loss only on the response. ProLong's recipe and NVIDIA's ChatQA 2 recipe both apply this. The Cerebras long-SFT stage uses 77.5 % synthetic Cerebras data and 22.5 % open-source long-context datasets, all with instruction-style masking. The reasoning is identical to short-context SFT: the model has nothing to learn by predicting tokens it does not produce at inference.
+
+### Z-loss and stability at long context
+
+At very long context, attention logits can grow large enough to produce numerical issues in the softmax. The softmax over a long sequence concentrates probability mass; with large positive logits, $e^{\text{logit}}$ can overflow before the subtraction in the log-sum-exp normalisation. The standard mitigation is **z-loss** — a small penalty on the log-sum-exp of the softmax — which keeps logits bounded. This belongs to [stability and annealing](/textbook/01h-annealing-and-stability), but it is worth flagging here because the failure mode is much more common at $L_{\text{ctx}} \geq 64 \text{ k}$ than at shorter context.
+
+---
+
+## Compute and inference tradeoffs {#tradeoffs}
+
+### The compute accounting
+
+Total pretraining FLOPs is approximately
+
+$$
+\text{FLOPs} \approx 6 N D + \text{attention overhead},
+$$
+
+where $N$ is parameter count, $D$ is token count, and the attention overhead per token grows quadratically with $L_{\text{ctx}}$. For a typical 70 B dense model:
+
+- A 14 T-token main pretraining run at $L_{\text{ctx}} = 8 \text{ k}$ has attention as ~10–15 % of total compute.
+- An 800 B-token long-context CPT phase ramping from 8 k to 128 k has attention as ~50 % of the *phase's* compute, but the phase is only ~5 % of total tokens, so total compute increase is ~5–8 % of the budget.
+
+This is why the 8 k-pretrain + late-extension recipe dominates: long-context capability arrives at a marginal compute cost of single-digit percentages of total budget. A from-scratch 128 k pretraining run, by contrast, would pay the 50 % attention tax on *every* token, multiplying total training FLOPs by roughly $1.5\times$ — for the same final long-context capability, at best. The economic logic is overwhelming.
+
+### Training length ≠ deployment length
+
+A 2024–2026 trend is to train at $L_{\text{train}}$ and deploy at $L_{\text{deploy}} > L_{\text{train}}$ via extrapolation. Three mechanisms are in production use:
+
+- A higher RoPE base at inference than at training (NTK-aware, Dynamic NTK at serve time).
+- YaRN-style temperature scaling computed at inference time as a function of the actual sequence length.
+- Sliding-window or chunked attention applied at inference, with positional encodings designed to extrapolate (Llama-4's iRoPE).
+
+The most consequential examples are listed in the [landscape section](#frontier-landscape). The pattern complicates the "context length" claim in marketing material: *trained*, *evaluated*, and *advertised* numbers are routinely different. Scout's 256 k training / 10 M deployed is the most extreme case; Qwen2.5-1M's 256 k training / 1 M deployed and LongRoPE Phi-3's 256 k training / 2 M deployed are the same pattern at smaller ratios.
+
+### Inference-time costs
+
+Even with sub-quadratic training tricks, *serving* a long-context request is expensive. KV-cache memory scales linearly with $L_{\text{ctx}}$ — a 70 B dense model at 128 k uses roughly 30 GB of KV cache, more than the model's own weight cache at 16-bit precision. Prefill latency scales quadratically with $L_{\text{ctx}}$ unless the model uses sparse attention. DeepSeek-V3.2's DeepSeek Sparse Attention (DSA), introduced in September 2025, is a serving-side optimisation that reduces the quadratic cost without retraining (DeepSeek API blog, 2025); the Llama-4 chunked-attention recipe is the corresponding design-time choice.
+
+Pricing reflects these costs. Anthropic charged a price premium for >200 k contexts on Claude Sonnet 4 (1 M beta) when the feature launched in August 2025. The premium was removed for Claude Sonnet 4.6 and Opus 4.6 in late 2025 (Anthropic context-windows docs). OpenAI's GPT-5.5 1.05 M context (launched late 2025) carries a price premium for inputs above 256 k.
+
+---
+
+## Effective vs nominal context {#effective-context}
+
+### The eval gap
+
+"Trained to 1 M" does *not* mean "uses 1 M effectively". This is the most important practical takeaway of the chapter. A model can have a 1 M-token context window in the sense that it accepts a 1 M-token input without crashing, yet retrieve information from that input only over the first 32 k tokens. The discipline of measuring *effective context* — the length at which the model still performs the task — is what separates an advertised number from a usable one.
+
+### RULER (Hsieh et al. 2024)
+
+The canonical synthetic benchmark for the distinction is **RULER**, Hsieh, Bai, Chen, Pang, Awadalla, Vyas (2024), arXiv:2404.06654. RULER extends needle-in-a-haystack to 13 tasks across four categories: retrieval (single-needle, multi-keys, multi-values, multi-queries), multi-hop tracing (variable tracking), aggregation (common-words extraction, frequent-words extraction), and question answering (SQuAD-based and HotpotQA-based variants embedded in long context).
+
+RULER defines *effective context* as the longest length at which the model's score is at least Llama-2-7B's score at 4 k context (85.6 %). This threshold is somewhat arbitrary but useful as a fixed reference point. The numbers from the original paper, illustrative of the eval gap:
+
+| Model | Claimed $L_{\text{ctx}}$ | RULER effective $L_{\text{ctx}}$ |
+|---|---|---|
+| Gemini-1.5-Pro | 1 M | >128 K |
+| GPT-4 | 128 K | 64 K |
+| Llama-3.1-70B | 128 K | 64 K |
+| Llama-3.1-8B | 128 K | 32 K |
+| Qwen2-72B | 128 K | 32 K |
+| Command-R+ | 128 K | 32 K |
+| Yi-34B | 200 K | 32 K |
+| GLM4-9B | 1 M | 64 K |
+| Mixtral-8x22B | 64 K | 32 K |
+| Phi-3-medium | 128 K | 32 K |
+| Mistral-v0.2 | 32 K | 16 K |
+| LWM-7B | 1 M | &lt;4 K |
+
+The takeaway is sharp. In the original RULER paper, the typical open model's effective context is **one half to one quarter of its advertised context**. The frontier of mid-2024 (Gemini-1.5-Pro) reached >128 k effective; the headline-1 M models GLM4-9B and LWM-7B reached 64 k and &lt;4 k respectively. The gap between marketing and capability is large enough that the only safe practice for downstream users is to evaluate at the relevant length, not to trust the advertised number.
+
+### Lost in the Middle (Liu et al. 2023)
+
+Liu, Lin, Hewitt, Paranjape, Bevilacqua, Petroni, Liang, *"Lost in the Middle"*, TACL 2024, arXiv:2307.03172. The finding: even at advertised context lengths, performance is **highest when relevant information is at the start or end of the input, and drops in the middle**. The shape is U-curved across models and tasks, and it is robust enough that several 2024–2026 production systems include retrieval-time re-ranking specifically to place the most relevant retrieved passages at the *ends* of the context window. The mechanism is partly an artefact of training-data composition (instruction-following data typically places the key information near the start and end) and partly an attention-pattern phenomenon (positional attention bias). The CREAM paper (Wu et al., 2024, arXiv:2406.07138) introduces middle-focused positional encoding as a partial mitigation, but the lost-in-the-middle effect remains observable in every frontier model as of May 2026.
+
+### LOFT (Lee et al. 2024)
+
+Lee, Chen, Ladhak, Hauser, Khattab, Yu et al., *"LOFT: Can Long-Context Language Models Subsume Retrieval, RAG, SQL, and More?"*, arXiv:2406.13121, Google DeepMind, 2024. LOFT is the closest thing to a real-world long-context benchmark. It covers six task categories and 35 datasets, with inputs up to 1 M tokens, testing whether a long-context model can directly subsume retrieval, retrieval-augmented generation, structured data querying, and multi-hop reasoning *without* an external retriever. Findings: long-context language models can rival dedicated retrievers and RAG pipelines on retrieval-style tasks without explicit training for retrieval, but they still fail on compositional reasoning at the longest lengths. The LOFT result is the strongest public evidence that long-context capability is a meaningful substitute for retrieval in many practical tasks — and the strongest public evidence that it is not yet a substitute for retrieval in compositional ones.
+
+### ZeroSCROLLS (Shaham et al. 2023)
+
+Shaham, Ivgi, Efrat, Berant, Levy, *"ZeroSCROLLS"*, EMNLP 2023, arXiv:2305.14196. Ten tasks: six from SCROLLS plus four new ones (query-based summarisation, multi-hop QA, sentiment aggregation, book-chapter ordering). ZeroSCROLLS tests *information aggregation* across long inputs, complementing RULER's retrieval focus. The tasks where models still struggle most as of May 2026 are sentiment aggregation (which requires integrating signal across many reviews) and book-chapter ordering (which requires global structural reasoning). The benchmark is older but remains the canonical aggregation-style long-context test.
+
+### Why the gap exists
+
+Several mechanistic explanations partly overlap. **Training data length distribution** is the most direct: even with upsampling, the absolute volume of natural >32 k examples is small. The model sees few examples of true long-range dependency during the long-context phase, so its capability at the longest lengths is undertrained. **Attention dilution**: softmax over many tokens spreads probability mass; relevant tokens receive low scores in raw terms. Lost-in-the-middle is the empirical signature of attention dilution combined with positional training bias. **Positional generalisation**: RoPE-based methods generalise imperfectly beyond the training length; even with ABF, a model trained on 128 k may have wrong inductive biases for 1 M, and Scout's iRoPE recipe is specifically a response to this failure mode. **Post-training mismatch**: SFT and RLHF data is mostly short-context; the model's long-context capability can degrade during alignment unless explicitly preserved, which is the central finding of NVIDIA's ChatQA 2 work.
+
+---
+
+## Worked example: 8 k → 128 k {#worked-example}
+
+This section walks through a concrete recipe for extending a 7 B-class dense transformer from 8 k to 128 k context, modelled on Llama-3.1 with simplifications. All numbers are illustrative; production runs would tune each parameter via small-scale ablations.
+
+### Setup
+
+The base model is a 7 B-class dense transformer with RoPE, head dimension $d = 128$, pretrained at $L_{\text{ctx}} = 8 \text{ k}$ with base $b = 10\,000$ on $\sim 10$ T tokens. The target is $L_{\text{ctx}} = 128 \text{ k}$.
+
+### Step 1: adjust the RoPE base
+
+The NTK-aware lower bound for $s = L_{\text{target}}/L_{\text{train}} = 16$ is
+
+$$
+b' \approx b \cdot s^{d/(d-2)} = 10\,000 \cdot 16^{128/126} \approx 10\,000 \cdot 16.36 \approx 1.64 \times 10^5.
+$$
+
+The empirical recipe, matching Llama-3.1 and the ABF paper, is to go higher: $b' = 5 \times 10^5$. Hold all other model weights fixed; only the RoPE configuration changes.
+
+### Step 2: staged CPT schedule
+
+Six stages, geometric progression, total ~800 B tokens:
+
+| Stage | $L_{\text{ctx}}$ | Tokens at this stage |
+|---|---|---|
+| 1 | 16 K | ~80 B |
+| 2 | 32 K | ~130 B |
+| 3 | 48 K | ~130 B |
+| 4 | 64 K | ~150 B |
+| 5 | 96 K | ~150 B |
+| 6 | 128 K | ~160 B |
+| **Total** | | **~800 B** |
+
+(The exact stage points are interpolated from public commentary; Meta's Llama-3 paper specifies "6 stages from 8 K to 128 K" without enumerating each.)
+
+Per-stage validation: NIAH must be >99 % accurate at the current stage's length, and short-context evals (MMLU, GSM8K, HumanEval) must be within ~0.5 % of the base model before advancing. A failing validation triggers more tokens at the current stage, not a jump to the next.
+
+### Step 3: data composition per stage
+
+- **25 %** natural long-context at or near the stage's max length: long books, long arXiv papers, repository-concatenated code, archived long fiction.
+- **75 %** normal-length pretrain data with the same domain mix as main pretraining: web, code, math, multilingual.
+- Within the long-context portion, per-source length-upsampling (long books, long code, long arXiv each scaled independently) to preserve domain balance per Fu et al. (2024).
+
+### Step 4: loss and mask
+
+Standard next-token cross-entropy on all positions. Document-boundary attention masking via FlashAttention varlen when packing multiple long documents into one sequence. Optional: zero the first 4 k positions' loss to push gradient signal toward long-range behaviour, mixed with short-only documents to prevent short-context regression.
+
+### Step 5: optimiser and LR schedule
+
+Continue from the base model's final learning rate (e.g. $3 \times 10^{-5}$). No re-warmup, or a very short ~1 B-token warmup. Cosine or constant-with-cooldown to 10 % of peak by the end of stage 6; final 40 M tokens linearly anneal to zero. This phase typically *overlaps* with the [annealing](/textbook/01h-annealing-and-stability) phase — the long-context extension and the final cooldown happen together, with the highest-quality data at the longest context length appearing in the final batches. See [schedules and batch](/textbook/01e-schedules-and-batch) for the broader LR-schedule context.
+
+### Step 6: compute estimate
+
+Naive estimate without attention overhead: $\sim 800 \text{ B tokens} \cdot 6 \cdot 7 \text{ B params} \approx 3.4 \times 10^{22}$ FLOPs. With attention's quadratic overhead ramping at higher stages, the actual total is roughly $4$–$5 \times 10^{22}$ FLOPs, or ~5 % of the $\sim 10^{23}$–$10^{24}$ FLOPs spent on main pretraining. In wall-clock on a 1 024-H100 cluster, this is a few weeks.
+
+### Step 7: final evaluation
+
+- **NIAH (single-needle):** target 100 % across 1 k–128 k.
+- **RULER 13-task suite:** target ≥ 85.6 % (the effective-context threshold) at 128 k.
+- **Lost-in-the-Middle:** verify the U-shape is mitigated by checking accuracy with needle placed at positions 25 %, 50 %, 75 % of the context.
+- **Short-context evals:** MMLU, GSM8K, HumanEval within ~0.5 % of base.
+- **ZeroSCROLLS** for aggregation tasks.
+
+A model trained *from scratch* at 128 k would cost roughly $10\times$ more FLOPs than this recipe, while typically achieving comparable or only modestly better long-context evals. This is the fundamental economic reason the staged-CPT recipe has displaced from-scratch long-context training across the field.
+
+---
+
+## Frontier landscape, May 2026 {#frontier-landscape}
+
+The table below summarises advertised context lengths across the major model families as of May 11 2026. Two repeated caveats apply: closed-lab recipes (Anthropic, OpenAI, Google) are publicly announced as context-length numbers but the training-side recipe (staging, base frequency, token budget) is not disclosed; and several models advertise a *deployment* length that exceeds their *training* length, sometimes by an order of magnitude.
+
+<ComparisonTable
+  caption="Long-context status of major model families, May 11 2026. Recipe details are 'publicly announced, undisclosed' where the lab has not published a technical report comparable to Llama-3's. Source URLs are provided per row."
+  columns={["Lab", "Model", "Year", "Advertised context", "Training-side recipe", "Source"]}
+  rows={[
+    [
+      "Anthropic",
+      "Claude 3 / 3.5 / 3.7 family",
+      "2024–25",
+      "200 K",
+      "publicly announced, recipe undisclosed",
+      "https://www.anthropic.com/news/claude-3-family"
+    ],
+    [
+      "Anthropic",
+      "Claude Sonnet 4 / 4.5 / 4.6, Opus 4 – 4.7",
+      "2025–26",
+      "200 K standard; 1 M beta (Sonnet 4+, Opus 4.5+)",
+      "publicly announced, recipe undisclosed; long-context surcharge removed for 4.6+",
+      "https://platform.claude.com/docs/en/build-with-claude/context-windows"
+    ],
+    [
+      "OpenAI",
+      "GPT-4 Turbo / GPT-4o",
+      "2023–24",
+      "128 K",
+      "publicly announced, recipe undisclosed",
+      "https://openai.com/index/new-models-and-developer-products-announced-at-devday/"
+    ],
+    [
+      "OpenAI",
+      "GPT-5 / GPT-5.2",
+      "2025",
+      "128 K → 256 K → 400 K",
+      "publicly announced, recipe undisclosed",
+      "https://platform.openai.com/docs/models/gpt-5.2"
+    ],
+    [
+      "OpenAI",
+      "GPT-5.4 / GPT-5.5",
+      "2025–26",
+      "1 050 K",
+      "publicly announced, recipe undisclosed",
+      "https://openai.com/index/introducing-gpt-5-5/"
+    ],
+    [
+      "Google DeepMind",
+      "Gemini 1.5 Pro",
+      "Feb 2024",
+      "1 M (public), 10 M reported in tech report",
+      "publicly announced, recipe undisclosed (paper alludes to 'architectural changes')",
+      "https://arxiv.org/abs/2403.05530"
+    ],
+    [
+      "Google DeepMind",
+      "Gemini 2.5 Pro / Flash",
+      "Mar 2025",
+      "1 M",
+      "publicly announced, recipe undisclosed",
+      "https://storage.googleapis.com/deepmind-media/gemini/gemini_v2_5_report.pdf"
+    ],
+    [
+      "Google DeepMind",
+      "Gemini 3 Pro / Deep Think / Flash",
+      "Nov–Dec 2025",
+      "1 M (current cap, May 2026)",
+      "publicly announced, recipe undisclosed",
+      "https://blog.google/products/gemini/gemini-3/"
+    ],
+    [
+      "Meta",
+      "Llama-3.1 (8B / 70B / 405B)",
+      "Jul 2024",
+      "128 K",
+      "ABF (base = 500 000) + staged CPT in 6 stages, ~800 B tokens",
+      "https://arxiv.org/abs/2407.21783"
+    ],
+    [
+      "Meta",
+      "Llama-3.3-70B",
+      "Dec 2024",
+      "128 K",
+      "same family as 3.1",
+      "https://ai.meta.com/blog/meta-llama-3/"
+    ],
+    [
+      "Meta",
+      "Llama-4 Scout",
+      "Apr 2025",
+      "10 M (trained at 256 K)",
+      "iRoPE: interleaved NoPE + chunked attention + inference temperature scaling; 'mid-training' budget not disclosed",
+      "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"
+    ],
+    [
+      "Meta",
+      "Llama-4 Maverick",
+      "Apr 2025",
+      "1 M",
+      "iRoPE (same family as Scout)",
+      "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"
+    ],
+    [
+      "DeepSeek",
+      "DeepSeek-V3",
+      "Dec 2024",
+      "128 K (4 K base → 32 K → 128 K via YaRN)",
+      "YaRN with s = 40, α = 1, β = 32; two phases of ~1 000 steps each",
+      "https://arxiv.org/abs/2412.19437"
+    ],
+    [
+      "DeepSeek",
+      "DeepSeek-V3.2 / V3.2-Speciale",
+      "Sep–Dec 2025",
+      "128 K (serving via DeepSeek Sparse Attention)",
+      "YaRN training pipeline + DSA serving optimisation",
+      "https://api-docs.deepseek.com/news/news250929"
+    ],
+    [
+      "Alibaba",
+      "Qwen2.5 (base, 32 K → 128 K)",
+      "Sep 2024",
+      "128 K (with DCA)",
+      "ABF (base = 1 000 000) + YaRN/PI",
+      "https://arxiv.org/pdf/2412.15115"
+    ],
+    [
+      "Alibaba",
+      "Qwen2.5-1M",
+      "Jan 2025",
+      "1 M (trained at 256 K)",
+      "progressive ABF with base up to 10 000 000",
+      "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/Qwen2_5_1M_Technical_Report.pdf"
+    ],
+    [
+      "Alibaba",
+      "Qwen3 family (incl. Qwen3-Coder)",
+      "2025",
+      "256 K native, 1 M with YaRN",
+      "ABF + YaRN + Dual Chunk Attention",
+      "https://github.com/QwenLM/qwen3"
+    ],
+    [
+      "Mistral",
+      "Mistral Large 2 (123B)",
+      "Jul 2024",
+      "128 K",
+      "publicly announced, recipe undisclosed",
+      "https://mistral.ai/news/mistral-large-2407"
+    ],
+    [
+      "Moonshot AI",
+      "Kimi-K2 / K2-0905 / K2.6",
+      "Jul 2025 – 2026",
+      "128 K → 256 K → 262 K",
+      "publicly announced, recipe undisclosed; Kimi-K2 line does NOT advertise 1 M as of May 2026",
+      "https://github.com/moonshotai/Kimi-K2"
+    ],
+    [
+      "Microsoft",
+      "Phi-3-medium-128k",
+      "2024",
+      "128 K (LongRoPE-based, with 2 M variants in research)",
+      "LongRoPE: evolutionary search over per-dimension factors + ~1 000-step fine-tuning at 256 K",
+      "https://arxiv.org/abs/2402.13753"
+    ]
+  ]}
+/>
+
+The 1 M-class club, as of May 11 2026, consists of: Gemini 1.5/2.0/2.5/3 Pro (Google); GPT-5.4/5.5 (OpenAI, 1.05 M); Claude Sonnet 4–4.6, Opus 4.5–4.7 (Anthropic, 1 M beta); Llama-4 Maverick (Meta, 1 M) and Llama-4 Scout (Meta, 10 M advertised); Qwen2.5-1M and Qwen3-Coder (Alibaba, 1 M); and LongRoPE-derived Phi-3 models (Microsoft, 2 M via search-based interpolation in research). The Kimi-K2 line — sometimes informally claimed at 1 M — is *not* a 1 M-class model: its current public configuration is 262 K (K2.6), and there is no Moonshot-published Kimi K2 with 1 M context as of May 2026.
+
+<Callout variant="warning" title="Closed-lab recipes are publicly announced but undisclosed">
+Anthropic, OpenAI, and Google have not published the equivalent of the Llama-3 paper for their long-context recipes. The numbers in the landscape table for these labs are *publicly announced context lengths*; the training-side recipe (staging, base frequency, token budget, data composition) is not disclosed. Inferences about these recipes from inference-time behaviour are speculative and are not made in this chapter.
+</Callout>
+
+---
+
+## Chapter summary {#summary}
+
+- **Long context is a continued-pretraining phase, not a from-scratch design.** Frontier labs pretrain at 4–8 k tokens, then run a dedicated long-context phase consuming roughly 5 % of total training tokens to extend to 128 k–1 M. The compute argument is dispositive: attention is 10–15 % of FLOPs at 8 k context and 50–70 % at 128 k.
+- **Adjusted Base Frequency is the workhorse recipe.** Bump the RoPE base $b$ from $10\,000$ to $5 \times 10^5$ – $10^7$, then run staged CPT. ABF is an *empirical* choice, distinct from the NTK-aware *formula* $b' = b \cdot s^{d/(d-2)}$, which provides only a lower bound and is most useful in the training-free regime.
+- **YaRN and LongRoPE extend the recipe at longer ratios.** YaRN's NTK-by-parts plus temperature correction handles the 32×–64× regime efficiently (DeepSeek-V3, Qwen3-Coder); LongRoPE's evolutionary per-dimension search reaches 2 M context (Phi-3) with ~1 000 fine-tuning steps.
+- **Llama-4 Scout's iRoPE is a structurally different recipe.** Trained at 256 K and *deployed* at 10 M via length generalisation, Scout combines interleaved NoPE + chunked attention + inference-time temperature scaling. Training length ≠ deployment length is a recurring 2025–2026 pattern — read advertised context numbers as three distinct quantities.
+- **Data engineering dominates the long-context phase.** Fu et al. (2024) establish 500 M–5 B tokens of well-curated long data as sufficient for 128 k retrieval; per-source within-domain upsampling preserves the domain mix; ~25 % long-context plus 75 % normal-length is the converged production split. Naive concatenation does not produce the long-range referential structure needed.
+- **Effective context is typically 1/2 to 1/4 of advertised context.** RULER, LOFT, Lost-in-the-Middle, and ZeroSCROLLS measure this gap. The frontier (Gemini family) closes the gap to within $2\times$; many open models trail by $4\times$. The discipline is to evaluate at the relevant length, not to trust the marketing number.
+- **Closed-lab recipes are publicly announced but undisclosed.** Anthropic, OpenAI, and Google publish context lengths but not staging, base frequencies, or token budgets. The open-recipe references in this chapter (Llama-3, ProLong, DeepSeek-V3, Qwen2.5, LongRoPE) are the primary technical evidence for what frontier long-context training actually looks like in 2026.
+
+---
+
+<Sources items={[
+  {
+    authors: "Xiong, W., Liu, J., Wu, I., Wang, B., Zhang, R., Yu, Y., et al.",
+    year: 2023,
+    title: "Effective Long-Context Scaling of Foundation Models",
+    venue: "Meta AI; NAACL 2024",
+    url: "https://arxiv.org/abs/2309.16039",
+    note: "Adjusted Base Frequency (ABF) — empirical base bump (e.g. 10 000 → 500 000) plus CPT; extends Llama-2 from 4 K to 32 K."
+  },
+  {
+    authors: "Chen, S., Wong, S., Chen, L., Tian, Y.",
+    year: 2023,
+    title: "Extending Context Window of Large Language Models via Positional Interpolation",
+    venue: "Meta AI",
+    url: "https://arxiv.org/abs/2306.15595",
+    note: "Position interpolation (PI). Conceptual ancestor of ABF / YaRN; Llama-2 7B → 32 K in &lt;1 000 steps."
+  },
+  {
+    authors: "Peng, B., Quesnelle, J., Fan, H., Shippole, E.",
+    year: 2023,
+    title: "YaRN: Efficient Context Window Extension of Large Language Models",
+    venue: "Nous Research; ICLR 2024",
+    url: "https://arxiv.org/abs/2309.00071",
+    note: "YaRN = NTK-by-parts + attention temperature correction. 10× fewer tokens / 2.5× fewer steps than PI."
+  },
+  {
+    authors: "Ding, Y., Zhang, L., Zhang, Z., Xu, S., Shang, Y., Xu, J., Yang, F., Yang, M.",
+    year: 2024,
+    title: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens",
+    venue: "Microsoft Research",
+    url: "https://arxiv.org/abs/2402.13753",
+    note: "Evolutionary search over per-dimension RoPE factors; progressive 256 K → 2 M; basis of Phi-3-medium-128k."
+  },
+  {
+    authors: "Shang, N., Zhang, L., Wang, Z., Zhang, Z., et al.",
+    year: 2025,
+    title: "LongRoPE2: Near-Lossless LLM Context Window Scaling",
+    venue: "Microsoft Research",
+    url: "https://arxiv.org/abs/2502.20082",
+    note: "Needle-driven perplexity search + mixed-context-window training; claimed 80× fewer tokens than Llama-3.1 extension."
+  },
+  {
+    authors: "Fu, Y., Yang, R., Hu, M., Sun, Y., Liu, A.",
+    year: 2024,
+    title: "Data Engineering for Scaling Language Models to 128K Context",
+    venue: "arXiv 2402.10171",
+    url: "https://arxiv.org/abs/2402.10171",
+    note: "Per-source within-domain upsampling rule; 500 M–5 B tokens of well-curated long data sufficient for 128 K retrieval."
+  },
+  {
+    authors: "Gao, T., Wettig, A., Yen, H., Chen, D.",
+    year: 2024,
+    title: "ProLong: How to Train Long-Context Language Models (Effectively)",
+    venue: "Princeton NLP",
+    url: "https://arxiv.org/abs/2410.02660",
+    note: "Llama-3-8B → 512 K with ~5 % of Llama-3.1's long-context budget. FlashAttention-2 varlen + length-sorted dataloader."
+  },
+  {
+    authors: "Cerebras Systems",
+    year: 2024,
+    title: "Extending LLM Context with 99% Less Training Tokens",
+    venue: "Cerebras blog",
+    url: "https://www.cerebras.ai/blog/extending-llm-context-with-99-less-training-tokens",
+    note: "Llama-3-8B-Instruct → 32 K with ~10 B tokens (80× less than Llama-3.1); stage-wise ABF base 5e5 → 8e6."
+  },
+  {
+    authors: "EleutherAI",
+    year: 2023,
+    title: "Extending the RoPE",
+    venue: "EleutherAI Blog",
+    url: "https://blog.eleuther.ai/yarn/",
+    note: "Independent corroboration of YaRN ramp-function formula, NTK-aware exposition, α=1/β=32 for LLaMA."
+  },
+  {
+    authors: "bloc97",
+    year: 2023,
+    title: "NTK-Aware Scaled RoPE allows LLaMA models to have extended (8k+) context size without any fine-tuning",
+    venue: "Reddit r/LocalLLaMA; HuggingFace TGI Issue #512",
+    url: "https://github.com/huggingface/text-generation-inference/issues/512",
+    note: "NTK-aware base rescaling formula b' = b · s^(d/(d-2)); community origin, no peer-reviewed paper."
+  },
+  {
+    authors: "Hsieh, C.-P., Bai, T., Chen, X., Pang, Y., Awadalla, A., Vyas, N., et al.",
+    year: 2024,
+    title: "RULER: What's the Real Context Size of Your Long-Context Language Models?",
+    venue: "NVIDIA; arXiv 2404.06654",
+    url: "https://arxiv.org/abs/2404.06654",
+    note: "13-task synthetic long-context benchmark; effective context = longest length where score ≥ Llama-2-7B at 4 K (85.6 %)."
+  },
+  {
+    authors: "Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., Liang, P.",
+    year: 2023,
+    title: "Lost in the Middle: How Language Models Use Long Contexts",
+    venue: "TACL 2024; arXiv 2307.03172",
+    url: "https://arxiv.org/abs/2307.03172",
+    note: "U-curve performance vs needle position; relevant info at start or end outperforms middle."
+  },
+  {
+    authors: "Lee, J., Chen, A., Ladhak, F., Hauser, V., Khattab, O., Yu, T., et al.",
+    year: 2024,
+    title: "LOFT: Can Long-Context Language Models Subsume Retrieval, RAG, SQL, and More?",
+    venue: "Google DeepMind; arXiv 2406.13121",
+    url: "https://arxiv.org/abs/2406.13121",
+    note: "Six task categories, 35 datasets, up to 1 M tokens. LCLMs rival dedicated retrievers but fail at compositional reasoning."
+  },
+  {
+    authors: "Shaham, U., Ivgi, M., Efrat, A., Berant, J., Levy, O.",
+    year: 2023,
+    title: "ZeroSCROLLS: A Zero-Shot Benchmark for Long Text Understanding",
+    venue: "EMNLP 2023; arXiv 2305.14196",
+    url: "https://arxiv.org/abs/2305.14196",
+    note: "10 long-context tasks; aggregation-focused complement to retrieval-focused RULER."
+  },
+  {
+    authors: "Wu, D., et al.",
+    year: 2024,
+    title: "CREAM: Consistency Regularized Self-Rewarding Language Models / Middle-focused positional encoding",
+    venue: "arXiv 2406.07138",
+    url: "https://arxiv.org/abs/2406.07138",
+    note: "Middle-focused positional encoding as a partial mitigation for lost-in-the-middle."
+  },
+  {
+    authors: "Dubey, A., Jauhri, A., Pandey, A., et al. (Meta)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "Meta AI; arXiv 2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3.1 long-context CPT: 6 stages from 8 K to 128 K, ~800 B tokens, ABF base = 500 000, per-stage NIAH validation."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI blog, April 5 2025",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama-4 Scout iRoPE: interleaved NoPE + chunked attention + inference-time temperature scaling; trained at 256 K, deployed at 10 M."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv 2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "4 K → 32 K → 128 K via YaRN (s = 40, α = 1, β = 32); two phases of ~1 000 steps each."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DeepSeek-V3.2 release notes (DeepSeek Sparse Attention)",
+    venue: "DeepSeek API blog, September 29 2025",
+    url: "https://api-docs.deepseek.com/news/news250929",
+    note: "DSA as serve-time sparse-attention optimisation for 128 K context."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv 2412.15115",
+    url: "https://arxiv.org/pdf/2412.15115",
+    note: "ABF base = 1 000 000, long-context stage with 75 % at max length + 25 % shorter sequences."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2025,
+    title: "Qwen2.5-1M Technical Report",
+    venue: "Alibaba",
+    url: "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/Qwen2_5_1M_Technical_Report.pdf",
+    note: "Progressive ABF with base up to 10 000 000; trained at 256 K, deployed at 1 M (3.9× extrapolation)."
+  },
+  {
+    authors: "Qwen Team, Alibaba",
+    year: 2025,
+    title: "Qwen3 family",
+    venue: "GitHub QwenLM/qwen3 and QwenLM/Qwen3-Coder",
+    url: "https://github.com/QwenLM/qwen3",
+    note: "256 K native context, 1 M extension via YaRN; Qwen3-Coder long-context recipe."
+  },
+  {
+    authors: "Google DeepMind",
+    year: 2024,
+    title: "Gemini 1.5 Technical Report",
+    venue: "arXiv 2403.05530",
+    url: "https://arxiv.org/abs/2403.05530",
+    note: "Up to 10 M reported, 1 M public; architectural details alluded to but not disclosed."
+  },
+  {
+    authors: "Google DeepMind",
+    year: 2025,
+    title: "Gemini 2.5 Technical Report",
+    venue: "Google DeepMind",
+    url: "https://storage.googleapis.com/deepmind-media/gemini/gemini_v2_5_report.pdf",
+    note: "1 M context; recipe undisclosed."
+  },
+  {
+    authors: "Google",
+    year: 2025,
+    title: "Introducing Gemini 3",
+    venue: "Google blog, November 2025",
+    url: "https://blog.google/products/gemini/gemini-3/",
+    note: "Gemini 3 Pro / Deep Think / Flash; 1 M context as of May 2026; recipe undisclosed."
+  },
+  {
+    authors: "Anthropic",
+    year: 2025,
+    title: "Context windows — Claude API",
+    venue: "Anthropic docs",
+    url: "https://platform.claude.com/docs/en/build-with-claude/context-windows",
+    note: "200 K standard, 1 M beta for Sonnet 4+, Opus 4.5+; long-context surcharge removed for 4.6+. Recipe undisclosed."
+  },
+  {
+    authors: "OpenAI",
+    year: 2025,
+    title: "Introducing GPT-5.5",
+    venue: "OpenAI",
+    url: "https://openai.com/index/introducing-gpt-5-5/",
+    note: "GPT-5.5: 1 050 K context. Recipe undisclosed."
+  },
+  {
+    authors: "Wang, T., Lu, Y., Zhang, Y., et al.",
+    year: 2025,
+    title: "Mid-Training of LLMs: A Survey",
+    venue: "arXiv 2510.06826",
+    url: "https://arxiv.org/html/2510.06826v1",
+    note: "Survey defining 'mid-training' as a category encompassing long-context CPT, annealing, and quality-data refinement."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 long-context extension (4k → 32k → 64k; RoPE θ 1.5M then 5M; YaRN to 128k)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Two-stage extension at 50B tokens per stage; selective NoPE every 4th layer; YaRN inference extrapolation to 128k (2× training length)."
+  },
+  {
+    authors: "Yang, R., Yu, A. et al.",
+    year: 2025,
+    title: "RoPE to NoRoPE and Back Again: A New Hybrid Attention Strategy",
+    venue: "arXiv:2501.18795",
+    url: "https://arxiv.org/abs/2501.18795",
+    note: "Theoretical basis for SmolLM3's selective-NoPE pattern; alternative architectural option to Llama-4 iRoPE."
+  }
+]} />

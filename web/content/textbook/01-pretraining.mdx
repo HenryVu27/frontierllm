@@ -1,0 +1,167 @@
+---
+slug: 01-pretraining
+title: Pretraining at scale — orientation
+description: How to read this module, the dependency chain across chapters, the notation conventions, and what a frontier pretraining run looks like in 2026.
+order: 10
+chapter: 9
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 22
+depends_on: [00-prerequisites]
+provides: []
+last_reviewed: 2026-05-12
+---
+
+## About this module {#about}
+
+This module is a self-contained textbook on the engineering of large-language-model pretraining. It covers the eight clusters of decisions a frontier-lab pretraining team has to make between the moment the architecture is fixed and the moment a base model is handed off to a post-training team: where the data comes from and how it is filtered, how the tokenizer is trained, how parameter and token budgets are set, how learning-rate schedules and batch sizes are chosen, how the data mix evolves across the run, how the context window is extended past the base length, and what the late-pretraining "annealing" phase and the FP8-era stability practices look like.
+
+After finishing the eight chapters, a reader should be able to read the *training* section of a frontier-lab tech report — DeepSeek-V3, Llama-3.1 / 4, Qwen-3, OLMo-2, Phi-4, Kimi-K2, Mistral Large 2 — and understand every choice it describes: the data-pipeline lineage from Common Crawl to a 15 T-token corpus, the tokenizer fertility math, the Chinchilla-vs-inference-aware token-per-parameter target, the μP-or-not hyperparameter sweep, the WSD schedule and the batch-size ramp, the data-mix ratios across pretraining and annealing, the long-context staging recipe, and the FP8 block-scaling configuration.
+
+The module does **not** teach the architecture itself (covered in [Module 0 — Prerequisites](/textbook/00-prerequisites)), distributed-training internals (DP / TP / PP / EP / FSDP-2 / ZeRO; future module), post-training and reasoning RL (SFT, DPO, RLHF, RLVR; future module), inference and serving (KV cache, paged attention, speculative decoding; future module), or evaluation methodology (future module). Cross-references to those topics appear where the boundary is genuinely thin, but the depth lives there.
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier-model practice as of May 2026. The mathematics of scaling laws, μP, and gradient-noise theory is durable. The comparison tables — which lab trains with what schedule, what vocab size, what FP8 recipe — age fastest. Recheck those tables every 6–12 months against the next round of public tech reports.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+Eight chapters, each addressing one cluster of pretraining-engineering decisions. The compute and engineering arguments build cumulatively; the [reading-order recommendations](#reading-order) section gives shortcuts for readers who only need a subset.
+
+**[Chapter 10 — Data sources, filtering, and deduplication](/textbook/01a-data-pipeline)**
+The 2026 data landscape: Common Crawl re-extraction from WARC, the FineWeb / FineWeb-Edu / RedPajama-2 / Dolma / DCLM lineage, code corpora (StackV2), and the synthetic-data slice. HTML extraction with Trafilatura and jusText. Three generations of quality filter — heuristic (Gopher / C4 / FineWeb), classifier-based (DCLM, FineWeb-Edu's Snowflake-Arctic-embed head), and LLM-judge (Phi family, Llama-3.1's annotator pipeline). MinHash + LSH deduplication with the 5–13-gram empirical band and the inter-snapshot reversal in FineWeb-2. PII and toxicity filtering with the LDNOOBW disparate-impact problem. Contamination removal and the n-gram-overlap limitation. Multilingual language ID with fastText / CLD3 / GlotLID. A frontier-practice landscape table and the DCLM-Baseline 7 B recipe as a worked example.
+
+**[Chapter 11 — Tokenizer training at frontier scale](/textbook/01b-tokenizer-training)**
+Why tokenizer choice is a pretraining decision: it gates loss-per-token interpretation, dataset shape, and inference cost. Vocab-size selection via the Tao et al. (2024) scaling law $L = E + A/N^{\alpha_1} + B/V^{\alpha_2}$, with the predicted-optimal $V \approx 216{,}000$ for 70-B-class models. Training-corpus selection for the tokenizer and the fertility tradeoff. The GPT-2, Llama-3, and DeepSeek-V3 pre-tokenization regexes verbatim, NFC vs NFKC normalization, byte-fallback, and the punctuation-and-newline trick. Glitch tokens (SolidGoldMagikarp class) and the "train on the model's data" mitigation. Multilingual considerations: fertility, STRR, Rényi efficiency, and why frontier labs use 100 k–256 k vocabularies in 2026. A 17-row frontier comparison table and a worked BPE training example with the bytes-per-token compression curve.
+
+**[Chapter 12 — Scaling laws and compute-optimal training](/textbook/01c-scaling-laws)**
+The keystone chapter of the module. Kaplan et al. (2020) and the original power-law fit $L(N, D) = E + A/N^{\alpha_N} + B/D^{\alpha_D}$. Chinchilla (Hoffmann et al., 2022) and the IsoFLOP method: Approach 1, 2, and 3 fits, the $\sim 20$ tokens-per-parameter optimum. The Besiroglu (2024) and Porian (2024) reconciliation: Kaplan's 0.73 vs Chinchilla's 0.50 exponent for $N_{\text{opt}} \propto C^a$ was a methodological gap (non-embedding parameter counting, last-layer FLOPs, warmup, AdamW $\beta_2$), not a "scaling laws don't work" story. The 20 : 1 rule survives. DeepSeek-LLM's data-quality-dependent exponents. Sardana et al.'s inference-aware framework and why frontier 2025-2026 models train at token-per-parameter ratios from 37 (DeepSeek-V3) to 1000+ (Llama-4 Scout). MoE active-vs-total parameter accounting. The two-questions distinction: "minimise pretraining loss for fixed compute" and "minimise lifecycle cost given inference demand" are different questions, both valid. A worked example deriving $(N^*, D^*)$ at $C = 10^{25}$ FLOPs under both regimes and a 20-row frontier-lab landscape table.
+
+**[Chapter 13 — μP and hyperparameter transfer](/textbook/01d-mup-and-transfer)**
+Why hyperparameter sweeping at frontier scale is infeasible. Standard parametrization vs Maximal Update Parametrization (Yang et al., 2022, *Tensor Programs V*): the update-RMS preservation condition, the Table 3 parametrization rules, and the $1/\sqrt{d_h} \to 1/d_h$ attention-scale change. The mup-transfer procedure (sweep at width 256–512, predict the LR for width 8 192–16 384). The 2024–2025 refinements: μP for SwiGLU, μP for MoE, depth-μP from *Tensor Programs VI*, and CompleteP (Dey et al., 2025). The honest accounting: μP transfers LR cleanly, partially transfers other hyperparameters, and does not replace IsoFLOP. The frontier-adoption landscape as of May 2026 — Cerebras-GPT (confirmed), Microsoft (confirmed), Graphcore u-μP, Essential AI; **not confirmed** for Llama-3 / 3.1 / 4, DeepSeek-V2 / V3 (which uses uniform std = 0.006, an explicit counter-example), Qwen, Gemma, OLMo, Kimi. The Kosson 2025 challenge: μP's invariant breaks within hundreds of steps; independent weight decay drives most of the LR transfer for most of training. Treated as a refinement, not a refutation.
+
+**[Chapter 14 — Learning-rate schedules and batch size](/textbook/01e-schedules-and-batch)**
+Warmup (linear ramp, 1–2% of total steps, Adam-bias-correction motivation). Cosine decay and the cosine-to-zero vs cosine-to-10% choice. Warmup-Stable-Decay (WSD) and the MiniCPM formulation $\eta(t) = \eta_{\max} \cdot 0.5^{(t - S)/T}$ in the decay tail. The DeepSeek-V2 step-decay variant and DeepSeek-V3's four-phase recipe verbatim: 2 K warmup, 2.2 × 10⁻⁴ stable for 10 T tokens, cosine to 2.2 × 10⁻⁵ over 4.3 T tokens, then 7.3 × 10⁻⁶ for 167 B. Schedule-Free AdamW (Defazio et al., 2024) and its scope limitations. Critical batch size via McCandlish et al. (2018): $(S/S_{\min} - 1)(E/E_{\min} - 1) = 1$ and $B_{\text{simple}} = \operatorname{tr}(\Sigma)/|G|^2$. Zhang et al. (2024) $B^* \approx 22.91 \cdot D^{0.47}$. The frontier batch-ramp practice: Llama-3-405B from 4 M to 16 M tokens at 252 M and 2.87 T tokens; DeepSeek-V3 3 072 → 15 360 sequences over 469 B tokens. Malladi (2022) Adam scaling rule for $\eta$-$B$ interaction. A worked example for a 13 B / 3 T-token run with a 512-H100 hardware envelope.
+
+**[Chapter 15 — Data mixing and curriculum](/textbook/01f-data-curriculum)**
+Why mix matters: code-heavy pretraining lifts natural-language reasoning by 8.2% (Aryabumi et al., 2024); Llama-3's 40-million-token annealing phase lifts GSM8K by 24% on the 8 B; reasoning-rich data lifts SFT outcomes by 4% (Front-Loading Reasoning, NVIDIA / CMU, 2025). Three families of static-mix methods: DoReMi (Xie et al., 2023) with proxy-model DRO reweighting (+6.5 pts, 2.6× step efficiency); RegMix (Liu et al., 2024) with regression on log-mix at proxy scale; and Data Mixing Laws (Ye et al., 2024) with the functional form $L_i = c_i + k_i \exp(\sum_j t_{ij} \alpha_j)$. The BiMix, CAMEL, and UtiliMax-MEDU 2024–2025 follow-ups. Dynamic curriculum: the broad-to-narrow recipe. Multilingual balance via temperature sampling $p_l \propto n_l^{1/T}$, with $T \in [0.3, 0.7]$ typical. Domain weights vs token-level reweighting (LESS, D4). Synthetic data: the Phi-1 to Phi-4 trajectory and the ~30% optimal rephrased-synthetic share. The verbatim Llama-3 50 / 25 / 17 / 8 mix, Phi-4 Table 5 (15 / 15 / 40 / 20 / 10), Qwen-3 36 T-token three-stage curriculum across 119 languages, and OLMo-2's 3.9 T stage-1 plus 843 B Dolmino-Mix.
+
+**[Chapter 16 — Long-context extension as a pretraining phase](/textbook/01g-long-context)**
+Continued pretraining for context length, not from scratch — the compute argument. Position-encoding integration: Adjusted Base Frequency (ABF, Xiong et al., 2023) as an empirical base bump; NTK-aware scaling $s = (L_{\text{target}}/L_{\text{train}})^{|d/(d-2)|}$ as a distinct method (the brief's earlier conflation corrected); YaRN with continued pretraining; LongRoPE; and Llama-4 Scout's iRoPE (interleaved NoPE + chunked attention + inference-time temperature scaling, trained at 256 K and deployed at 10 M — the chapter's "training length ≠ deployment length" teaching moment). Data construction for long context: book concatenation, repository flat files, packed needle-in-haystack synthetic, and the diversity tradeoff. Loss-mask strategies. Effective-vs-nominal context via the RULER benchmark (Hsieh et al., 2024), LOFT, and Lost-in-the-Middle (Liu et al., 2023). A worked recipe for 8 K → 128 K extension and a 14-row frontier landscape (Llama-3.1 / 4, Gemini 1.5 / 2.5 / 3, GPT-5.x, Claude 4.x, DeepSeek-V3, Qwen-2.5-1M, Mistral Large 2, Kimi-K2.6). Closed-lab recipes marked "publicly announced, recipe undisclosed."
+
+**[Chapter 17 — Midtraining, annealing, and stability](/textbook/01h-annealing-and-stability)**
+The late-pretraining phase and the reliability practices that keep frontier runs from spiking. Terminology disambiguation: *annealing*, *midtraining*, *decay phase*, *cooldown*, *Stage 2/3*, *high-quality phase* all refer operationally to the same recipe. The verbatim Llama-3 405 B 40-million-token cooldown (with the common 40 B-token misquote flagged). The DeepSeek-V2 / V3 multistage WSD with exact step counts. The Phi-4, Qwen-2.5 / 3, Kimi-K2, OLMo-2, and Gemma-2 / 3 annealing recipes as published. The annealing data-mix shift: code, math, reasoning chains, long-context, recent web. Stability practices: z-loss for the output softmax, gradient clipping (global vs per-parameter), AdamW $\epsilon$ choice (OLMo-2 lowered $10^{-5} \to 10^{-8}$), QK-norm, and the OLMo-2 net result of a gradient-norm spike score from 0.40 to 0.03. FP8 training in detail: DeepSeek-V3's recipe with 1 × 128 activation tiles, 128 × 128 weight blocks, E4M3 elements, BF16 moments, FP32 master weights, and manual FP32 accumulation via promotion to CUDA cores. The MXFP8 (block 32, E8M0 outer scale, Blackwell-native) and NVFP4 (block 16, E4M3 micro-scale, FP32 outer) successors. Checkpoint surgery for persistent spikes.
+
+---
+
+## Prerequisites for this module {#prereqs}
+
+The hard prerequisite is [Module 0 — Prerequisites](/textbook/00-prerequisites). Module 1 freely uses the residual-stream framing, the FLOPs-per-token $6N$ identity, RMSNorm and QK-norm, RoPE, SwiGLU, AdamW and Muon, BPE / SentencePiece, and the MoE active-vs-total accounting without re-deriving any of them. Cross-references to the prerequisite chapters appear throughout for review, but the module is hard to follow without first having internalised them.
+
+Beyond Module 0, the module assumes the same general background: calculus and the chain rule, linear algebra, basic probability, and at least one previous neural-network training run. Specific extra material that helps:
+
+**Distributed-training vocabulary at the level of a glossary.** Phrases like "data parallel", "tensor parallel", "expert parallel", "FSDP-2", and "ZeRO-3" appear in Chapters 14, 15, and 17 in connection with batch sizes and FP8 recipes. The module treats them as labels for design choices, not as topics in their own right. If a reader has never encountered the labels, the [HuggingFace distributed-training cheat-sheet](https://huggingface.co/docs/transformers/main/perf_train_gpu_many) is a fifteen-minute primer that suffices for this module; the full mechanics live in a future Distributed-Training module.
+
+**FLOP arithmetic.** Comfort with the $C \approx 6 \, N \, D$ identity from Chapter 1 is heavily used in Chapter 12 (scaling laws) and the worked example of Chapter 14 (where 13 B parameters × 3 T tokens × 6 = $2.34 \times 10^{23}$ FLOPs is taken as given).
+
+**Reading a tech report.** Several worked examples quote specific paragraphs from the DeepSeek-V3, Llama-3, OLMo-2, and Kimi-K2 tech reports. The reader does not need to read those reports in full, but should be willing to follow links to specific sections when the chapter flags them.
+
+---
+
+## The shape of a 2026 pretraining run {#shape}
+
+Some scale to calibrate expectations across the module:
+
+- **Parameter scale.** Public frontier models in 2026 range from $7$–$13$ B active parameters (open small) to $\sim 70$ B active in the open-frontier band (Llama-3.3, Qwen-3, DeepSeek-V3 with $\sim 37$ B active out of $671$ B total) to the rumoured $300$ B–$2$ T active in the closed-frontier band. The chapters use $7$ B, $70$ B, and $400$ B as worked-example reference points.
+- **Data scale.** Frontier pretraining corpora in 2026 are $10$–$30$ T tokens after filtering and deduplication, drawn from a pre-filter pool of $\sim 100$ T web tokens plus code, books, papers, and a synthetic slice. Token counts are tokenizer-relative: 15 T tokens under the FineWeb GPT-2-style tokenizer is not 15 T tokens under the Llama-3 128 K tokenizer; Chapter 10 explains the conversion.
+- **Compute.** A $70$ B-active dense model trained Chinchilla-optimally at 20 tokens per parameter consumes $\approx 8 \times 10^{23}$ FLOPs. A $400$ B-active model trained inference-aware at $100$ tokens per parameter consumes $\approx 2.4 \times 10^{25}$ FLOPs. The compute envelope is a low-precision multiplicand of wall-clock and dollars: a typical 2026 frontier run is weeks to months on $10^3$–$10^5$ accelerators with a budget envelope of \$1 M–\$100 M+.
+- **Wall-clock.** Pretraining is no longer a single phase. The published recipes split into a base phase (most of the tokens, short context, broad data mix), an extension phase (long-context continued pretraining), and an annealing / midtraining phase (the final 1–5% of tokens with LR decaying and a high-quality data mix). Some labs also publicly disclose an early "warmup-the-corpus" stage. The module's chapter order roughly follows this temporal order from Chapter 10 (data, set early) through Chapter 17 (annealing, set late).
+
+<Callout variant="warning" title="Ablation compute is a substantial share of the run">
+Headline "training compute" numbers in tech reports cover the single main run; they exclude the recipe-development work that decided what that run should be. The HuggingFace SmolLM3 playbook is the cleanest open disclosure of this gap. Of the 3B model's total 437,760 GPU-hours, approximately **161,280 GPU-hours — about 37%** — were consumed by ablations, debugging, and a full restart from a silent tensor-parallelism bug at the ~1T-token mark. The other ~63% paid for the production 11.2T-token run. The implication is operational: the cost of *deciding* on a recipe at small-model scale is a substantial fraction of the cost of *running* it, and the chapters' worked-example FLOPs accounting refers to the production run only. Frontier-scale runs do not publish an ablation-compute share, but the SmolLM3 number is the right order of magnitude for any lab that takes recipe development seriously.
+</Callout>
+
+---
+
+## Notation conventions {#notation}
+
+The module uses the following symbols throughout. Chapter-local overloads are explicitly flagged on first use.
+
+- $N$ — parameter count (non-embedding parameters unless explicitly otherwise; see Chapter 12 for the Porian correction that this distinction caused the Kaplan-vs-Chinchilla exponent gap).
+- $D$ — pretraining tokens (tokenizer-relative; specify the tokenizer if the unit is ambiguous).
+- $C$ — compute in FLOPs, typically with the $C = 6 \, N \, D$ identity for dense models and the active-parameter version for MoE.
+- $L$ — per-token cross-entropy loss in nats. $L_\infty$ is the irreducible loss.
+- $V$ — tokenizer vocabulary size.
+- $T$ — total training tokens (synonymous with $D$ when there is no ambiguity).
+- $B$ — batch size. Always specify the unit (tokens or sequences); the brief's review of frontier recipes found this ambiguity in published reports.
+- $\eta$ — learning rate, with $\eta_{\max}$ for the peak. The Adam moment-decay rates are $\beta_1, \beta_2$ and the denominator floor is $\epsilon$.
+- $B_{\text{crit}}$, $B_{\text{simple}}$ — McCandlish's critical batch size and the simple-noise-scale estimator. See Chapter 14.
+- $p_i$ — mixing proportion for data domain $i$, with $\sum p_i = 1$.
+
+Chapter 13 (μP) introduces width and depth notation ($n$ for hidden dimension, $L$ overloaded as layer count — flagged explicitly there). Chapter 16 (long context) uses $L_{\text{ctx}}$ for context length to avoid the same overload.
+
+---
+
+## Reading order recommendations {#reading-order}
+
+### First time through
+
+Chapters 10 through 17 in order. The module is built so that each chapter cleanly follows from its predecessor. Chapter 10 (data) sets up Chapter 11 (tokenizer-on-data); Chapters 10 and 11 set up Chapter 12 (scaling laws calibrated to the data); Chapter 12 motivates Chapter 13 (μP, which would not exist without the scaling-laws-at-scale problem); Chapters 12 and 13 set up Chapter 14 (schedules and batch sizes that have to be picked once the data and parameter scale are known); Chapter 14 sets up Chapter 15 (data mix evolves *along* the schedule); Chapters 14 and 15 set up Chapter 16 (long-context as a continued-pretraining phase at the end of the main run); and all of the above set up Chapter 17 (annealing and stability are the operational concerns that overlay every other choice). Total reading time is roughly five to six hours of attentive reading, distributed across two or three sittings.
+
+### For a training engineer at a small lab
+
+Chapters 12, 14, 13, 17 in that order. The scaling-law framing tells the engineer what target $(N, D)$ pair to aim at; Chapter 14 gives the schedule and batch-size envelope; Chapter 13 is the hyperparameter-transfer story that decides whether to run a small sweep; Chapter 17 is the reliability checklist. Chapters 10, 11, 15, 16 are reference chapters they can skim and return to.
+
+### For a research scientist studying frontier recipes
+
+Chapters 12, 15, 17, 13. Chapter 12 anchors the "why train this much data" question; Chapter 15 covers what the *data mix* researchers actually argue about; Chapter 17 is the most-2024–2026 chapter in the module and where most of the current public debate lives; Chapter 13 is the methodological chapter that the scaling-law and data-mix work increasingly relies on.
+
+### For someone evaluating a frontier-lab report
+
+Read [§Frontier-lab landscape](/textbook/01c-scaling-laws#frontier-practice) in Chapter 12 first to calibrate the token-per-parameter ratio. Read [§Frontier-lab recipes](/textbook/01e-schedules-and-batch#frontier-recipes) in Chapter 14 next for the schedule and batch sizes. Then [§Frontier-lab landscape](/textbook/01f-data-curriculum#frontier-practice) in Chapter 15 for the data mix. Finally [§Frontier-lab landscape](/textbook/01h-annealing-and-stability#frontier-landscape) in Chapter 17 for the annealing and FP8 recipes. The other chapters fill in the *why* once a specific number from a report needs interpretation.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module, a reader should be able to do all of the following without consulting external references:
+
+1. **Read the data section of any 2024–2026 frontier tech report** and identify the heuristic / classifier / LLM-judge filter stages, the deduplication algorithm and parameter choices, the multilingual sampling temperature, and the synthetic-data share. Where the report is silent on a choice, the reader should know what the closest published baseline is and the magnitude of the uncertainty.
+2. **Predict, within a factor of two, the optimal $(N^*, D^*)$ pair** for a given compute budget and a given inference-demand profile, using the worked-example methodology from Chapter 12.
+3. **Read a published schedule and batch-size recipe** (e.g. DeepSeek-V3's four-phase WSD) and reproduce the schedule shape from the disclosed step counts and LR targets.
+4. **Recognise when a published μP claim is load-bearing vs cosmetic.** Most frontier labs do not claim μP; the chapter teaches how to read DeepSeek-V3's uniform-std-0.006 init as an *explicit counter-example* rather than a μP variant.
+5. **Reproduce a long-context extension recipe** from the published base-frequency change, continued-pretraining token budget, and data-construction strategy. Distinguish ABF from NTK-aware from YaRN from iRoPE.
+6. **Read an annealing-phase disclosure** and identify the LR decay shape, the token budget, the data-mix shift, and the FP8 configuration (per-tensor vs block-scaled vs MX).
+7. **Argue from first principles for or against** a specific training choice. The module's "no verdicts" voice still gives the reader the evidence to form their own; the comparison tables and the cross-referenced ablation citations are the raw material.
+
+The module does **not** claim to teach the operational craft — debugging a specific spike, tuning communication overlap for a specific cluster, choosing between vLLM and SGLang for a specific deployment. Those are skills that require the runs themselves. The module teaches the *vocabulary* and the *current published recipes* that make those skills learnable from experience instead of from scratch.
+
+---
+
+## What this module does not cover {#non-goals}
+
+- **Distributed training internals.** Data parallel / tensor parallel / pipeline parallel / expert parallel / FSDP-2 / ZeRO-3 mechanics, communication overlap, micro-batch tiling, gradient-checkpointing math. Future module.
+- **Post-training and RLHF.** SFT data curation, DPO / IPO / KTO / SimPO math, RLHF reward-model training, RLVR and RL-with-process-rewards, the o-series and R-series reasoning RL recipes. Future module.
+- **Inference and serving.** KV-cache layout, paged attention, speculative decoding, continuous batching, vLLM / SGLang / TRT-LLM. Future module.
+- **Evaluation methodology.** Benchmark design, contamination measurement at evaluation time, capability elicitation, the LMSYS / Chatbot Arena methodology, calibration. Future module.
+- **Alignment and interpretability.** SAEs, circuit-level analysis, constitutional AI, red-teaming. Future module.
+- **The economics and policy of frontier compute.** Power constraints, fab capacity, regulatory regimes. Not in scope for any planned module.
+
+---
+
+## A note on hedging {#hedging}
+
+The voice of every chapter in this module is neutral textbook, in the Hull / Goodfellow / Bishop register. There are no verdicts on which lab "got it right" and no marketing adjectives. Where the literature has converged — RMSNorm replacing LayerNorm, SwiGLU replacing GELU, RoPE replacing learned absolute encodings, AdamW replacing SGD-with-momentum — the chapters say so and cite the convergence. Where the literature is divided — the inference-aware token-per-parameter target, the optimal MinHash $n$-gram size, the question of whether μP transfers cleanly past 100 B parameters, the FP8 vs MXFP8 vs NVFP4 choice — the chapters present the range with sources and decline to pick.
+
+This is a deliberate stylistic choice and not a hedge against opinion. The reader is expected to form their own positions after seeing the evidence laid out. The chapters' job is to lay the evidence out — clearly, with primary citations, with worked examples that ground the numbers — and stop there.
+
+<Sources items={[
+  { authors: "Module 0 — Prerequisites", year: 2026, title: "Frontier-LLM textbook, Module 0", url: "/textbook/00-prerequisites" },
+  { authors: "Hoffmann, J. et al.", year: 2022, title: "Training Compute-Optimal Large Language Models", venue: "arXiv:2203.15556", url: "https://arxiv.org/abs/2203.15556" },
+  { authors: "Kaplan, J. et al.", year: 2020, title: "Scaling Laws for Neural Language Models", venue: "arXiv:2001.08361", url: "https://arxiv.org/abs/2001.08361" },
+  { authors: "Porian, T. et al.", year: 2024, title: "Resolving Discrepancies in Compute-Optimal Scaling of Language Models", venue: "arXiv:2406.19146", url: "https://arxiv.org/abs/2406.19146" },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V3 Technical Report", venue: "arXiv:2412.19437", url: "https://arxiv.org/abs/2412.19437", note: "Anchor reference for the FP8 recipe, schedule, and batch ramp used throughout the module's worked examples." },
+  { authors: "Meta AI", year: 2024, title: "The Llama 3 Herd of Models", venue: "arXiv:2407.21783", url: "https://arxiv.org/abs/2407.21783", note: "Anchor reference for the 40-million-token cooldown, the batch-size ramp, and the data-mix table." },
+]} />

@@ -1,0 +1,796 @@
+---
+slug: 01a-data-pipeline
+title: Data sources, filtering, and deduplication
+description: How frontier labs build a 10–30T-token pretraining corpus in 2026, from WARC re-extraction through MinHash deduplication.
+order: 11
+chapter: 10
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 42
+depends_on: [00g-tokenization-and-objectives]
+provides: [data-pipeline, html-extraction, quality-filtering, deduplication, contamination]
+last_reviewed: 2026-05-11
+---
+
+## Why data is the lever {#why-data}
+
+A frontier-class large language model in 2026 is, in arithmetic terms, a numerical optimum over a large product of conditional next-token distributions. That product is fully determined by three things: the architecture, the optimiser trajectory, and the data. The first two are open-sourced or closely approximated across labs; the third is where most of the divergence between published systems lives. Llama 3 8B, trained on 15 T tokens, and DCLM-Baseline 7B, trained on 2.5 T tokens, sit within a few MMLU points of each other despite a 6.6× compute gap on the training side. The DCLM authors' explanation is not architectural: it is that their 2.5 T tokens have been more aggressively filtered. This chapter is about the pipeline that produces such a curated pretraining corpus, from a raw Common Crawl WARC file to a sharded mmap'd dataset ready to be consumed by a distributed dataloader.
+
+The chapter assumes the reader has finished the prerequisites module, in particular [BPE / SentencePiece basics](/textbook/00g-tokenization-and-objectives#bpe), because nearly every quantitative claim in what follows is denominated in *tokens*, and that unit is tokenizer-relative. The chapter establishes raw sources and per-source filtering; how to *mix* sources by sampling weight and how to anneal toward higher-quality data at the end of training is the subject of the later chapter on [data mixing and curriculum](/textbook/01f-data-curriculum). The implications of the resulting tokens-per-parameter ratio for loss reduction belong to [scaling laws](/textbook/01c-scaling-laws). The construction of long-document streams from the deduplicated corpus is revisited in [long-context extension](/textbook/01g-long-context).
+
+<Callout variant="note" title="Calibration date">
+Content calibrated to frontier-model practice as of May 2026. Numbers from closed-frontier labs (OpenAI, Anthropic, Google) are intentionally hedged: their pipelines are described only at the narrative level in their technical reports. Open-frontier numbers (Meta, AI2, HuggingFace, NVIDIA, Apple/UW, Alibaba, DeepSeek) are drawn from the corresponding technical reports and dataset cards.
+</Callout>
+
+**Notation used in this chapter.** $N$ is parameter count; $D$ is pretraining-token count; $C$ is compute budget in FLOPs; $V$ is tokenizer vocabulary size; $L$ is per-token cross-entropy loss in nats. The shingle size for near-duplicate detection is $n$; the number of MinHash signatures is $K$; signatures are arranged into $b$ bands of $r$ rows each, with $K = b \cdot r$. The Jaccard similarity between two shingle sets $A$ and $B$ is $J(A,B) = |A \cap B| / |A \cup B|$.
+
+---
+
+## The 2026 data landscape {#landscape}
+
+<Figure caption="Order-of-magnitude shape of a 2026 pretraining pipeline. The Common Crawl pool shrinks roughly two orders of magnitude through HTML extraction, quality filtering, and deduplication; the trained-on corpus is a small fraction of the raw input, and quality filters do most of the cutting.">
+  <DataPipelineFlow />
+</Figure>
+
+### Four reservoirs
+
+A pretraining mix in 2026 draws from four broad reservoirs, in declining order of raw size.
+
+**(1) Open-web crawl.** Common Crawl is the substrate from which essentially every published pretraining corpus is constructed. Each monthly crawl since 2008 produces roughly 250 TB of compressed web data covering on the order of 2 billion pages; CC-MAIN-2026-12, the March 2026 snapshot, indexes 1.97 billion pages. Common Crawl distributes both raw HTTP responses (WARC files) and pre-extracted text (WET files). Derivative datasets re-process the WARCs and apply their own extraction, filtering, and deduplication. The best-known open derivatives are FineWeb (15 T tokens across 96 snapshots through April 2024, ODC-BY-licensed), its educational-classifier subset FineWeb-Edu (1.3 T tokens), DCLM-Baseline (3.8 T tokens, the substrate for Apple's open 7B), RedPajama-V2 (30 T raw tokens across 84 snapshots with quality annotations layered on top), Dolma 1.7 from AI2 (3 T tokens), Nemotron-CC from NVIDIA (6.3 T tokens, comprising 4.4 T deduplicated original text plus 1.9 T synthetic rephrases), RefinedWeb (the 5 T-token Falcon corpus), and FineWeb-2 (about 3 T words across 1,893 language-script pairs in 8 TB compressed). The relative scale of these corpora has expanded by roughly two orders of magnitude since The Pile (825 GiB, 22 sources, 2020), which is the canonical predecessor against which modern open corpora are compared.
+
+**(2) Code.** The dominant open code corpus is The Stack v2, the BigCode / Software-Heritage dataset that underlies StarCoder 2: more than 3 billion source files spanning 600+ programming languages, 67.5 TB of raw repository content, and approximately 900 B training tokens after filtering. Frontier labs supplement public code with licensed corpora — GitHub Enterprise data, private monorepos, and internal company codebases. The Llama 3 technical report discloses that code accounts for 17% of its 15 T-token training mix.
+
+**(3) Books, papers, and conversations.** Public-domain books (Project Gutenberg, Internet Archive Books), academic papers (arXiv, PubMed, the peS2o / S2ORC corpora from AI2), question-and-answer (StackExchange dumps, Reddit data through 2022), and reference content (Wikipedia, Wikidata) round out the curated long-form sources. Licensed book corpora — historically distributed under the Books3 name — have been a flashpoint of 2023–2025 copyright litigation, and most labs now describe their book sources only at the level of "licensed corpora" without specifying provenance. Dolma 1.7 is the canonical modern open-mixture replacement for The Pile.
+
+**(4) Synthetic data.** The fourth reservoir has changed character most rapidly. Cosmopedia (HuggingFace, 25 B tokens of textbook-style, blog-style, and story-style text generated by Mixtral) is the public benchmark. Phi-4's technical report discloses approximately 400 B tokens of synthetic content from roughly 50 generation pipelines, and reports a pretraining mix that is 40% synthetic, 15% filtered web, 15% web rewrites, 20% code, and 10% books-and-academic. Nemotron-CC synthesises 1.9 T tokens of rephrased web. Between 2024 and 2026, synthetic data has shifted from being a "small distillation supplement" used to inject capabilities the base corpus did not contain, to being a primary training signal — especially for math, code, and reasoning. Exact synthetic-fraction percentages at OpenAI, Anthropic, and Google are not disclosed.
+
+### Disclosed scale of recent training runs
+
+<ComparisonTable
+  caption="Disclosed pretraining token counts (text-only where multimodal) for major frontier and open models from 2020 through 2026. Quoted counts are tokenizer-relative; see the caveat below."
+  columns={["Model", "Year", "Disclosed pretraining tokens"]}
+  rows={[
+    ["GPT-3", "2020", "~300 B (sampled from 500 B pool)"],
+    ["LLaMA-1 65B", "2023", "1.4 T"],
+    ["Llama 2 70B", "2023", "2.0 T"],
+    ["Llama 3 / 3.1 (8B–405B)", "2024", "15.0 T (text); 15.6 T for 405B"],
+    ["Qwen 2.5", "2024", "18 T"],
+    ["DeepSeek-V3", "2024", "14.8 T"],
+    ["Phi-4 (14B)", "2024", "~10 T (40% synthetic)"],
+    ["DCLM-Baseline 7B", "2024", "2.5–2.6 T"],
+    ["Qwen 3", "2025", "36 T (119 languages)"],
+    ["Llama 4 Scout / Maverick", "2025", "~40 T / ~22 T (multimodal)"],
+  ]}
+/>
+
+The range is roughly an order of magnitude above Chinchilla-optimal at the smaller end, which reflects an industry-wide consensus that has settled over 2024–2026: for a *fixed-size deployable model*, training on far more tokens than the Chinchilla-optimal $D = 20N$ ratio improves both eval quality and inference economics. The formal accounting of how the marginal loss reduction relates to extra tokens at fixed $N$ is the subject of [scaling laws](/textbook/01c-scaling-laws); the practical consequence for this chapter is that the data pipeline must keep up with $D$ in the tens of trillions.
+
+<Callout variant="warning" title="Token counts are tokenizer-relative">
+"15 T tokens" in the FineWeb dataset card is measured with the GPT-2 tokenizer ($V \approx 50\,257$). "15 T tokens" in the Llama 3 technical report is measured with the Llama 3 tiktoken-based tokenizer ($V \approx 128\,256$). The Llama 3 tokenizer compresses English text into roughly 15% fewer tokens than the GPT-2 tokenizer at equal text content, so 15 T Llama-3 tokens corresponds to about 17–18 T GPT-2 tokens of underlying text. When comparing token counts across systems, either standardise to one tokenizer or treat the comparison as approximate. The point recurs throughout this chapter — every "T" in this section is tokenizer-relative.
+</Callout>
+
+### Three binding constraints
+
+The size of $D$ in any given training run is set by three constraints, in interaction. The first is the compute budget $C$, which for a dense transformer obeys $C \approx 6ND$ FLOPs to leading order, so for a fixed $C$ there is an envelope of $(N, D)$ trade-offs. The second is *raw token availability* for the languages and domains of interest. Villalobos et al. (2024) estimated that approximately 300 T high-quality public English tokens existed in raw form as of their cutoff; after deduplication and quality filtering the effective pool drops to roughly 10–50 T. By 2026 this is widely treated as the binding bottleneck for English-only pretraining and is being relieved on three fronts: synthetic data, multimodal expansion (which adds image, audio, and video corpora that are not in the English-token denominator), and licensed private corpora. The third constraint is the *quality–quantity trade-off*: DCLM and FineWeb-Edu both report that a 10× tighter classifier filter, retaining roughly 10% of the raw pool, can match or beat the unfiltered baseline on knowledge-heavy benchmarks (MMLU, ARC, HellaSwag). Whether the same trade-off holds at the 30–40 T training-token regime of Qwen 3 and Llama 4 is an open question; see [Quality filtering](#quality-filtering).
+
+### Frontier practice in May 2026
+
+Open-weights labs — Meta (Llama), Alibaba (Qwen), DeepSeek, AI2 (OLMo), Mistral — publish token counts and partial pipeline descriptions in their technical reports. The numbers used in this chapter come from those reports, the corresponding HuggingFace dataset cards, and the published derivative-dataset papers (FineWeb, DCLM, Nemotron-CC, Dolma, RedPajama-V2). Closed frontier labs — OpenAI's GPT-5 / o-series, Anthropic's Claude 4, Google DeepMind's Gemini 2.5 — disclose only narrative-level descriptions: "filtered web data, code, academic content, licensed corpora, and large quantities of synthetic data." Specific filter thresholds, deduplication parameters, and source-mix percentages are not public. The discussion in the rest of this chapter will flag this asymmetry wherever it bears on a quantitative claim. The industry trend across 2024–2026 has been consistent: a shift from WET to WARC re-extraction, a shift from pure heuristic filtering to classifier-based filtering, an increase in synthetic-data share from under 1% to over 25% in some mixes, and the addition of multilingual sub-pipelines via FineWeb-2 / Qwen-3 / Llama-4-style per-language adaptation.
+
+---
+
+## HTML extraction {#html-extraction}
+
+### WARC versus WET
+
+Every web-derived pretraining corpus begins from one of two file formats. WARC (Web ARChive) files contain the *raw* HTTP responses captured by the crawler, including the full HTML body, the response headers, and crawl metadata. A single Common Crawl monthly archive is approximately 90 TB compressed in WARC form. WET (WARC Encapsulated Text) files contain plain-text output that Common Crawl produces from the WARCs using its own boilerplate-stripping pipeline; they are roughly one-sixth the size of WARC and are convenient to consume, but lossy.
+
+Pre-2023 corpora — C4, the original CCNet, RedPajama-V1, the Common Crawl component of The Pile — operated on WET. The pivotal 2023–2024 finding, stated most cleanly in the RefinedWeb (Penedo et al. 2023) and FineWeb (Penedo et al. 2024) papers, is that *re-extracting text from raw WARCs with a modern, boilerplate-aware library substantially outperforms WET on downstream benchmarks*. WET extraction is encoding-fragile, drops too much in some regimes and too little in others, and discards structural cues (lists, code blocks, inline math) that downstream filters and the model itself can exploit. Every open frontier dataset released from 2024 onward — FineWeb, DCLM, Nemotron-CC, Dolma — operates on WARC.
+
+### Three modern extractors
+
+The open-source extraction landscape converges on three libraries, each occupying a different point on the precision–recall–throughput envelope.
+
+<ComparisonTable
+  caption="The three principal modern HTML extractors used in open pretraining corpora. Throughput claim is relative to Trafilatura."
+  columns={["Tool", "Approach", "Used by", "Notable property"]}
+  rows={[
+    ["Trafilatura (Barbaresi 2021)", "XPath rule cascade with jusText / readability fallback", "FineWeb, RefinedWeb", "Highest per-page quality in author's benchmarks"],
+    ["jusText (Pomikálek 2011)", "Block classification on length, link density, stopword frequency", "Nemotron-CC", "Highest token yield downstream of FineWeb-Edu classifier"],
+    ["Resiliparse (Bevendorff 2018)", "Hand-tuned heuristics implemented in Rust/C++", "DCLM, DCLM-Baseline", "~10× faster than Trafilatura"],
+  ]}
+/>
+
+The empirical comparison published by Bevendorff et al. (SIGIR 2023) reports that only about 39% of pages survive across more than one extractor at neutral quality settings; the remaining 61% are dropped by at least one of the three. The natural response — taking the union of pages surviving *any* extractor and re-deduplicating afterwards — increases token yield by 71% at neutral quality in a 2026 reproduction. Frontier-lab open-pipeline practice is converging on multi-extractor union plus a unified deduplication pass.
+
+### Math: there is none
+
+Extraction is purely an engineering decision. The relevant trade-off space is *precision* (no navigation bars, footers, cookie banners, advertising boilerplate) versus *recall* (do not drop math, code, tables, or long-tail content types that the standard extractor heuristics misclassify as boilerplate). Lab-specific custom parsers — the "custom parser optimised for math and code" that the Llama 3 Herd report describes, and the parser DeepSeek references in the V3 report — sit further out on the recall axis. They preserve `alt` attributes on inline images, because server-side-rendered LaTeX often appears as `<img alt="...">`; they preserve `<pre>` and `<code>` blocks verbatim; they preserve table-row and list-item structure.
+
+### Worked example: the Llama 3 custom parser
+
+The Llama 3 Herd report (Grattafiori et al. 2024) describes a custom HTML parser that (i) optimises precision against navigation, footers, cookie modals, and similar UI cruft, (ii) optimises recall on math and code by preserving structural elements — pre-formatted blocks, table rows, list items — and (iii) preserves `alt` attributes on inline images because pre-rendered LaTeX appears as `<img alt="...">` on many math sites. The paper reports that this custom path outperforms off-the-shelf Trafilatura on Meta's internal math-and-code evaluations. The source code is not disclosed. Whether the standard Trafilatura plus image-alt-preservation can reproduce this gain is an open question.
+
+### Frontier practice in May 2026
+
+All open frontier datasets re-extract from WARC; WET is now legacy and appears only as a baseline in ablations. Trafilatura is the most-cited default in academic publications and the HuggingFace dataset ecosystem. Resiliparse dominates wherever throughput is the binding constraint — DCLM processed 240 T tokens through its extraction stage, a workload at which the Trafilatura/Python combination is impractical. jusText survives as a niche choice where the combination "jusText extraction + FineWeb-Edu classifier" produces the highest downstream token yield, as in Nemotron-CC. Closed frontier labs are believed — but not confirmed — to use custom multi-extractor pipelines with math- and code-aware structural preservation similar to Llama 3's.
+
+---
+
+## Quality filtering {#quality-filtering}
+
+### Three generations
+
+Quality filters drop documents that are low-information, off-topic, or otherwise expected to harm downstream performance. Three generations of filter coexist in 2026 practice and are typically run in sequence on the same corpus.
+
+**(a) Heuristic filters.** Fast, interpretable, blunt. The MassiveText / Gopher filters (Rae et al. 2021) define the canonical set: word count between 50 and $10^5$; mean word length between 3 and 10 characters; symbol-to-word ratio below 0.1; bullet-list ratio below 0.9; ellipsis-terminated line ratio below 0.3; at least 80% of words containing at least one alphabetic character; and the page must contain at least two of the stop-word set \{the, be, to, of, and, that, have, with\}. The C4 filters (Raffel et al. 2020) are stricter still: keep only lines ending in terminal punctuation; drop pages with fewer than five sentences; drop pages containing any token from the LDNOOBW blocklist (see [PII, toxicity, contamination](#pii-tox-contam) for the disparate-impact problem this creates); drop pages containing literal `{` or `}` characters to suppress JavaScript leakage. FineWeb (Penedo et al. 2024) adds three further heuristics calibrated by ablation: drop pages where the fraction of lines ending in punctuation is below 0.12 (which removes about 10% of tokens); drop pages where the duplicated-line character ratio is above 0.1 (about 12% of tokens); drop pages where at least 67% of lines are shorter than 30 characters (about 3% of tokens). The combined heuristic stage removes roughly 22% of tokens and gains about 1% on the FineWeb downstream-benchmark aggregate.
+
+**(b) Classifier filters.** Embedding-based or fastText-based models trained to recognise "quality" as proxied by some positive class. GPT-3 (Brown et al. 2020) trained a logistic-regression classifier over a hashing-trick feature representation: positive class = WebText, Wikipedia, and Books; negative class = random Common Crawl. The Pareto filter retains the top ~22% of CC pages by classifier score. Llama 2 and Llama 3 each describe a fastText classifier identifying "Wikipedia-referenced text," supplemented in Llama 3 by a DistilRoBERTa classifier trained on Llama-2-labelled documents and by a KL-divergence-on-token-distribution filter that drops outlier-token documents. The FineWeb-Edu classifier (Penedo et al. 2024) is the open reference for an LLM-annotated quality model: prompt Llama-3-70B-Instruct to score 460 K – 500 K FineWeb documents 0–5 on educational value; train a single-output linear regression head on top of frozen Snowflake-Arctic-embed (768-d); binarise at score ≥ 3, giving binary F1 ≈ 82%. Applied to FineWeb, this filter keeps about 1.3 T tokens, roughly 8% of the input. The DCLM fastText classifier (Li et al. 2024) uses a different positive class: OpenHermes-2.5 instructions plus the top Reddit r/ExplainLikeImFive responses, with random Common Crawl as negative. Keeping the top 10% by classifier score, DCLM's classifier outperforms perplexity filtering, BGE-embedding classifiers, AskLLM, PageRank, and SemDeDup on the DCLM benchmark.
+
+**(c) LLM-judge filters.** The most expensive and most aggressive option. Phi-1 and Phi-1.5 (Gunasekar et al. 2023; Li et al. 2023) use GPT-3.5- and GPT-4-judged "textbook quality" labels on a small web sample to train a classifier that filters the rest. Phi-4 (Abdin et al. 2024) takes the logic further and replaces large-corpus filtering with *generation*: synthetic textbooks and rephrased-web text are produced directly by a teacher model, and the pretraining mix is reported as 40% synthetic. Llama 3.1's "annotator pipeline" (Grattafiori et al. 2024) uses earlier-generation Llama models to do topic classification and reasoning-quality scoring on late-stage data.
+
+### The "more compute on filtering" argument, and the Nemotron-CC counterweight
+
+DCLM is the canonical empirical statement of "more compute on filtering pays off." The fastText OH-2.5 + ELI5 classifier delivers a 3.5-point improvement on DCLM's Core metric over reference-only filters (Wikipedia, GPT-3 reproductions). FineWeb-Edu, evaluated on a different 1.8 B-parameter Llama-architecture base, reports that pretraining on a 10× smaller filtered subset *matches or beats* unfiltered training on knowledge tasks: +12% relative MMLU and +24% relative ARC at equal training-token budget. The implication that DCLM and FineWeb-Edu draw from these numbers is that, at frontier scale, spending compute on a *filtering classifier* is more cost-effective than spending the same compute on extra raw tokens. Bansal et al. (2025) and the BETR framework formalise this and provide scaling-law-style projections of optimal filtering aggressiveness as a function of $N$ and $D$.
+
+The counter-evidence comes from Nemotron-CC (Su et al. 2024). At the long-horizon regime — pretraining-token budgets above approximately 10 T — aggressive single-classifier filtering becomes *token-limited*: dropping 90% of the corpus leaves fewer tokens than the model needs, and the marginal value of each extra Wikipedia-style high-quality token falls off. Nemotron-CC's response is twofold. First, ensemble multiple model-based classifiers (FineWeb-Edu, DCLM's OH-2.5 + ELI5, and a Nemotron-trained classifier) and keep documents flagged as high quality by *any* of them. The ensemble retains a larger high-quality pool than any single classifier alone. Second, *rephrase* low-quality web with a teacher model rather than dropping it, producing 1.9 T tokens of synthetic rephrases that can be mixed with the 4.4 T deduplicated original. Nemotron-CC also explicitly disables some classical heuristic filters because the classifier ensemble would have kept the documents the heuristics removed.
+
+The argument is unsettled. DCLM and FineWeb-Edu provide strong evidence at 7 B – 13 B model scale and training-token budgets at or below 5 T. Nemotron-CC's classifier-ensembling-plus-rephrasing argues against aggressive single-classifier filtering at the 10 T+ regime. Whether DCLM-style aggressive filtering would still dominate at the 36 T scale of Qwen 3 or the 40 T scale of Llama 4 — or whether at that scale the ensemble-plus-rephrase strategy is unambiguously better — is not settled by published evidence.
+
+### Math: classifier filtering as importance reweighting
+
+A binary filter classifier $f(x) \in [0,1]$ approximates the ratio of densities
+
+$$ f(x) \;\approx\; \frac{p(x \mid \text{high-quality})}{p(x \mid \text{web})}.$$
+
+Filtering at threshold $\tau$ is therefore a form of importance sampling: documents are selected with probability $\mathbf{1}[f(x) > \tau]$, which up to normalisation re-weights the source distribution toward the high-quality target. With percentile-keep filtering (retain the top $k\%$ of the corpus by score), the empirical KL divergence
+
+$$ D_{\mathrm{KL}}\!\big(\,\hat p_{\text{filtered}} \;\big\|\; p_{\text{target}}\,\big) $$
+
+decreases monotonically in the compute spent training the classifier, up to a floor set by labeller noise and out-of-distribution coverage. This is the formal sense in which "more compute on filtering" is a defensible operating regime. The caveat — and it is the more important one in practice — is that the *target* distribution is itself a choice. OpenHermes-2.5 + ELI5 selects for instruction-style explanatory prose. Wikipedia-referenced text selects for encyclopaedic prose. A misaligned target can hurt downstream performance on tasks whose prose style does not match the positive class, and this is one of the reasons Nemotron-CC's *ensemble* approach reports a larger usable pool than any single classifier.
+
+### Worked example: the FineWeb-Edu pipeline
+
+The full FineWeb-Edu construction sequence is:
+
+1. Sample 460 K documents from FineWeb.
+2. Prompt Llama-3-70B-Instruct: "Score 0–5 the educational value of the following document," with a rubric specifying what counts at each score.
+3. Train a single-output linear regression head on top of the frozen Snowflake-Arctic-embed (768-d) representation of each document.
+4. Calibrate the threshold: at score $\geq 3$, binary F1 = 82%; this drops about 92% of FineWeb.
+5. Apply to all of FineWeb. Result: 1.3 T educational tokens.
+6. Train a 1.82 B-parameter Llama-architecture model on FineWeb-Edu versus on FineWeb at equal token budget. FineWeb-Edu wins by +12% on relative MMLU and +24% on relative ARC.
+
+The pipeline is reproducible; the classifier weights are published as `HuggingFaceFW/fineweb-edu-classifier` on the HuggingFace Hub.
+
+### Frontier practice in May 2026
+
+Heuristic-plus-classifier ensembles dominate. Pure heuristic filtering is now considered insufficient at frontier scale. LLM-judge filtering of the Phi style is dominant only for synthetic and boutique corpora; it is not used as the sole filter for the multi-trillion-token base web corpus, because the inference cost of an LLM judge over $10^{10}$ documents is prohibitive even at frontier-lab compute scale. Most labs apply two to four classifiers in series or as a weighted ensemble, often with the second classifier targeting a different distributional slice from the first.
+
+---
+
+## Deduplication {#deduplication}
+
+### Why deduplicate at all
+
+Web-crawl corpora contain massive duplication: the same news article republished on syndicated outlets, mirrored Wikipedia copies, common boilerplate that recurs across thousands of low-content pages, and crawl revisits of the same URL across successive snapshots. Lee et al. (2022), "Deduplicating Training Data Makes Language Models Better," is the canonical empirical statement of why this matters: deduplicated training reduces verbatim memorisation by approximately 10× and matches or improves downstream accuracy at *fewer* training steps. The result has been confirmed at multiple scales since 2022, and modern pipelines treat deduplication as a non-optional stage. Two families of technique coexist.
+
+### Near-duplicate (fuzzy) deduplication: MinHash + LSH
+
+The dominant method for near-duplicate detection at trillion-document scale is MinHash combined with locality-sensitive hashing (LSH). The construction proceeds in three steps.
+
+**Step 1: shingling.** Each document is represented as the set of its overlapping $n$-grams (shingles), where the gram unit is typically words but is sometimes characters. The choice of $n$ matters and is not standardised: the empirical norm in open pretraining datasets is $n = 5$ (FineWeb) to $n = 13$ (Gopher / MassiveText, SlimPajama). A frequently cited convention of "9-gram, 80% Jaccard" appears in older notes but is *not* literally what any single major open dataset uses; it is a midpoint of the empirical range rather than a canonical setting from a specific paper. The chapter takes the position that $n \in [5,13]$ is the empirical norm and that the choice trades off between catching short reused passages (smaller $n$) and avoiding false positives on common phrases (larger $n$).
+
+**Step 2: MinHash signatures.** Compute $K$ MinHash signatures for each document. A MinHash function is a permutation-invariant hash defined so that for two sets $A$ and $B$,
+
+$$ \Pr\big[\operatorname{minhash}(A) = \operatorname{minhash}(B)\big] \;=\; J(A,B) \;=\; \frac{|A \cap B|}{|A \cup B|}.$$
+
+Averaging the equality indicator over $K$ independent hash functions gives an unbiased estimator of Jaccard similarity, with variance approximately $J(1-J)/K$. At $K = 128$ and $J = 0.8$, the standard error is roughly 3.5%. The typical $K$ in pretraining pipelines is 64–256. FineWeb uses $K = 112$; SlimPajama uses 128.
+
+**Step 3: LSH banding.** Split the $K$ signatures into $b$ bands of $r = K/b$ rows each. Two documents are flagged as *candidate duplicates* if their signatures match in *at least one* band. The probability that two documents with Jaccard similarity $s$ are flagged is
+
+$$ \Pr[\text{candidate}] \;=\; 1 - (1 - s^r)^b.$$
+
+This is the LSH S-curve, and choosing $b$ and $r$ subject to $K = br$ shifts the curve's knee. The conventional approximation is that the threshold sits near
+
+$$ t \;\approx\; (1/b)^{1/r}.$$
+
+For $K = 128$ with $b = 16$ bands of $r = 8$ rows, $t \approx 0.78$. For FineWeb's $K = 112$ with $b = 14$ bands of $r = 8$, $t \approx 0.81$ in the formula; the FineWeb authors report an effective threshold of approximately 0.75 in practice because the approximation underestimates the soft shoulder of the S-curve. Total cost is $O(NK)$ hash computations and $O(Nb)$ bucket inserts, plus the candidate-pair verification work, which scales with the collision rate.
+
+### Exact-substring deduplication: suffix arrays
+
+The Lee et al. (2022) reference implementation, `deduplicate-text-datasets`, builds a suffix array over the entire concatenated corpus and, for a chosen minimum match length $k$, removes all but one occurrence of every substring of length $\geq k$ that appears more than once. The recommended $k$ is 50 tokens. Suffix-array construction is $O(n \log n)$ in corpus length; the Google Research Rust implementation is the standard reference. Exact-substring is *complementary to* MinHash: it catches reused passages that share insufficient context to register as near-duplicate documents (e.g., a paragraph of legal boilerplate copied into otherwise distinct documents). The most aggressive published pipelines run both, in sequence.
+
+### Bloom-filter deduplication: BFF
+
+AI2's `bff` ("Big Friendly Filter") maintains a Bloom filter of seen paragraph hashes or $n$-gram hashes and drops re-occurring entries. It is cheaper than MinHash, has exact recall on identity matches (no false negatives when the same paragraph appears verbatim), and lower recall on genuine near-duplicates than MinHash. Dolma uses BFF at the paragraph level; DCLM uses BFF at the document *and* paragraph levels simultaneously. The BFF approach trades off MinHash's fuzzy-match recall for substantially lower compute, and at DCLM-style scale (240 T input tokens) the compute argument is decisive.
+
+### Document-level versus span-level deduplication
+
+Document-level deduplication removes a flagged document in its entirety. Span-level (or line-level) deduplication removes only the repeated substring while retaining the rest of the document. Llama 3 uses aggressive line-level deduplication: a line is dropped if it appears more than six times in any 30 M-document bucket. The trade-off is that document-level is safer in the sense of preserving local context (the model sees coherent surrounding prose), but it misses boilerplate that recurs across otherwise-unique documents; line-level catches such boilerplate but risks fragmenting the surrounding text into less-coherent passages. Llama 3's three-tier strategy — URL-level deduplication first, then document-level MinHash, then line-level — is one negotiated answer.
+
+### The FineWeb inter-snapshot finding, and its FineWeb-2 reversal
+
+The FineWeb authors' a-priori expectation was that deduplicating *across all 96 Common Crawl snapshots* would maximise quality. They found the opposite: aggressive cross-snapshot deduplication *hurt* downstream performance. The mechanism, as they explain it, is that deduplicating against newer snapshots disproportionately removes the higher-quality, more-frequently-re-crawled URLs from older snapshots — leaving the older snapshots with a higher residue of low-quality content that was never re-crawled. The remedy was *per-snapshot* MinHash deduplication only, which retains roughly 20 T tokens versus the 5 T that cross-snapshot deduplication would have left. The finding has been re-confirmed in RedPajama-V2 and Nemotron-CC.
+
+FineWeb-2 (Penedo et al. 2025), the multilingual successor, *reverses* this policy. For each language, FineWeb-2 deduplicates globally across all snapshots within that language. The reason is that for low-resource languages the corpus is small enough that per-snapshot deduplication leaves too much intra-document repetition — many low-resource pages are simply re-crawled translations of the same source material — and the absolute level of duplication overwhelms the per-snapshot mechanism's protective effect. The reversal is not a contradiction. It is a context-dependent re-optimisation: when the input is large and the duplicates are largely cross-snapshot re-crawls of distinct content, per-snapshot deduplication protects against systematic quality loss; when the input is small and intra-language repetition dominates, global deduplication is the binding constraint. The lesson is that "always per-snapshot" and "always global" are both incorrect; the right policy is a function of the input's noise–signal ratio at the language level.
+
+### Worked example: FineWeb's dedup configuration
+
+The FineWeb deduplication pass, applied across approximately 25 B candidate documents from 96 Common Crawl snapshots, proceeds as follows.
+
+1. Shingle each document into 5-grams of words after Trafilatura extraction and the heuristic filters.
+2. Compute 112 MinHash signatures per document.
+3. Arrange the 112 signatures into $b = 14$ bands of $r = 8$ rows. The S-curve places the effective Jaccard threshold near $t \approx 0.75$.
+4. Apply LSH banding *within* each Common Crawl snapshot independently. Do not deduplicate across snapshots.
+5. The output, after also applying the FineWeb heuristic filters, is approximately 15 T tokens (GPT-2 tokenizer) — roughly one-third of the approximately 50 T raw extracted tokens.
+
+### Frontier practice in May 2026
+
+<ComparisonTable
+  caption="Deduplication approach across representative open and partly-open frontier corpora as of May 2026. 'Not fully disclosed' indicates the technical report describes the broad strategy but not parameter values."
+  columns={["Corpus / model", "Year", "Dedup approach"]}
+  rows={[
+    ["FineWeb (HuggingFace)", "2024", "MinHash 5-gram, 112 hashes, 14×8 bands, per-snapshot only"],
+    ["FineWeb-2 (HuggingFace)", "2025", "MinHash per language, global across snapshots"],
+    ["DCLM-Baseline (Apple/UW)", "2024", "BFF Bloom filter, doc + paragraph simultaneously"],
+    ["RedPajama-V2 (Together)", "2023", "MinHash annotations exposed; consumer picks cutoff"],
+    ["Dolma (AI2)", "2024", "BFF Bloom filter, exact paragraph"],
+    ["Llama 3 (Meta)", "2024", "URL-level + document MinHash + line-level (>6 in 30M-doc bucket)"],
+    ["SlimPajama (Cerebras)", "2023", "MinHashLSH 13-gram, Jaccard 0.8"],
+    ["Gopher / MassiveText (DeepMind)", "2021", "MinHash 13-gram"],
+    ["Nemotron-CC (NVIDIA)", "2024", "Global MinHash on the 4.4 T original tokens"],
+    ["StarCoder 2 / The Stack v2", "2024", "Exact file-hash dedup + near-dedup at file level"],
+  ]}
+/>
+
+Across labs, MinHash + LSH with $n$-grams in the 5–13 range remains the modal choice for the near-duplicate stage. Exact-substring (Lee-style) deduplication is run *after* near-deduplication at the most aggressive labs. Google's Gemini pipeline is believed to use both stages; the same is not confirmed for OpenAI or Anthropic.
+
+---
+
+## PII, toxicity, and contamination {#pii-tox-contam}
+
+This section covers three categories of "remove dangerous content" that share a software pipeline but have very different precision–recall trade-offs and very different downstream consequences.
+
+### Personally identifiable information
+
+PII removal applies pattern-matching plus named-entity recognition to redact emails, phone numbers, government identifiers (SSNs, national IDs), credit-card numbers, and IP addresses. The dominant open tools are Microsoft Presidio (an extensible NER plus regex framework), scrubadub (pure regex, lightweight), and spaCy / Flair NER models. Frontier-lab code corpora apply aggressive PII redaction because of the personally-identifying metadata embedded in GitHub commit history (author email, author name, often phone numbers in commit messages). StarCoder 2 and Llama 3 both describe redaction tokens — emails become `<EMAIL>`, API keys become `<KEY>`, and so on. The documented limitations are well-rehearsed in the literature: NER misses transliterated names, edge-case email formats, and culturally-specific personal markers, and the redaction tokens themselves leak signal that the original document contained PII. Frontier-lab web-corpus PII filtering tends to be less aggressive than code-corpus PII filtering, because emails and phone numbers in legitimate business pages are arguably useful retrieval-style signal that the model may need to learn to handle.
+
+### Toxicity filtering and disparate impact
+
+Older pipelines (C4, RefinedWeb) use the LDNOOBW ("List of Dirty, Naughty, Obscene, and Otherwise Bad Words"), a 400-plus-term blocklist originally maintained by Shutterstock, to drop entire pages that contain any term. Dodge et al. (2021) document a serious disparate-impact problem with this approach: LDNOOBW filtering disproportionately drops African-American English (42% of the AAE subset removed) and Hispanic-aligned English (32%), compared to 6.2% for white-aligned English. The numbers measure removal-rate disparity, not toxicity-rate correlation, and the most natural reading is that the LDNOOBW list includes terms that are in-group register markers in some subcommunities but not in others. Perspective API (Jigsaw) is a learned classifier sometimes used for moderation; published audits (Sap et al. 2019; Welbl et al. 2021) report systematically higher false-positive rates on text by or about minority groups. Frontier practice has shifted, over 2024–2026, toward calibrated classifier-based filters that report explicit subgroup metrics rather than naive blocklists. Anthropic's 2025 alignment-blog post on pretraining-data filtering for tamper-resistant safety argues that pretraining-time filtering is more durable than post-hoc moderation but must be explicitly audited for disparate impact. The trade-off space is not yet a solved engineering problem; it is an active research area.
+
+### Contamination removal
+
+The goal of contamination removal is to ensure that pretraining text does not contain the *evaluation* benchmark questions or their answers, so that reported MMLU / GSM8K / HumanEval / ARC numbers reflect generalisation rather than memorisation. The canonical method is $n$-gram overlap between the eval corpus and the pretraining corpus, with both $n$ and the overlap fraction $f$ configurable.
+
+Historical conventions span a range. GPT-2 (Radford et al. 2019) uses 8-grams. GPT-3 (Brown et al. 2020) uses 13-grams and flags a document as contaminated on any 13-gram collision with any eval document. Gopher / MassiveText uses 13-grams. Llama 2 (Touvron et al. 2023) operates at the token level, refined to "a token is contaminated if it appears in a ≥10-token $n$-gram that is present in both eval and train" and aggregates this into a document-level score. Llama 3 (Grattafiori et al. 2024) uses 8-gram tokens. The range $n \in [8, 13]$ is the industry compromise, and there is no closed-form optimum: increasing $n$ reduces false positives (legitimate language reuse — common phrases, news article quotations, Wikipedia passages — registers less) but reduces detection of *paraphrase contamination*. A strict policy at small $n$ over-removes legitimate text; a loose policy at large $n$ leaves real contamination undetected. The EleutherAI lm-evaluation-harness ships an $n$-gram decontamination procedure that is the de facto open-source reference.
+
+A live limitation is that $n$-gram overlap does not detect *paraphrase contamination*. Several 2024–2025 audits — the survey of Sainz et al. (2024), and follow-on work by Xu et al. — report evidence of paraphrase contamination in widely-used benchmarks *even after* labs apply $n$-gram filtering. The current mitigation is to hold out benchmarks whose content post-dates the pretraining cutoff (recent code repositories, recent math contests), but this only postpones the problem. Paraphrase-level contamination detection is an open problem and a recognised confound in benchmark comparisons; 2025–2026 frontier-lab eval reports increasingly include explicit "contamination audit" sections (Qwen 3, Llama 4, DeepSeek-V3).
+
+### Worked example: the Llama 3 contamination removal pipeline
+
+The Llama 3 pipeline (Grattafiori et al. 2024) is described in its appendix as follows. Collect every evaluation benchmark known or planned for the model. Tokenise both the eval set and the pretraining corpus in the Llama tokenizer. Compute 8-gram overlap: a pretraining document is flagged contaminated if a sufficient fraction of its 8-grams overlap with any eval document. Drop flagged documents. Report contamination per benchmark in the appendix. The Llama 3 numbers were small enough (under 1% on every standard benchmark) that the authors argue the reported model scores are not meaningfully inflated; the chapter notes that this conclusion does *not* extend to paraphrase contamination, which 8-gram overlap does not detect. The integrity of every benchmark number reported in [scaling laws](/textbook/01c-scaling-laws) and in downstream evaluation chapters rests on this filter operating correctly, which is one reason contamination audits have become standard practice.
+
+---
+
+## Multilingual considerations {#multilingual}
+
+Multilingual pretraining adds three steps not needed (or much simpler) in English-only pipelines: language identification, per-language quality calibration, and per-language deduplication. It also surfaces a downstream sampling decision — how to weight languages in the training mix — which is treated more thoroughly in [data mixing and curriculum](/textbook/01f-data-curriculum).
+
+### Language identification
+
+The open-source LID hierarchy in 2026 has three principal options. CLD3 (Google) is the legacy choice: an $n$-gram plus small-neural model covering 107 languages, fast but with lower accuracy on short text and code-mixed content. fastText LID (Joulin et al. 2017; Grave et al. 2018) is the de facto open default for pretraining, with 176 language labels; CCNet, RefinedWeb, FineWeb, and DCLM all use fastText with confidence thresholds in the 0.5–0.65 range (FineWeb uses 0.65 for English; RefinedWeb uses 0.5). GlotLID (Kargaran et al. 2023, EMNLP Findings) extends coverage to 1,665 language labels in its initial release and over 2,000 in subsequent versions, and is the only widely-deployed open LID with substantive low-resource coverage; it outperforms fastText, CLD3, and OpenLID on balanced F1 and false-positive rate for long-tail languages. NLLB-LID (Meta NLLB 2022) covers 200+ languages and is trained as part of the No Language Left Behind translation system.
+
+A 2024–2026 trend is to run LID at the *sentence* level rather than the document level, because code-mixed pages — common in many South Asian, African, and European bilingual contexts — would otherwise be assigned a single dominant-language label and the secondary-language content would be discarded or mis-categorised. FineWeb-2 uses sentence-level GlotLID.
+
+### Per-language quality thresholds
+
+A single quality threshold applied uniformly across all languages systematically over-filters low-resource languages. The mechanism is straightforward: classifier filters trained on Wikipedia-like text — even when language-balanced — assign lower scores to languages whose Wikipedia is small or stylistically narrow, because the embedding model has seen less of that language and its representations have higher variance. FineWeb-2's response is to retrain the same FineWeb pipeline per language, with per-language stopword lists, per-language tokenization parameters, and per-language deduplication. Cohere's Aya project and Meta's NLLB pursue analogous per-language calibration. The effect on the long-tail-language token budget is large: for some languages, per-language calibration recovers an order of magnitude more usable tokens than a single uniform threshold.
+
+### The long-tail problem
+
+For a language with fewer than approximately 1 M speakers, even after extraction and deduplication the resulting corpus is dominated by religious texts (Bible and Quran translations are disproportionately well-represented), news, government documents, and machine-translated UN-style content. These genre biases distort downstream model behaviour in that language: the model is fluent on bureaucratic prose and on religious idiom and noticeably less fluent on informal or conversational text. FineWeb-2 covers 1,893 language-script pairs spanning roughly 1,000 distinct languages; for most of these the per-language corpus is below 100 M tokens, and modelling quality on these languages is poorly correlated with general benchmarks like MMLU.
+
+### Math: temperature sampling across languages
+
+Once per-language corpora exist, the next decision is how to *mix* them at training time. The standard procedure is temperature sampling: language $i$ is sampled with probability
+
+$$ p_i \;=\; \frac{n_i^{\alpha}}{\sum_j n_j^{\alpha}},$$
+
+where $n_i$ is the natural token count for language $i$ and $\alpha \in [0,1]$ controls how aggressively the long tail is upsampled. At $\alpha = 1$ the mix is proportional to natural frequency, and low-resource languages are under-represented relative to their share of the world's speakers. At $\alpha \to 0$ the mix becomes uniform across languages, and low-resource languages are over-represented relative to the data the model has seen for them — with elevated risk of overfitting and benchmark gaming. NLLB and mBART report using $\alpha \approx 0.3$; Llama 3's disclosed mix is consistent with $\alpha \approx 0.5$, though the report does not state the figure directly. Qwen 3 explicitly targets 119 languages with what is described as a "token-balanced upsampling" strategy that is consistent with a temperature-sampling regime but does not disclose $\alpha$.
+
+### Frontier practice in May 2026
+
+All open frontier datasets ship multilingual variants — FineWeb-2, RedPajama-V2 multilingual subsets, the multilingual portions of Nemotron-CC. Sentence-level LID is increasingly standard. Per-language calibration of filters is the open-source default following FineWeb-2. Closed-frontier labs disclose multilingual *capability* — Gemini, GPT-5, and Claude all advertise strong non-English performance — but not pipeline detail. The chapter notes that any apparent comparison between a frontier-lab system's multilingual coverage and an open dataset's coverage is dependent on the tokenizer being used: the same physical text produces fewer tokens under the Llama-3 tokenizer than under the GPT-2 tokenizer (see again the [Token counts are tokenizer-relative](#landscape) callout).
+
+---
+
+## Frontier-practice landscape {#frontier-practice}
+
+The comparison below collects the most-cited and most-recent open-corpus pipelines into a single table. Where the technical report describes the broad approach but not the parameter values, this is marked "not disclosed."
+
+<ComparisonTable
+  caption="Representative open and partly-open pretraining corpora from 2020–2025. Token counts are tokenizer-relative; see the landscape section. Closed-frontier labs (OpenAI, Anthropic, Google) are omitted because no comparable per-stage details are public."
+  columns={["Corpus / model", "Year", "Tokens (T)", "Primary extractor", "Primary quality filter", "Dedup method", "Notable feature", "Source"]}
+  rows={[
+    ["The Pile (EleutherAI)", "2020", "0.28", "n/a (curated sources)", "curation by source", "exact dedup", "22-source mix incl. arXiv/PubMed/GitHub", "arXiv:2101.00027"],
+    ["GPT-3 (OpenAI)", "2020", "0.30 (sampled)", "WET", "logistic-regression classifier", "MinHash LSH (Spark)", "60% CC / 22% WebText2 / 16% books / 3% Wiki mix", "arXiv:2005.14165"],
+    ["Gopher / MassiveText (DeepMind)", "2021", "0.30 used", "WET", "MassiveText heuristics", "MinHash 13-gram + test-set dedup", "first formalised heuristic set", "arXiv:2112.11446"],
+    ["RefinedWeb / Falcon", "2023", "5 (3 released)", "Trafilatura on WARC", "MassiveText heuristics", "MinHash + exact-substring", "demonstrated web-data-only can match curated", "arXiv:2306.01116"],
+    ["Dolma (AI2)", "2024", "3.0", "Trafilatura + custom", "Gopher + C4 heuristics", "BFF paragraph", "fully-open data for OLMo", "arXiv:2402.00159"],
+    ["FineWeb (HuggingFace)", "2024", "15", "Trafilatura on WARC", "C4 + MassiveText + 3 custom heuristics", "MinHash 5-gram, 112 hashes, per-snapshot", "inter-snapshot dedup finding", "arXiv:2406.17557"],
+    ["FineWeb-Edu", "2024", "1.3", "inherits FineWeb", "Snowflake-Arctic-embed + Llama-3-70B annotations, score ≥ 3", "inherits", "classifier-driven educational subset", "arXiv:2406.17557"],
+    ["DCLM-Baseline (Apple/UW)", "2024", "3.8 (training 2.5)", "Resiliparse", "fastText OH-2.5 + ELI5, keep top 10%", "BFF doc + paragraph", "'more compute on filter' empirical case", "arXiv:2406.11794"],
+    ["Llama 3 / 3.1 (Meta)", "2024", "15–15.6", "custom (math/code-aware)", "fastText + DistilRoBERTa + KL filter", "URL + doc MinHash + line-level (>6 in 30M)", "50% general / 25% math / 17% code / 8% multilingual", "arXiv:2407.21783"],
+    ["Nemotron-CC (NVIDIA)", "2024", "6.3 (4.4 + 1.9 synth)", "jusText", "classifier ensemble + heuristics relaxed", "global MinHash", "ensemble + 30% synthetic rephrase", "arXiv:2412.02595"],
+    ["FineWeb-2 (HuggingFace)", "2025", "~3 (words)", "Trafilatura", "per-language adapted FineWeb pipeline", "per-language global MinHash", "1,893 language-script pairs", "arXiv:2506.20920"],
+    ["Qwen 3 (Alibaba)", "2025", "36", "proprietary; Qwen2.5-VL on PDFs", "not fully disclosed", "not fully disclosed", "119 languages, PDF extraction stage", "arXiv:2505.09388"],
+  ]}
+/>
+
+Reading across the table, four trajectories are visible. The shift from WET to WARC extraction crystallises around 2023 with RefinedWeb and is universal in open corpora from 2024 onward. The shift from heuristic-only to classifier-based filtering is concurrent: Gopher (2021) is the high point of heuristic-only practice; DCLM (2024) is the high point of classifier-aggressive filtering. The synthetic-data fraction grows from zero in The Pile to 30% in Nemotron-CC and 40% in Phi-4 over four years. And the multilingual coverage scales from ~30 languages in Llama 3 to 119 in Qwen 3 and 1,893 language-script pairs in FineWeb-2 — though with the long-tail caveat that the per-language corpus shrinks rapidly past the top 50 languages.
+
+---
+
+## Worked example: the DCLM-Baseline recipe {#worked-example}
+
+DCLM-Baseline is the most thoroughly documented public end-to-end recipe that produced a frontier-comparable model from web data alone. The 7 B model trained on it achieves 64.0% on MMLU 5-shot and a 53-task aggregate comparable to Mistral 7B v0.3 and approaching Llama 3 8B's 66% — at 2.5–2.6 T training tokens, against Llama 3 8B's 15 T. Every choice in the pipeline is documented in Li et al. (2024) or in the public DCLM GitHub repository, which makes the recipe a useful anchor for the abstract concepts in the rest of the chapter.
+
+### The recipe, step by step
+
+**Step 1: source.** DCLM-Pool, the raw input, consists of 240 T tokens of Common Crawl text. Every CC snapshot through CC-2023-50 is included. Text is extracted directly from WARC files using Resiliparse, the Apache-licensed Rust/C++ extractor; the choice is motivated by throughput. Trafilatura at equal quality is roughly 10× slower; at 240 T tokens of input, the Trafilatura throughput is impractical for a single-lab pipeline.
+
+**Step 2: heuristic filter.** RefinedWeb-style heuristics in sequence. A URL blocklist removes pornography, gambling, and other categorically excluded domains. fastText LID keeps documents whose English-language confidence is at least 0.65; documents below the threshold are routed to multilingual sub-pipelines or dropped. Line- and paragraph-level Gopher heuristics apply length, repetition, symbol-to-word ratio, and ellipsis-line-ratio filters as described in [Quality filtering](#quality-filtering).
+
+**Step 3: deduplication.** AI2's BFF (Big Friendly Filter) Bloom-filter-backed $n$-gram deduplication is applied simultaneously at the document level and the paragraph level. Tokenisation for the dedup hash is via the UniSeg word segmenter; the segmenter choice matters for unicode-correct hashing. The choice of BFF over MinHash is again motivated by throughput at 240 T input tokens: MinHash + LSH would be feasible but substantially more expensive.
+
+**Step 4: quality classifier.** The fastText OH-2.5 + ELI5 classifier is the centrepiece of the DCLM contribution. The positive class is the concatenation of OpenHermes-2.5 (~1 M instruction–response examples) and the top-scored responses from Reddit r/ExplainLikeImFive. The negative class is a uniform random sample of the deduplicated DCLM-Pool. The classifier is a single-layer fastText model — orders of magnitude cheaper at inference than a BERT-class encoder. Documents are scored, and only the *top 10%* by classifier score are retained.
+
+**Step 5: final corpus.** The output is approximately 3.8 T tokens.
+
+**Step 6: tokenizer.** GPT-NeoX (50 K vocabulary) for OpenLM training. The DCLM paper does not retokenise the data with a larger frontier vocabulary; the 3.8 T figure is in GPT-NeoX tokens.
+
+**Step 7: model and training.** A 7 B-parameter decoder-only transformer in the OpenLM framework, trained for 2.5–2.6 T tokens. The chapter does not cover the optimiser, parallelism, or schedule details, which belong to subsequent chapters.
+
+**Step 8: result.** 64.0% MMLU 5-shot. 53-task aggregate score comparable to Mistral 7B v0.3 and within a few points of Llama 3 8B, which used 15 T training tokens — 6.6× more compute on the data-volume axis.
+
+### Why each choice was made: the ablations
+
+The DCLM paper supports each step above with an ablation. The fastText OH-2.5 + ELI5 classifier was selected over six alternatives — perplexity filtering, a BGE-large embedding classifier, AskLLM, PageRank, SemDeDup, and a "top-k average logits" classifier — and beat each of them by at least one point on the DCLM Core metric. The fastText choice is itself interesting: a single-layer fastText classifier *outperforms* a BERT-class classifier for downstream filtering quality, despite the BERT-class model having higher test-set classification accuracy. The DCLM authors frame this as evidence that classifier test-set accuracy is the wrong metric — downstream model quality is the only metric that matters, and the relationship between the two is not monotone. The 10% top-$k$ cutoff is the optimum of a sweep over 1%, 5%, 10%, and 20% keep rates at 7B model scale; whether 10% remains optimal at larger model scale or larger training-token budget is one of the open questions in [Quality filtering](#quality-filtering). Resiliparse versus Trafilatura was an equal-quality comparison at the time of the DCLM paper; subsequent Nemotron-CC analysis shows that the *union* of Resiliparse, Trafilatura, and jusText yields more tokens still at neutral quality, a finding DCLM did not have in hand.
+
+### What the recipe is and is not
+
+The DCLM-Baseline recipe is a strong demonstration of the "more compute on filtering" position at 7 B scale and 2.5 T training tokens. It is not direct evidence for the same position at 30–40 T training tokens or at 70 B parameter scale, both of which involve regimes where the recipe is token-limited rather than quality-limited. The Nemotron-CC counterargument (see [Quality filtering](#quality-filtering)) is most relevant in that long-horizon regime. The chapter takes the position that DCLM-Baseline is the best public anchor for the *mechanism* of classifier-based filtering at frontier scale, and that the *quantitative* extrapolation to 30 T+ training-token runs remains an open empirical question.
+
+---
+
+## Chapter summary {#summary}
+
+- A 2026 frontier pretraining corpus is built from four reservoirs — open-web crawl, code, books-and-academic, and synthetic — at total scales of 10–40 T tokens. All quantitative comparisons across labs are *tokenizer-relative*: 15 T FineWeb tokens (GPT-2 tokenizer) and 15 T Llama-3 tokens (128 K vocabulary) describe different amounts of underlying text.
+- The 2023 shift from WET to WARC extraction is universal in open corpora from 2024 onward. Trafilatura, jusText, and Resiliparse occupy different points on the precision–recall–throughput envelope, and multi-extractor union with a unified deduplication pass is the emerging best practice.
+- Quality filtering runs in three generations: heuristic (Gopher/C4/FineWeb), classifier-based (GPT-3 logistic regression, FineWeb-Edu, DCLM OH-2.5 + ELI5), and LLM-judge (Phi-1, Phi-4 generation). The "more compute on filtering" argument from DCLM and FineWeb-Edu is well-supported at 7 B scale and ≤ 5 T training tokens; Nemotron-CC's classifier-ensembling-plus-rephrasing argues that the same approach breaks down at the 10 T+ regime. The empirical question is not settled at frontier scale.
+- MinHash + LSH on $n$-grams in the range $n \in [5, 13]$, combined optionally with exact-substring deduplication (Lee et al. 2022) and Bloom-filter deduplication (AI2's BFF), is the modal near-deduplication pipeline. "9-gram, 80% Jaccard" is a midpoint convention rather than a canonical setting. FineWeb's finding that *per-snapshot* deduplication outperforms cross-snapshot deduplication in English reverses in FineWeb-2's multilingual setting, where intra-language repetition dominates; both findings are correct in their respective regimes.
+- LDNOOBW-style toxicity filtering has documented disparate-impact harms (Dodge et al. 2021). $n$-gram contamination filtering at $n \in [8, 13]$ is industry-standard but misses paraphrase contamination, which 2024–2025 audits identify as a live confound. Pretraining-time safety filtering is more durable than post-hoc moderation but requires explicit subgroup auditing.
+- Multilingual pipelines require sentence-level language identification (GlotLID for long-tail coverage), per-language quality thresholds (FineWeb-2), per-language deduplication, and temperature-sampling at training time with $\alpha \in [0.3, 0.5]$ in the open literature.
+- DCLM-Baseline is the best public anchor for an end-to-end classifier-aggressive pipeline: 240 T-token input, Resiliparse extraction, RefinedWeb-style heuristics, BFF deduplication, fastText OH-2.5 + ELI5 classifier with a 10% top-$k$ cutoff, 3.8 T-token output, 7 B-model trained on 2.5–2.6 T tokens, 64% MMLU at 6.6× less compute than Llama 3 8B. The recipe is reproducible from public artefacts and is the natural reference point against which to read subsequent frontier-lab pipelines.
+
+---
+
+<Sources items={[
+  {
+    authors: "Penedo, G., Kydlíček, H., Lozhkov, A., Mitchell, M., Raffel, C., Von Werra, L., & Wolf, T.",
+    year: 2024,
+    title: "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale",
+    venue: "NeurIPS Datasets & Benchmarks",
+    url: "https://arxiv.org/abs/2406.17557",
+    note: "FineWeb 15T tokens; 5-gram MinHash, 112 hashes, 14×8 LSH bands; per-snapshot dedup finding; FineWeb-Edu Snowflake-Arctic-embed + Llama-3-70B annotation pipeline."
+  },
+  {
+    authors: "Penedo, G. et al.",
+    year: 2025,
+    title: "FineWeb2: One Pipeline to Scale Them All",
+    venue: "arXiv:2506.20920",
+    url: "https://arxiv.org/abs/2506.20920",
+    note: "Per-language adapted FineWeb pipeline; per-language global MinHash dedup; 1,893 language-script pairs; reverses FineWeb's per-snapshot policy for multilingual."
+  },
+  {
+    authors: "Li, J., Fang, A., Smyrnis, G., Ivgi, M., et al.",
+    year: 2024,
+    title: "DataComp-LM: In search of the next generation of training sets for language models",
+    venue: "arXiv:2406.11794",
+    url: "https://arxiv.org/abs/2406.11794",
+    note: "DCLM-Pool 240T → DCLM-Baseline 3.8T; Resiliparse; BFF doc+paragraph; fastText OH-2.5+ELI5 classifier; 10% top-k cutoff; 7B model 64% MMLU at 2.5T training tokens."
+  },
+  {
+    authors: "Soldaini, L. et al. (AI2)",
+    year: 2024,
+    title: "Dolma: an Open Corpus of Three Trillion Tokens for Language Model Pretraining Research",
+    venue: "ACL 2024",
+    url: "https://arxiv.org/abs/2402.00159",
+    note: "AI2 open mixture for OLMo; Trafilatura + custom extractor; Gopher+C4 heuristics; BFF paragraph dedup."
+  },
+  {
+    authors: "Together Computer",
+    year: 2023,
+    title: "RedPajama-Data-v2: An open dataset with 30 trillion tokens for training large language models",
+    venue: "Together AI blog",
+    url: "https://www.together.ai/blog/redpajama-data-v2",
+    note: "30T raw tokens across 84 snapshots; MinHash annotations exposed for downstream cutoff selection."
+  },
+  {
+    authors: "Su, D. et al. (NVIDIA)",
+    year: 2024,
+    title: "Nemotron-CC: Transforming Common Crawl into a Refined Long-Horizon Pretraining Dataset",
+    venue: "arXiv:2412.02595",
+    url: "https://arxiv.org/abs/2412.02595",
+    note: "6.3T tokens = 4.4T original + 1.9T synthetic rephrases; classifier ensemble approach; argues against aggressive single-classifier filtering at 10T+ regime; global MinHash."
+  },
+  {
+    authors: "Penedo, G. et al.",
+    year: 2023,
+    title: "The RefinedWeb Dataset for Falcon LLM",
+    venue: "arXiv:2306.01116",
+    url: "https://arxiv.org/abs/2306.01116",
+    note: "5T-token Falcon corpus; Trafilatura on WARC; first demonstration that web-data-only can match curated mixtures; MinHash + exact-substring dedup."
+  },
+  {
+    authors: "Lozhkov, A. et al.",
+    year: 2024,
+    title: "StarCoder 2 and The Stack v2: The Next Generation",
+    venue: "arXiv:2402.19173",
+    url: "https://arxiv.org/abs/2402.19173",
+    note: "Stack v2: 3B+ files, 600+ programming languages, ~900B training tokens; aggressive PII redaction; file-hash + near-dedup."
+  },
+  {
+    authors: "Gao, L. et al.",
+    year: 2020,
+    title: "The Pile: An 800GB Dataset of Diverse Text for Language Modeling",
+    venue: "arXiv:2101.00027",
+    url: "https://arxiv.org/abs/2101.00027",
+    note: "Canonical 22-source curated pretraining mixture; predecessor of modern open corpora."
+  },
+  {
+    authors: "Ben Allal, L. et al.",
+    year: 2024,
+    title: "Cosmopedia",
+    venue: "HuggingFace blog",
+    url: "https://huggingface.co/blog/cosmopedia",
+    note: "25B tokens of Mixtral-generated textbooks, blogs, and stories; public benchmark for synthetic data."
+  },
+  {
+    authors: "Abdin, M. et al. (Microsoft)",
+    year: 2024,
+    title: "Phi-4 Technical Report",
+    venue: "arXiv:2412.08905",
+    url: "https://arxiv.org/abs/2412.08905",
+    note: "~10T training tokens; 40% synthetic mix from ~50 generation pipelines; LLM-judge / generation in place of filtering; 14B parameters."
+  },
+  {
+    authors: "Grattafiori, A. et al. (Meta)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama 3 / 3.1 data curation §3.1: custom math/code-aware HTML parser; fastText + DistilRoBERTa + KL filter; URL + doc-MinHash + line-level (>6 in 30M); 8-gram contamination filter; 50/25/17/8 mix."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "14.8T training tokens; MoE 671B/37B-active; pipeline details narrative-level."
+  },
+  {
+    authors: "Qwen Team (Alibaba)",
+    year: 2024,
+    title: "Qwen2.5 Technical Report",
+    venue: "arXiv:2412.15115",
+    url: "https://arxiv.org/abs/2412.15115",
+    note: "18T training tokens; staged data mixture; pipeline details largely undisclosed."
+  },
+  {
+    authors: "Qwen Team (Alibaba)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "36T training tokens; 119 languages with token-balanced upsampling; Qwen2.5-VL used for PDF extraction; specific filters not disclosed."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI blog",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama 4 Scout ~40T tokens / Maverick ~22T; natively multimodal; data pipeline details largely undisclosed."
+  },
+  {
+    authors: "Common Crawl",
+    year: 2026,
+    title: "Crawl statistics: monthly crawl size",
+    venue: "Common Crawl Foundation",
+    url: "https://commoncrawl.github.io/cc-crawl-statistics/plots/crawlsize",
+    note: "Monthly snapshot statistics; CC-MAIN-2026-12 contains 1.97B pages; basis for the 250 TB / monthly figure."
+  },
+  {
+    authors: "Barbaresi, A.",
+    year: 2021,
+    title: "Trafilatura: A Web Scraping Library and Command-Line Tool for Text Discovery and Extraction",
+    venue: "ACL System Demonstrations",
+    url: "https://aclanthology.org/2021.acl-demo.15/",
+    note: "Trafilatura: XPath cascade with jusText/readability fallback; reference HTML extractor for FineWeb and RefinedWeb."
+  },
+  {
+    authors: "Bevendorff, J. et al.",
+    year: 2023,
+    title: "An Empirical Comparison of Web Content Extraction Algorithms",
+    venue: "SIGIR 2023",
+    url: "https://dl.acm.org/doi/10.1145/3539618.3591920",
+    note: "Cross-extractor analysis; ~39% of pages survive across more than one extractor; basis for the multi-extractor union argument."
+  },
+  {
+    authors: "Common Crawl",
+    year: "n.d.",
+    title: "Web Archiving File Formats Explained",
+    venue: "Common Crawl Foundation",
+    url: "https://commoncrawl.org/blog/web-archiving-file-formats-explained",
+    note: "WARC vs WET vs WAT format definitions; canonical reference for the format distinction in §2."
+  },
+  {
+    authors: "Rae, J. W. et al. (DeepMind)",
+    year: 2021,
+    title: "Scaling Language Models: Methods, Analysis & Insights from Training Gopher",
+    venue: "arXiv:2112.11446",
+    url: "https://arxiv.org/abs/2112.11446",
+    note: "MassiveText heuristic filters (word count, mean word length, symbol ratio, bullet ratio, ellipsis ratio, stopword presence); 13-gram MinHash dedup; canonical heuristic-filter reference."
+  },
+  {
+    authors: "Raffel, C. et al.",
+    year: 2020,
+    title: "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer",
+    venue: "JMLR (T5/C4 paper)",
+    url: "https://arxiv.org/abs/1910.10683",
+    note: "C4 corpus and filters: terminal punctuation, ≥5 sentences, LDNOOBW, lorem-ipsum and brace-token suppression."
+  },
+  {
+    authors: "Dodge, J. et al.",
+    year: 2021,
+    title: "Documenting Large Webtext Corpora: A Case Study on the Colossal Clean Crawled Corpus",
+    venue: "EMNLP 2021",
+    url: "https://arxiv.org/abs/2104.08758",
+    note: "Audit of C4; LDNOOBW disparate-impact measurement (42% AAE removed vs 6.2% white-aligned English); canonical evidence for the toxicity-filter disparate-impact problem."
+  },
+  {
+    authors: "Brown, T. B. et al. (OpenAI)",
+    year: 2020,
+    title: "Language Models are Few-Shot Learners",
+    venue: "NeurIPS 2020 (GPT-3)",
+    url: "https://arxiv.org/abs/2005.14165",
+    note: "GPT-3 logistic-regression filtering classifier (~22% of CC retained); 13-gram contamination filter; ~300B tokens from 500B-token pool."
+  },
+  {
+    authors: "Gunasekar, S. et al.",
+    year: 2023,
+    title: "Textbooks Are All You Need",
+    venue: "arXiv:2306.11644 (Phi-1)",
+    url: "https://arxiv.org/abs/2306.11644",
+    note: "Phi-1: GPT-3.5/GPT-4-judged textbook quality labels; canonical LLM-judge filter."
+  },
+  {
+    authors: "Li, Y. et al.",
+    year: 2023,
+    title: "Textbooks Are All You Need II: phi-1.5 technical report",
+    venue: "arXiv:2309.05463",
+    url: "https://arxiv.org/abs/2309.05463",
+    note: "Phi-1.5 extension of LLM-judge filtering pipeline."
+  },
+  {
+    authors: "HuggingFace",
+    year: 2024,
+    title: "fineweb-edu-classifier model card",
+    venue: "HuggingFace Hub",
+    url: "https://huggingface.co/HuggingFaceFW/fineweb-edu-classifier",
+    note: "Public weights of the FineWeb-Edu educational-quality classifier; Snowflake-Arctic-embed backbone, regression head, F1=82% at threshold 3."
+  },
+  {
+    authors: "mlfoundations",
+    year: 2024,
+    title: "fasttext-oh-eli5 model card",
+    venue: "HuggingFace Hub",
+    url: "https://huggingface.co/mlfoundations/fasttext-oh-eli5",
+    note: "Public weights of the DCLM fastText OH-2.5 + ELI5 classifier; positive class = OpenHermes-2.5 + ELI5 top responses."
+  },
+  {
+    authors: "Lee, K. et al.",
+    year: 2022,
+    title: "Deduplicating Training Data Makes Language Models Better",
+    venue: "ACL 2022",
+    url: "https://arxiv.org/abs/2107.06499",
+    note: "Canonical empirical statement that deduplication improves LMs; 10× memorisation reduction; exact-substring (suffix array, k=50 tokens) reference implementation."
+  },
+  {
+    authors: "Broder, A.",
+    year: 1997,
+    title: "On the resemblance and containment of documents",
+    venue: "SEQUENCES 1997",
+    url: "https://www.cs.princeton.edu/courses/archive/spr05/cos598E/bib/broder97resemblance.pdf",
+    note: "Original MinHash construction; Pr[minhash(A)=minhash(B)] = J(A,B)."
+  },
+  {
+    authors: "Soboleva, D. et al. (Cerebras)",
+    year: 2023,
+    title: "SlimPajama: A 627B token cleaned and deduplicated version of RedPajama",
+    venue: "Cerebras blog",
+    url: "https://www.cerebras.ai/blog/slimpajama-a-627b-token-cleaned-and-deduplicated-version-of-redpajama",
+    note: "SlimPajama 627B tokens; MinHashLSH 13-gram, Jaccard 0.8; cleaned/dedup'd RedPajama-V1."
+  },
+  {
+    authors: "AI2",
+    year: "n.d.",
+    title: "BFF (Big Friendly Filter) GitHub repository",
+    venue: "GitHub",
+    url: "https://github.com/allenai/bff",
+    note: "Reference implementation of Bloom-filter paragraph/document dedup used by Dolma and DCLM."
+  },
+  {
+    authors: "Google Research",
+    year: 2022,
+    title: "deduplicate-text-datasets",
+    venue: "GitHub",
+    url: "https://github.com/google-research/deduplicate-text-datasets",
+    note: "Rust suffix-array dedup; reference implementation of Lee et al. exact-substring approach."
+  },
+  {
+    authors: "Wenzek, G. et al.",
+    year: 2020,
+    title: "CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data",
+    venue: "LREC 2020",
+    url: "https://arxiv.org/abs/1911.00359",
+    note: "CCNet: paragraph-hash dedup + LM-perplexity quality filter + fastText LID; basis for many follow-on pipelines."
+  },
+  {
+    authors: "Sap, M. et al.",
+    year: 2019,
+    title: "The Risk of Racial Bias in Hate Speech Detection",
+    venue: "ACL 2019",
+    url: "https://aclanthology.org/P19-1163/",
+    note: "Subgroup bias in toxicity classifiers; basis for the Perspective-API critique."
+  },
+  {
+    authors: "Welbl, J. et al.",
+    year: 2021,
+    title: "Challenges in Detoxifying Language Models",
+    venue: "EMNLP Findings 2021",
+    url: "https://arxiv.org/abs/2109.07445",
+    note: "Audit of detoxification approaches; documented subgroup biases in learned toxicity classifiers."
+  },
+  {
+    authors: "Microsoft",
+    year: "n.d.",
+    title: "Presidio: Data Protection and De-identification SDK",
+    venue: "GitHub",
+    url: "https://github.com/microsoft/presidio",
+    note: "Extensible NER + regex PII redaction framework."
+  },
+  {
+    authors: "Touvron, H. et al. (Meta)",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "Llama 2 data and contamination methodology: token-level overlap with ≥10-token n-gram criterion."
+  },
+  {
+    authors: "Radford, A. et al. (OpenAI)",
+    year: 2019,
+    title: "Language Models are Unsupervised Multitask Learners",
+    venue: "OpenAI technical report (GPT-2)",
+    url: "https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf",
+    note: "GPT-2 8-gram contamination filter."
+  },
+  {
+    authors: "EleutherAI",
+    year: "n.d.",
+    title: "lm-evaluation-harness: decontamination documentation",
+    venue: "GitHub",
+    url: "https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/decontamination.md",
+    note: "De facto open-source reference for n-gram decontamination."
+  },
+  {
+    authors: "Sainz, O. et al.",
+    year: 2024,
+    title: "A Comprehensive Survey of Contamination Detection Methods in Large Language Models",
+    venue: "arXiv:2404.00699",
+    url: "https://arxiv.org/abs/2404.00699",
+    note: "2024 survey; evidence of paraphrase contamination remaining after n-gram filtering."
+  },
+  {
+    authors: "Anthropic",
+    year: 2025,
+    title: "Enhancing Model Safety through Pretraining Data Filtering",
+    venue: "Anthropic Alignment blog",
+    url: "https://alignment.anthropic.com/2025/pretraining-data-filtering/",
+    note: "Argument for pretraining-time safety filtering as more durable than post-hoc moderation; subgroup-audit framing."
+  },
+  {
+    authors: "Kargaran, A. et al.",
+    year: 2023,
+    title: "GlotLID: Language Identification for Low-Resource Languages",
+    venue: "EMNLP Findings 2023",
+    url: "https://arxiv.org/abs/2310.16248",
+    note: "1,665+ language labels; outperforms fastText, CLD3, OpenLID at long-tail languages on balanced F1 / FPR."
+  },
+  {
+    authors: "Joulin, A. et al.",
+    year: 2017,
+    title: "Bag of Tricks for Efficient Text Classification",
+    venue: "EACL 2017",
+    url: "https://arxiv.org/abs/1607.01759",
+    note: "fastText classifier underlying fastText LID; basis for CCNet, RefinedWeb, FineWeb, DCLM LID."
+  },
+  {
+    authors: "NLLB Team (Meta)",
+    year: 2022,
+    title: "No Language Left Behind: Scaling Human-Centered Machine Translation",
+    venue: "arXiv:2207.04672",
+    url: "https://arxiv.org/abs/2207.04672",
+    note: "200+ language coverage; NLLB-LID; temperature-sampling reference with α ≈ 0.3."
+  },
+  {
+    authors: "Villalobos, P. et al.",
+    year: 2024,
+    title: "Will We Run Out of Data? Limits of LLM Scaling Based on Human-Generated Data",
+    venue: "ICML 2024",
+    url: "https://arxiv.org/abs/2211.04325",
+    note: "Estimate of ~300T high-quality public English tokens in raw form; ~10–50T after dedup and quality filtering."
+  },
+  {
+    authors: "OLMo Team (AI2)",
+    year: 2025,
+    title: "OLMo 2: Furthering the Frontier of Open Language Models",
+    venue: "arXiv:2501.00656",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "Dolma + DCLM + StarCoder + ProofPile-II mixture; Dolmino-Mix late-stage anneal; 3.9T main + late-curriculum tokens."
+  },
+  {
+    authors: "Apple",
+    year: 2024,
+    title: "DCLM-Baseline-7B model card",
+    venue: "HuggingFace Hub",
+    url: "https://huggingface.co/apple/DCLM-Baseline-7B",
+    note: "7B model card; reproduces DCLM-Baseline training recipe; 64% MMLU 5-shot."
+  },
+  {
+    authors: "mlfoundations",
+    year: 2024,
+    title: "DCLM: DataComp for Language Models",
+    venue: "GitHub",
+    url: "https://github.com/mlfoundations/dclm",
+    note: "Reference implementation of the DCLM pipeline including Resiliparse extraction, RefinedWeb-style heuristics, BFF dedup, and fastText classifier."
+  },
+  {
+    authors: "Bansal, H. et al.",
+    year: 2025,
+    title: "Scaling Laws for Data Filtering in Language Model Pretraining (BETR)",
+    venue: "arXiv:2502.02585",
+    url: "https://arxiv.org/abs/2502.02585",
+    note: "Scaling-law formalisation of optimal filtering aggressiveness as a function of N and D."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs",
+    venue: "HuggingFace Space",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook",
+    note: "11.2T-token open recipe; ablation methodology; full 3-stage mix with explicit per-stage percentages."
+  },
+  {
+    authors: "Allal, L., Lozhkov, A. et al.",
+    year: 2025,
+    title: "SmolLM2: When Smol Goes Big — Data-Centric Training of a Small Language Model",
+    venue: "arXiv:2502.02737",
+    url: "https://arxiv.org/abs/2502.02737",
+    note: "Multi-stage curriculum methodology; manual mix-rate refinement across stages; introduces FineMath, Stack-Edu, SmolTalk."
+  }
+]} />

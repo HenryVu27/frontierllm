@@ -1,0 +1,809 @@
+---
+slug: 01c-scaling-laws
+title: Scaling laws and compute-optimal training
+description: Kaplan → Chinchilla → Besiroglu / Porian reconciliation, inference-aware overtraining, and the May 2026 frontier-lab token-per-parameter landscape.
+order: 13
+chapter: 12
+module: 1
+module_title: Pretraining at scale
+reading_minutes: 45
+depends_on: [00a-transformer, 00h-moe-plumbing]
+provides: [scaling-laws, compute-optimal, inference-aware-scaling, chinchilla, isoflop, moe-scaling]
+last_reviewed: 2026-05-11
+---
+
+## Orientation {#orientation}
+
+A scaling law is a predictive equation that maps three numbers — non-embedding parameter count $N$, pretraining tokens $D$, and total training compute $C$ — onto an expected per-token cross-entropy loss $L$. Once the equation is fit on a small grid of experiments, it can be inverted: for any target compute budget $C$, the practitioner can read off the compute-optimal $(N^*, D^*)$ pair, plan the cluster reservation, the data acquisition pipeline, and the schedule, all before a single trillion-parameter run is launched. Frontier-scale pretraining is too expensive to be exploratory, and scaling laws are what make it predictive instead.
+
+This chapter traces six years of revisions to that predictive equation. The story has three honesty points worth flagging at the outset. First, the well-known disagreement between Kaplan et al. (2020) and Hoffmann et al. (2022) was not a sign that scaling laws fail; it was a methodological gap in Kaplan's original protocol that Porian et al. (2024) closed with four specific corrections — non-embedding parameter counting, last-layer FLOPs accounting, warmup that scales with model size, and per-scale AdamW hyperparameter tuning. The 20-tokens-per-parameter rule survives. Second, the apparent contradiction between the Chinchilla 20:1 rule and Llama-3's 38:1 ratio, DeepSeek-V3's roughly 400:1 ratio (per active parameter), and Llama-4 Scout's 2,353:1 ratio is also not a contradiction. The two regimes answer different questions: Chinchilla minimises pretraining loss for fixed training compute, while frontier 2025-2026 practice minimises *lifecycle* compute given a heavy expected inference load (Sardana et al. 2023). Both are valid; neither contradicts the other. Third, the Schaeffer et al. (2023) "emergent abilities are a mirage" result is partial. It applies cleanly to BIG-Bench tasks scored by hard, discontinuous metrics, but does not claim *all* emergence is metric-induced.
+
+The notation used throughout: $N$ is non-embedding parameter count (unless stated otherwise); $D$ is pretraining tokens; $C$ is compute in FLOPs; $L$ is per-token cross-entropy loss in nats; $L_\infty$ is the irreducible loss term in parametric fits; $N^*$ and $D^*$ are the compute-optimal parameter count and token count; $a$ is the exponent in $N_{\text{opt}} \propto C^a$; $\alpha$ and $\beta$ are the parametric exponents in $L(N,D)$; $T/P$ denotes the tokens-per-parameter ratio. All FLOPs counts use the [$C = 6ND$ convention from the transformer-block chapter](/textbook/00a-transformer#flops-per-token), unless explicitly replaced by DeepSeek's exact model-FLOPs-per-token quantity $M$ (Section [Data quality](#data-quality)).
+
+The structure mirrors the historical development. The Kaplan paper sets the stage. Chinchilla rewrites the rule. Besiroglu and Porian explain the disagreement. DeepSeek's data-quality finding sharpens it. Sardana inverts the objective to include inference. The chapter then turns to downstream-metric scaling, MoE scaling laws, a fully worked example at $C = 10^{25}$ FLOPs, and a frontier-lab landscape table calibrated to May 2026.
+
+---
+
+## Kaplan 2020 {#kaplan}
+
+Kaplan, McCandlish, Henighan, Brown, Chess, Child, Gray, Radford, Wu, and Amodei published "Scaling Laws for Neural Language Models" in January 2020. The paper fit independent power laws for loss as a function of each of $N$, $D$, and $C$ on a large sweep of decoder-only Transformers trained on WebText2-style data. It introduced the conceptual framework that the field has used ever since: loss is well-approximated by a power law over many orders of magnitude in each scaling axis, and these power laws combine into a joint form that admits a closed-form compute-optimal allocation.
+
+### Functional forms and reported exponents
+
+Kaplan reports three single-axis power laws:
+
+$$
+L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N}, \qquad L(D) = \left(\frac{D_c}{D}\right)^{\alpha_D}, \qquad L(C_{\min}) = \left(\frac{C_c^{\min}}{C_{\min}}\right)^{\alpha_C^{\min}}
+$$
+
+and a joint form (Equation 1.5 of the paper) that combines the $N$ and $D$ dependencies into a single expression:
+
+$$
+L(N, D) = \left[\left(\frac{N_c}{N}\right)^{\alpha_N / \alpha_D} + \frac{D_c}{D}\right]^{\alpha_D}
+$$
+
+This joint form has no explicit irreducible-loss term — Kaplan's fit treats the asymptote as zero in nats and discusses a conjectured floor of roughly $L_\infty \approx 1.7$ nats/token separately in Section 6.3 of the paper. The reported exponents and critical scales:
+
+| Quantity | Value | Notes |
+| --- | --- | --- |
+| $\alpha_N$ | 0.076 | per non-embedding parameter |
+| $\alpha_D$ | 0.095 | per token |
+| $\alpha_C^{\min}$ | 0.050 | exponent for optimally-allocated compute |
+| $N_c$ | $6.4 \times 10^{13}$ | non-embedding params, critical scale |
+| $D_c$ | $1.8 \times 10^{13}$ | tokens, critical scale |
+| $C_c^{\min}$ | $3.1 \times 10^{8}$ PF-days | critical compute |
+
+### The Kaplan compute-optimal frontier
+
+Combining the single-axis laws with the FLOPs convention $C \approx 6ND$ gives a closed-form optimal allocation:
+
+$$
+N_{\text{opt}}(C) \propto C^{\alpha_C^{\min} / \alpha_N} = C^{0.73}, \qquad D_{\text{opt}}(C) \propto C^{1 - 0.73} = C^{0.27}
+$$
+
+Read literally: when compute increases tenfold, the optimal model grows by a factor of $10^{0.73} \approx 5.4$ and the optimal dataset grows by only $10^{0.27} \approx 1.86$. The exponents are far from symmetric. The prescription that emerged from this — "model size matters much more than dataset size" — drove the design of GPT-3 (175B parameters trained on roughly 300B tokens, a $T/P$ ratio under 2), Gopher (280B parameters trained on 300B tokens, $T/P \approx 1.07$), and the broader 2020-2021 trend toward ever-larger but only marginally better-fed models.
+
+Kaplan also fit a *critical batch size* function $B_{\text{crit}}(L) = B_*/L^{1/\alpha_B}$ with $B_* \approx 2 \times 10^8$ tokens and $1/\alpha_B \approx 4.8$, which governs the trade-off between data-parallelism and serial step count. The [schedules-and-batch chapter](/textbook/01e-schedules-and-batch) returns to this; Kaplan's batch-scaling result has held up better than his $N$-vs-$D$ allocation.
+
+### What Kaplan got methodologically wrong
+
+The retrospective diagnosis, assembled across Hoffmann et al. (2022), Pearce and Song (2024), and Porian et al. (2024), is now well-understood:
+
+1. **Non-embedding parameter counting in the wrong place.** Kaplan defined $N$ to exclude embeddings (a defensible choice) but then computed FLOPs/token using that same $N$ rather than the full forward-pass cost. At small scales the embedding and unembedding layers represent a large fraction of compute, so the FLOPs accounting was systematically biased.
+2. **Last-layer (unembedding) FLOPs excluded.** For small-vocabulary models at small $N$, the head accounts for a non-trivial share of forward-pass compute. Dropping it from $C$ pushed the apparent compute-optimal exponent toward larger models.
+3. **Warmup duration held fixed.** Small reference models received the same warmup as larger ones, leaving them undertrained relative to their final-loss capacity and biasing the data exponent.
+4. **Optimizer hyperparameters not retuned per scale.** AdamW's $\beta_2$ in particular is scale-sensitive at low batch sizes; Kaplan's fixed-hyperparameter sweep made small models look worse than they should have.
+
+None of these is a flaw in the scaling-law framework itself. Each is a methodological gap that, when closed, brings Kaplan's exponents into line with Chinchilla's. The Pearce and Song (2024) note attributes the bulk of the apparent disagreement to non-embedding parameter counting alone — a single accounting bug that propagates through the joint fit.
+
+<Callout variant="note" title="Kaplan's framework, not Kaplan's numbers">
+The 2020 paper's *framework* — power-law fits, joint $L(N,D)$ form, the idea that a compute-optimal allocation exists and can be derived from the single-axis exponents — is intact and remains the foundation of every subsequent paper in this chapter. What does not survive is the specific allocation prescription $N \propto C^{0.73}$. The methodological corrections in Section [The Besiroglu / Porian reconciliation](#reconciliation) explain why.
+</Callout>
+
+---
+
+## Chinchilla (Hoffmann et al. 2022) {#chinchilla}
+
+Hoffmann et al. (DeepMind) published "Training Compute-Optimal Large Language Models" in March 2022. The headline result is that for a fixed training compute budget, parameter count $N$ and token count $D$ should grow roughly in proportion — equivalent to a tokens-per-parameter ratio near 20. The 70-billion-parameter Chinchilla model was trained on 1.4 trillion tokens to demonstrate this, and outperformed the 280-billion-parameter Gopher on every evaluated benchmark while using one-quarter of the compute.
+
+The novelty of the Chinchilla paper is methodological. Where Kaplan fit single-axis power laws and combined them, Hoffmann fit the compute-optimal frontier three independent ways and showed all three agreed.
+
+### Approach 1 — fixed model size, vary tokens
+
+Train each of several model sizes $N$ for a sweep of token counts $D$, plot loss versus training compute $C = 6ND$ for each model, and identify the lower envelope across model sizes. Each envelope point is the loss-minimising model at that compute. Fit $N_{\text{opt}}(C) = A C^a$ to the envelope. Hoffmann reports $a \approx 0.50$ from this approach.
+
+### Approach 2 — IsoFLOP curves
+
+Hold compute fixed at nine different budgets. For each budget, train a sweep of $(N, D)$ pairs all consuming exactly that budget, plot loss versus $N$, and identify the minimum. This is the *IsoFLOP* method that has become standard in subsequent papers. Hoffmann reports $a \approx 0.49$ with an 80% confidence interval of $(0.462, 0.534)$ — i.e. $a \approx b \approx 0.5$ within the data.
+
+### Approach 3 — parametric fit
+
+Fit a three-parameter functional form directly to all 400+ training-curve loss values:
+
+$$
+L(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}
+$$
+
+via L-BFGS optimisation with a Huber loss. The minimiser under the constraint $C = 6ND$ has a closed form, and the compute-optimal exponent is $a = \beta / (\alpha + \beta)$. Hoffmann reports the headline parametric fit in Table 3 of the paper:
+
+| Parameter | Hoffmann (2022) reported value |
+| --- | --- |
+| $E$ (irreducible loss) | 1.69 |
+| $A$ | 406.4 |
+| $B$ | 410.7 |
+| $\alpha$ | 0.34 |
+| $\beta$ | 0.28 |
+
+Plugging in: $a = 0.28 / (0.34 + 0.28) = 0.28/0.62 \approx 0.452$. Hoffmann reports $a = 0.46$, $b = 0.54$ from Approach 3 — slightly different from Approaches 1 and 2 (which gave $a \approx 0.49$-$0.50$). The paper does not resolve this internal discrepancy; Besiroglu et al. (2024) will return to it in Section [The Besiroglu / Porian reconciliation](#reconciliation).
+
+### The 20-tokens-per-parameter rule
+
+When $\alpha \approx \beta$ in the parametric fit, both terms in $L(N,D) - E$ scale the same way with their respective axis, and the compute-optimal split balances them at a constant $D/N$ ratio independent of $C$. Hoffmann's Approach 2 yields a $T/P$ ratio of approximately 20; the Chinchilla 70B model trained on 1.4T tokens is the canonical example: $1.4 \times 10^{12} / 7 \times 10^{10} = 20$. This is the famous rule.
+
+### Why Kaplan's data scaling was undersized
+
+Hoffmann's own diagnosis (Sections 4-5 of the paper) is that Kaplan's reported $\alpha_N = 0.076$ and $\alpha_D = 0.095$ implied data is much *harder* to convert into loss reduction than parameters, biasing the optimal allocation toward more $N$. Once the parametric form is fit on a wider range with corrected methodology, $\alpha$ and $\beta$ come out roughly equal, and the optimal allocation collapses to the symmetric 50/50 split in compute. The Gopher-versus-Chinchilla empirical demonstration was the field-changing moment: Gopher at $T/P \approx 1$ underperforms Chinchilla at $T/P = 20$ on every standard benchmark, despite the latter using one-quarter the training compute. After this paper, every credible frontier-lab pretraining run was sized to roughly the 20:1 ratio.
+
+<Callout variant="info" title="Chinchilla and what comes after">
+The 20:1 rule is the answer to the question "given a fixed pretraining-compute budget, what allocation minimises pretraining cross-entropy loss?" The qualification matters. The question of what minimises *lifecycle* compute — pretraining plus inference — has a different answer, derived in Section [Inference-aware overtraining](#inference-aware). Both questions are valid, and both are answered by scaling laws; they are answered by different scaling laws.
+</Callout>
+
+---
+
+## The Besiroglu / Porian reconciliation {#reconciliation}
+
+Two papers in 2024 closed the methodological gap between Kaplan and Chinchilla. Besiroglu et al. (April 2024, Epoch AI) attempted a direct replication of Chinchilla's Approach 3 parametric fit. Porian et al. (June 2024) reproduced Kaplan's experimental setup, applied targeted corrections, and recovered the Chinchilla exponents.
+
+### Besiroglu et al. — what was wrong with Chinchilla Approach 3
+
+Besiroglu, Erdil, Barnett, and You extracted the training-loss data points underlying Hoffmann's parametric fit from the figures of the original paper and re-ran the L-BFGS Huber-loss fit themselves. They identified three problems with the published Approach 3 numbers:
+
+1. **Internal inconsistency.** Hoffmann's own Approach 3 reports $a \approx 0.46$, but Approaches 1 and 2 give $a \approx 0.49$-$0.50$. The three methods disagree within a single paper, and Hoffmann does not explain the gap.
+2. **Poor fit quality.** Under Hoffmann's published coefficients, the parametric form does not predict the actual loss data points well — the residuals are systematically biased.
+3. **Implausibly tight confidence intervals.** Hoffmann's reported standard errors on $\alpha$ and $\beta$ would, by standard statistical reasoning, require approximately 600,000 training runs to achieve. Hoffmann actually ran roughly 400.
+
+After re-running the optimisation to convergence and avoiding the coefficient rounding in the original paper body, Besiroglu reports the corrected parametric fit:
+
+<ComparisonTable
+  caption="Chinchilla parametric fit: Hoffmann (2022) reported values versus Besiroglu (2024) refit. Standard errors in parentheses."
+  columns={["Parameter", "Hoffmann (2022) reported", "Besiroglu (2024) refit"]}
+  rows={[
+    ["E (irreducible loss)", "1.6934", "1.8172 (0.03)"],
+    ["A", "406.4", "482.01 (124.58)"],
+    ["B", "410.7", "2085.43 (1293.23)"],
+    ["α", "0.3392", "0.3478 (0.02)"],
+    ["β", "0.2849", "0.3658 (0.02)"],
+    ["Derived a = β/(α+β)", "0.456", "0.5126 (0.02)"],
+    ["Implied T/P optimum", "~70 (inconsistent with A1/A2)", "~20 (consistent with A1/A2)"],
+  ]}
+/>
+
+The corrected exponent $a = \beta / (\alpha + \beta) = 0.5126$ now agrees with Approaches 1 and 2 within the corrected confidence interval. The 20-tokens-per-parameter rule survives — in fact the corrected fit is *closer* to a clean 20:1 ratio than Hoffmann's headline number suggested. The diagnostic causes Besiroglu identifies are mundane: the published optimiser stopped early due to a poor loss-scale setting and did not reach convergence, and the coefficients in the paper body were rounded in a way that compounded into substantial bias in implied predictions.
+
+The wider confidence intervals are the price of honest reporting. The 20:1 rule is right; the original paper's quoted error bars on the parametric fit were not.
+
+### Porian et al. — closing the Kaplan-Chinchilla gap
+
+Porian, Achille, Maddison, and colleagues took the complementary approach. They reproduced Kaplan's experimental setup as faithfully as the public materials allowed, then asked which targeted corrections would push the resulting exponents toward Chinchilla's. Three corrections did the bulk of the work:
+
+1. **Last-layer FLOPs.** Including the unembedding head in $C$ shifts the compute-optimal model-size exponent downward by more than 0.1 at small scale. This was the single largest contributor to the apparent disagreement.
+2. **Warmup that scales with model size.** Kaplan held warmup constant across model sizes, undertraining the small reference models. Scaling warmup with $N$ — or equivalently shortening it at every scale — shifts the resulting exponents toward Chinchilla.
+3. **Per-scale optimizer hyperparameter tuning.** Retuning AdamW's $\beta_2$ per scale matters more than the LR-decay schedule that Hoffmann had emphasised. Porian shows that LR decay is *not* essential to the scaling law — the same exponents are recovered with constant LR — but $\beta_2$ tuning is essential at the smaller batch sizes used in early-scale training. This is a useful clarification of Chinchilla's own claims and feeds forward into the [schedules-and-batch chapter](/textbook/01e-schedules-and-batch).
+
+After all corrections, Porian recovers $N_{\text{opt}}(C) \propto C^{0.50}$ within a 95% confidence interval of $(0.49, 0.50)$ on RefinedWeb, and reports that the resulting predicted model sizes are within roughly 15% of Chinchilla's prescription at every tested compute level. Pearce and Song (2024) provide an independent, simpler reconciliation that attributes the lion's share of Kaplan's overshoot to the non-embedding-only parameter-counting issue alone.
+
+### Robustness work
+
+Two further papers from late 2024 and 2025 reinforce the conclusion that the 20:1 rule is durable:
+
+- **Sengupta et al. (2025), "Evaluating the Robustness of Chinchilla Compute-Optimal Scaling."** Applies four classes of perturbation — multiplicative, additive, systematic, and log-normal — to Hoffmann's parameter table. Under multiplicative perturbations the 20:1 $T/P$ ratio is preserved exactly. Under additive perturbations the ratio drifts but stays within $\pm 15.2\%$. The paper's conclusion is that "Chinchilla is a durable guide."
+- **Choshen et al. (2024), "A Hitchhiker's Guide to Scaling Law Estimation."** Mines 485 published models, fits over 1000 scaling laws, and concludes that the literature's largest source of scatter is *seed variance* (up to 4% in loss) rather than methodological disagreement on exponents. The paper recommends fitting to intermediate training checkpoints rather than only final losses, which has become standard practice.
+
+The synthesis as of May 2026: the corrected Chinchilla exponents — $\alpha \approx 0.35$, $\beta \approx 0.37$, $a = \beta/(\alpha + \beta) \approx 0.51$, $T/P$ optimum approximately 20 — are the canonical fit for compute-optimal pretraining loss, with wider confidence intervals than the original paper claimed. This is the regime in which "Chinchilla-optimal" means anything precise. Every subsequent section in this chapter starts from this corrected fit.
+
+---
+
+## Data quality and exponent shifts {#data-quality}
+
+The exponents in the parametric Chinchilla form depend on the *data distribution* the model is trained on. This is a 2024 result, due primarily to the DeepSeek-LLM paper, and remains under active investigation. It is one of the cleaner reasons that frontier labs report different scaling-law exponents and arrive at different $T/P$ ratios.
+
+### DeepSeek-LLM — replacing N with model FLOPs per token
+
+Bi, Chen, Dai, et al. (DeepSeek-AI, January 2024, arXiv:2401.02954) make two methodological moves that have become standard in 2024-2026 scaling-law work.
+
+The first is to replace the parameter axis $N$ with **model FLOPs per token** $M$. The approximation $C \approx 6ND$ is only that — an approximation — and its error is 10-50% at small scale because the embedding and unembedding share of compute varies with model dimension. DeepSeek defines $M$ exactly:
+
+$$
+M = 72 \, n_{\text{layer}} \, d_{\text{model}}^2 + 12 \, n_{\text{layer}} \, d_{\text{model}} \, \ell_{\text{seq}}
+$$
+
+which includes attention contributions and excludes vocabulary — so $C = M D$ holds exactly. They report this replacement alone reduces compute-accounting error from roughly 50% to negligible at the smaller end of their sweep. DeepSeek's $M$ is the exact version of the $6N$ rule from the [transformer-block chapter](/textbook/00a-transformer#flops-per-token), and is the right quantity to use when fitting scaling laws over a wide range of model widths.
+
+The second move is to re-fit the IsoFLOP method in $(M, D)$ space. DeepSeek's headline fit:
+
+$$
+M_{\text{opt}} = 0.1715 \, C^{0.5243}, \qquad D_{\text{opt}} = 5.8316 \, C^{0.4757}
+$$
+
+So the model-FLOPs exponent is $a = 0.524$, the data exponent is $b = 0.476$. This is 0.024 higher in the model exponent than Chinchilla's corrected fit — "spend slightly more compute on bigger models" — but within the wider confidence intervals of the Besiroglu refit.
+
+### The data-quality finding
+
+DeepSeek's most consequential result for the rest of the field is that **the exponents themselves shift with data quality**. They ran the same IsoFLOP procedure on three datasets that differ in their data-cleaning pipeline:
+
+| Dataset | Model exponent $a$ | Data exponent $b$ |
+| --- | --- | --- |
+| Early in-house corpus | 0.450 | 0.550 |
+| Current in-house corpus | 0.524 | 0.476 |
+| OpenWebText2 | 0.578 | 0.422 |
+
+Higher data quality shifts compute toward larger models. This is intuitive in retrospect: when data is noisier or more diverse, additional tokens reduce loss more efficiently than additional parameters can absorb, so the optimum tips toward more $D$. When data is cleaner and tighter in distribution, additional tokens are less informative on the margin and the optimum tips toward more $N$. The [data-curriculum chapter](/textbook/01f-data-curriculum) returns to what "higher quality" means operationally; the upstream [data pipeline](/textbook/01a-data-pipeline) is where these quality differences are generated.
+
+Hoffmann's Chinchilla used MassiveText, an internal Google corpus whose quality DeepSeek estimates as falling between their "early in-house" and "current in-house" corpora, which puts Chinchilla's $a \approx 0.50$ approximately in the middle of DeepSeek's range. This is not a contradiction of Chinchilla — it is a calibration of Chinchilla. Different labs, training on different corpora, will rationally arrive at different exponents within a band of roughly $a \in [0.45, 0.58]$.
+
+### Llama-3 and the empirical IsoFLOP flatness
+
+Grattafiori et al. (Meta, July 2024, arXiv:2407.21783) report their own IsoFLOP fit in the Llama-3 herd paper:
+
+$$
+N_{\text{opt}}(C) = A C^\alpha, \qquad (\alpha, A) = (0.53, 0.29)
+$$
+
+For their compute budget of $C = 3.8 \times 10^{25}$ FLOPs, the formula predicts $N^* \approx 402$B parameters trained on roughly 16.55T tokens — i.e. $T/P \approx 41$ at the compute-optimal point. They built the 405B flagship, a roughly 1% deviation from the law, justified by the empirical observation that **IsoFLOP curves become flatter around the minimum as the compute budget increases**. Loss is approximately quadratic in $\log N$ near the minimum, and the second derivative shrinks at higher compute budgets, so a 1-2% off-optimum allocation costs essentially no loss while delivering a much rounder model size for hardware accounting.
+
+Two further methodological notes from the Llama-3 report carry forward into Sections [Inference-aware overtraining](#inference-aware) and [Loss-to-downstream metric scaling](#loss-to-metric). First, the paper fits downstream-task scaling laws in two stages: compute $\to$ NLL on the downstream eval, then NLL $\to$ accuracy. Second, the smaller Llama-3 variants (8B and 70B) were deliberately trained past compute-optimal — past 15T tokens — for inference reasons, not because Meta believes the IsoFLOP frontier is wrong at those scales.
+
+### Independent follow-ups
+
+The data-quality story has fewer independent replications than one would like. The 2025 ACL paper "Scaling Laws Revisited: Modeling the Role of Data Quality in Language Model Pretraining" (arXiv:2510.03313) is the closest follow-up: it parameterises quality with a factor $Q \in (0, 1]$ and fits an exponent for quality's contribution to loss in the range $\gamma \approx 0.17$ (for neural machine translation) to $\gamma \approx 0.40$ (for causal language modelling). Goyal et al. (CVPR 2024) studied data filtering at the multimodal pretraining scale and reached compatible qualitative conclusions. The literature is still small, and the chapter does not claim more than DeepSeek's original finding plus one corroborating study. Treat the precise exponent values as preliminary.
+
+---
+
+## Inference-aware overtraining {#inference-aware}
+
+Sardana, Portes, Doubov, and Frankle (MosaicML/Databricks, December 2023, arXiv:2401.00448) published "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws." The paper extends Chinchilla's optimisation problem by adding the inference cost over a model's deployed lifetime. The result reshapes what "optimal" means in 2024-2026 frontier practice.
+
+<Figure caption="Loss-proxy vs N at a fixed training-compute budget of 10²⁵ FLOPs. The black curve is the Chinchilla objective (training loss only); its minimum sits near N ≈ 300 B. The coloured curve adds the lifecycle inference cost; as the slider raises N_infer, its minimum migrates left — the optimal model gets smaller and more-trained. Numbers are illustrative; coefficients are Hoffmann 2022.">
+  <IsoflopCurve />
+</Figure>
+
+### The lifecycle FLOP objective
+
+Chinchilla minimises $L(N, D_{\text{tr}})$ subject to a fixed training compute budget $C_{\text{tr}} = 6 N D_{\text{tr}}$. Sardana replaces this with the total lifecycle compute:
+
+$$
+C_{\text{total}}(N, D_{\text{tr}}, D_{\text{inf}}) = 6 N D_{\text{tr}} + 2 N D_{\text{inf}}
+$$
+
+where $D_{\text{inf}}$ is the expected total number of inference tokens — number of requests times tokens per request, summed over the model's lifetime. The factor of 2 (rather than 6) reflects the fact that inference is forward-only: there is no backward pass, no optimizer state update, so each token through the model costs roughly $2N$ FLOPs in the per-token accounting that the [transformer-block chapter](/textbook/00a-transformer#flops-per-token) sets up.
+
+The constraint is no longer "fixed training compute" but "achieve target loss $L^*$." The optimisation is then to choose $(N, D_{\text{tr}})$ minimising $C_{\text{total}}$ subject to $L(N, D_{\text{tr}}) = L^*$. Sardana retains the Chinchilla parametric form $L(N, D_{\text{tr}}) = E + A/N^\alpha + B/D_{\text{tr}}^\beta$. Their own fit on a sweep of 47 models extending to $T/P$ ratios up to 10,000:
+
+| Parameter | Sardana (2023) fit |
+| --- | --- |
+| $A$ | 33.66 |
+| $B$ | 138.9 |
+| $\alpha$ | 0.18 |
+| $\beta$ | 0.24 |
+| $E$ | 1.45 |
+
+These exponents differ substantially from Chinchilla's $\alpha \approx 0.35, \beta \approx 0.37$. Sardana attributes the difference to the extreme $T/P$ range of their sweep — Chinchilla's fit is most accurate near $T/P \approx 20$, while Sardana's is most accurate when $T/P$ runs into the hundreds or thousands. The two fits should be read as regime-dependent rather than as contradicting each other. A practitioner working at $T/P = 20$ should use Chinchilla's exponents; one working at $T/P = 1000$ should use Sardana's.
+
+### The over-training prescription
+
+The Lagrangian for the constrained Sardana problem produces a closed-form correction to the Chinchilla optimum. For target loss $L^* = L(N^*_{\text{ch}}, D^*_{\text{tr,ch}})$ — matching Chinchilla quality at lifecycle minimum cost — the cost-optimal $N^{**}$ satisfies approximately
+
+$$
+N^{**} \approx N^*_{\text{ch}} \cdot \left( \frac{1}{1 + r/3} \right)^{\frac{\beta}{\alpha + \beta + \alpha \beta}}
+$$
+
+where $r = D_{\text{inf}} / D_{\text{tr}}$ is the inference-to-training token ratio and the factor of 1/3 comes from the ratio of inference FLOPs (2N) to training FLOPs (6N) per token. The intuition is straightforward: when inference dominates the lifecycle, the cost-minimising allocation pushes $N$ down (cheaper to serve) and $D_{\text{tr}}$ up (compensating for the smaller model). The full derivation appears in Sardana §3.
+
+The headline numerical claim in the paper: a 13B Chinchilla model expecting 2T inference tokens over its lifetime can be replaced by a 7B model trained on 1.18× the Chinchilla-optimal data for that 7B, achieving the same loss target at roughly 17% less total compute.
+
+### Why every frontier lab over-trains
+
+Two reinforcing reasons. The first is direct: when a model expects to serve billions or trillions of inference tokens, the inference term in $C_{\text{total}}$ dominates and Sardana's optimum pushes $T/P$ into the hundreds. The second is indirect, via distillation: training a large compute-optimal teacher and distilling into a smaller student is now a dominant production pattern (used in some form by every major closed-model lab), and the student is then over-trained on synthetic data from the teacher, multiplying the apparent $T/P$ ratio beyond what any single-stage scaling law would predict.
+
+The Epoch AI data-insight tracker reports tokens-per-(active)-parameter for open-weight frontier models rising from approximately 10 in 2022 to approximately 300 in 2025, a growth rate of roughly 3.1× per year. By any reasonable inference-economics calculation, every frontier-2026 model is deep in over-training territory, and the Sardana framework is the correct lens for understanding that practice. The [active-vs-total parameter accounting from the MoE chapter](/textbook/00h-moe-plumbing#why-moe) becomes essential here: for a mixture-of-experts model, the $N$ in Sardana's formula is the *active* parameter count, since that is what actually consumes 2N FLOPs per inference token, even though total parameters set the GPU memory footprint.
+
+<Callout variant="warning" title="Two questions, two answers">
+Chinchilla and Sardana answer different questions. Chinchilla: "Given a fixed pretraining compute budget, which allocation minimises pretraining loss?" — answer, $T/P \approx 20$. Sardana: "Given a target loss and an expected inference load, which allocation minimises lifecycle cost?" — answer, $T/P$ can be anywhere from 20 to several thousand depending on the inference load. Both are valid. Frontier models in 2025-2026 sit at Sardana-optimal, not Chinchilla-optimal, and this is not a refutation of Chinchilla — it is Chinchilla applied to a different objective function.
+</Callout>
+
+---
+
+## Loss-to-downstream metric scaling {#loss-to-metric}
+
+A scaling law for pretraining loss is only as useful as the link from loss to task accuracy. If task accuracy is unpredictable from loss, the entire planning apparatus of frontier pretraining loses its value. The literature on this link is now mature enough to support careful claims, but the early framing of "emergent abilities" requires re-examination.
+
+### Wei et al. — the emergence claim
+
+Wei, Tay, Bommasani, Raffel, Zoph, et al. (2022, "Emergent Abilities of Large Language Models," arXiv:2206.07682) reported that on 137 BIG-Bench tasks plus the curated BIG-Bench Hard subset (Suzgun et al. 2022, arXiv:2210.09261), task accuracy as a function of compute appears *discontinuous*: flat or near-zero up to some critical scale, then sharply rising. They framed this as analogous to a phase transition. If correct, this would imply that downstream task quality is fundamentally unpredictable from loss alone — that frontier model planning could not rely on smooth loss-to-accuracy extrapolation.
+
+### Schaeffer et al. — the metric-artifact rebuttal
+
+Schaeffer, Miranda, and Koyejo (2023, "Are Emergent Abilities of Large Language Models a Mirage?", arXiv:2304.15004, NeurIPS 2023 best paper) argue that most observed emergence is a **metric artifact**. Their argument has three pieces:
+
+1. Non-linear or discontinuous metrics — exact-match accuracy on multi-step problems, choose-from-five accuracy with high random-chance baseline — produce apparent emergence even when the underlying model's per-token log-likelihood of the correct answer improves smoothly.
+2. Linear or continuous metrics on the same model outputs — token-level edit distance, log-probability of correct answer, Brier score — produce smooth, predictable improvement curves.
+3. Of the 39 BIG-Bench metrics that show non-trivial scale dependence, 25 show smooth improvement (no apparent emergence) when re-scored with continuous metrics.
+
+The Schaeffer paper does not deny that task accuracy *sometimes* shows sharp thresholds — it argues those thresholds are not properties of the model's underlying competence but of the rounding that converts continuous internal log-probabilities into discrete pass/fail. The honest position is that emergence is *partly* a metric artifact, not entirely: there are still tasks (grokking-style behaviours, some multi-step reasoning compositions) where genuinely sharp behavioural transitions have been documented. Schaeffer should not be over-cited as having dissolved the emergence question entirely.
+
+### Gadre et al. — loss-to-downstream as a power law
+
+Gadre, Smyrnis, Shankar, Gururangan, and colleagues (2024, "Language models scale reliably with over-training and on downstream tasks," arXiv:2403.08540) develop the two-part framework that is now standard for predicting frontier-model downstream performance.
+
+**Part 1: an over-training scaling law for loss** that explicitly includes the token multiplier $M = D/N$ as a hyperparameter rather than fixing it at compute-optimal:
+
+$$
+L(C, M) = E + (a M^\eta + b M^{-\eta}) \, C^{-\eta}
+$$
+
+with $\eta$ independent of $M$. This is the first scaling law that is *designed* to predict loss in the over-trained regime, not just at Chinchilla-optimal.
+
+**Part 2: a loss-to-downstream-error power law:**
+
+$$
+\text{Err}(L) = \varepsilon - k \exp(-\gamma L), \qquad \text{equivalently} \qquad \text{Err}(\text{PP}) = \varepsilon - k \, \text{PP}^{-\gamma}
+$$
+
+where $\text{PP}$ is perplexity. This is fit on 17 LLM-Foundry downstream tasks, with the metric being averaged top-1 error across tasks. The averaging is essential — it smooths out the sharp thresholds that single-task exact-match accuracy produces and recovers a clean power-law relationship between loss and downstream error.
+
+Predictive accuracy: extrapolating from experiments at 20× lower compute, Gadre predicts the validation loss of a 6.9B-parameter compute-optimal model trained on 138B tokens (i.e. $T/P = 20$) to within 0.7% relative error, and the corresponding averaged downstream top-1 error to within 0.05%. For a 1.4B/900B-token over-trained model ($T/P = 643$), the downstream prediction holds at 3.6% relative error.
+
+This is the proof of concept that, with the right metric, downstream prediction works at scale. Frontier-lab calibration in practice — Llama-3, Llama-4, Apple AFM, and (publicly visible) OpenAI evals — uses two-stage prediction: compute predicts NLL on a broad eval suite, and NLL predicts accuracy via a sigmoidal or exponential curve. The eval suite is chosen to be broad enough that the law-of-large-numbers averaging in Gadre's analysis applies.
+
+### Ruan et al. — observational scaling laws
+
+Ruan, Maddison, and Hashimoto (2024, "Observational Scaling Laws and the Predictability of Language Model Performance," arXiv:2405.10938, NeurIPS 2024 spotlight) take a complementary approach. Rather than training a new sweep, they fit scaling laws on roughly 100 already-published models — Llama-2 family, Mistral family, Phi, StarCoder, and others — using their reported benchmark scores. The key finding: a low-dimensional capability space, extracted via principal components on a panel of benchmark scores, captures most of the cross-family variance, and downstream-task performance is a smooth, often sigmoidal function of position in that space. Even agentic task scores are smoothly predictable from non-agentic benchmark scores within this framework. This validates Schaeffer's "smoothness given the right metric" claim at cross-family scale.
+
+### When loss predicts downstream cleanly
+
+The synthesis across Schaeffer, Gadre, and Ruan:
+
+- **Yes** if the downstream metric is averaged top-1 error across many tasks (variance averages out and sharp thresholds blur into smooth curves).
+- **Yes** if the metric is log-likelihood of the correct answer rather than exact-match accuracy.
+- **No** if the metric is single-task exact-match accuracy on a problem requiring multi-step composition, especially with high random-chance baseline.
+- **In practice** (Llama-3, Llama-4, Apple AFM, OpenAI), the two-stage prediction (compute $\to$ NLL on a broad eval, NLL $\to$ accuracy) is the calibration pattern frontier labs publicly disclose.
+
+---
+
+## MoE scaling laws {#moe-scaling}
+
+The dense $C = 6ND$ accounting couples parameters and compute. For a mixture-of-experts model the coupling breaks: training compute scales with active parameters, but model capacity scales with total parameters. Scaling laws for MoE require an additional axis — either total parameter count, the sparsity ratio $S = N_{\text{total}}/N_{\text{active}}$, or an expert-count quantity — to make sense of this decoupling. The relevant background is the [active-vs-total accounting introduced in the MoE-plumbing chapter](/textbook/00h-moe-plumbing#why-moe).
+
+### Clark et al. — unified routed scaling
+
+Clark, de Las Casas, Guy, et al. (DeepMind, 2022, "Unified Scaling Laws for Routed Language Models," arXiv:2202.01169, ICML 2022 oral) propose a joint form for routed models:
+
+$$
+L(N, E) = \left( \frac{N_c}{N} \right)^{\alpha_N} + \left( \frac{E_c}{E} \right)^{\alpha_E} + \text{cross term} + L_\infty
+$$
+
+where $N$ is the *active* parameter count and $E$ is the number of experts. They define an Effective Parameter Count $N_{\text{eff}}(N, E)$ such that all routing architectures they study — S-BASE, Hash Layers, RL-based routing — collapse onto a single dense scaling law when plotted against $N_{\text{eff}}$. The effective-parameter formula is roughly $N_{\text{eff}} \propto N \cdot f(E)$ where $f(E)$ saturates as $E$ grows large — implying a soft upper bound on how much benefit additional experts deliver at fixed active parameter count. The reported saturation point lies in the low hundreds of experts for the architectures they study.
+
+### Krajewski et al. — fine-grained MoE and the granularity axis
+
+Krajewski, Ludziejewski, and colleagues (2024, "Scaling Laws for Fine-Grained Mixture of Experts," arXiv:2402.07871, ICML 2024) add a third axis to the MoE scaling-law form: **granularity** $G = 2 d_{\text{model}} / d_{\text{expert}}$, so $G > 1$ means smaller-than-default experts. Their joint law:
+
+$$
+L(N, D, G) = c + \left( \frac{g}{G^\gamma} + a \right) \frac{1}{N^\alpha} + \frac{b}{D^\beta}
+$$
+
+with fit values at $E = 64$ experts:
+
+| Parameter | Value |
+| --- | --- |
+| $\alpha$ | 0.115 |
+| $\beta$ | 0.147 |
+| $\gamma$ | 0.58 |
+| $a$ | 18.1 |
+| $b$ | 30.8 |
+| $g$ | 2.1 |
+| $c$ | 0.47 |
+
+Two practical conclusions emerge from the Krajewski fit. First, the standard practice of $d_{\text{expert}} = d_{\text{ffn}}$ (i.e. $G = 1$) is almost never compute-optimal — optimal $G$ rises with $N$, from approximately 8 at 100M total parameters to approximately 64 at trillion-parameter scale. Second, a compute-optimal MoE at $10^{20}$ FLOPs matches the loss of a compute-optimal dense Transformer at roughly $2 \times 10^{21}$ FLOPs — a 20× compute-efficiency factor at that scale. The factor narrows at much larger compute budgets but does not vanish.
+
+### DeepSeek-V2 / V3 and active-parameter accounting
+
+DeepSeek-V2 (arXiv:2405.04434, May 2024) has 236B total / 21B active parameters, trained on 8.1T tokens. DeepSeek-V3 (arXiv:2412.19437, December 2024) has 671B total / 37B active, trained on 14.8T tokens. The $T/P$ ratios on the active axis are $8.1\text{T}/21\text{B} \approx 386$ for V2 and $14.8\text{T}/37\text{B} \approx 400$ for V3. Both are deep in over-training territory by Sardana logic, consistent with their API-deployed, inference-heavy usage profile.
+
+Neither DeepSeek paper publishes a separate MoE-specific scaling-law sweep. They reuse the dense IsoFLOP framework from DeepSeek-LLM and treat the MoE as an architecture with a smaller effective compute cost than its total-parameter count suggests. The implicit claim, defended in DeepSeekMoE (Dai et al., arXiv:2401.06066), is that fine-grained MoE with one or more *shared experts* — always-active experts that absorb common-knowledge gradients — gives a higher effective-parameter multiplier than uniform top-$k$ routing without shared experts.
+
+### Recent MoE scaling work (2024-2025)
+
+Three subsequent papers refine the picture. Abnar et al. (2025, "Parameters vs FLOPs: Scaling Laws for Optimal Sparsity for MoE Language Models," arXiv:2501.12370) find that the optimal sparsity $S^* = N_{\text{total}}/N_{\text{active}}$ depends on both the training compute budget and the total-parameter budget, and that under typical settings $S^*$ lies in the range of approximately 8-16 active per 100 total — i.e. roughly 6-12% activation, broadly consistent with DeepSeek-V3's 5.5% and Qwen3-235B's 9%. Yang et al. (2025, "Towards Greater Leverage," arXiv:2507.17702) parameterise MoE scaling with three axes: activation ratio, granularity, and shared-expert ratio; they report that granularity acts as a non-linear modulator with a clear optimal range matching Krajewski's $G \in [16, 64]$ band. A separate 2025 paper on joint MoE scaling (arXiv:2502.05172) argues for memory-aware variants that incorporate KV cache and weight-memory budgets as explicit constraints.
+
+The pattern across this work is that the MoE scaling-law literature is converging on a small number of canonical findings — granularity matters, sparsity has an optimum, shared experts help in some regimes — without yet producing a single dominant parametric form analogous to the Chinchilla equation for dense models. The Krajewski form is currently the most-cited, and its $\alpha = 0.115, \beta = 0.147$ exponents (lower than dense Chinchilla) reflect the fact that MoE models absorb additional parameters more efficiently than dense models at the same active-parameter count.
+
+---
+
+## Worked example: choosing N\* and D\* {#worked-example}
+
+A frontier lab has $C = 10^{25}$ FLOPs of training budget. The question is what $(N^*, D^*_{\text{tr}})$ to choose, first under Chinchilla and then under three inference scenarios. All numerical work uses the Besiroglu/Porian-corrected Chinchilla parametric fit:
+
+$$
+L(N, D_{\text{tr}}) = E + \frac{A}{N^\alpha} + \frac{B}{D_{\text{tr}}^\beta}, \qquad E = 1.82, \; A = 482, \; B = 2085, \; \alpha = 0.348, \; \beta = 0.366
+$$
+
+The FLOPs convention is dense: $C_{\text{tr}} = 6 N D_{\text{tr}}$.
+
+### Step 1 — Chinchilla-optimal, no inference
+
+Minimise $L$ subject to $6 N D_{\text{tr}} = C$. The Lagrangian condition equates marginal loss reductions per FLOP between the $N$ and $D$ directions, which after substituting $D_{\text{tr}} = C/(6N)$ gives the closed-form
+
+$$
+N^* = \left( \frac{\alpha A}{\beta B} \right)^{\frac{1}{\alpha + \beta}} \cdot \left( \frac{C}{6} \right)^{\frac{\beta}{\alpha + \beta}}
+$$
+
+Plugging in numbers:
+
+$$
+\frac{\alpha A}{\beta B} = \frac{0.348 \times 482}{0.366 \times 2085} = \frac{167.7}{763.1} = 0.2198
+$$
+
+$$
+\frac{\beta}{\alpha + \beta} = \frac{0.366}{0.714} = 0.5126
+$$
+
+$$
+N^* = 0.2198^{1/0.714} \cdot (10^{25} / 6)^{0.5126} = 0.114 \cdot (1.667 \times 10^{24})^{0.5126}
+$$
+
+Taking logarithms:
+
+$$
+\log_{10}(N^*) = \log_{10}(0.114) + 0.5126 \cdot \log_{10}(1.667 \times 10^{24}) = -0.943 + 0.5126 \cdot 24.222 = 11.474
+$$
+
+So $N^* \approx 3.0 \times 10^{11}$ — that is, **300 billion parameters**. The corresponding optimal token count is
+
+$$
+D^*_{\text{tr}} = \frac{C}{6 N^*} = \frac{10^{25}}{6 \cdot 3.0 \times 10^{11}} = \frac{10^{25}}{1.8 \times 10^{12}} \approx 5.6 \times 10^{12} = 5.6 \text{T tokens}
+$$
+
+The $T/P$ ratio is $5.6\text{T} / 300\text{B} \approx 19$, consistent with the canonical 20-tokens-per-parameter rule. As a sanity check, the Llama-3 405B model at $3.8 \times 10^{25}$ FLOPs sits at $T/P = 41$ — roughly twice the Chinchilla prediction here, because Llama-3 uses $a = 0.53$ rather than 0.51 and Meta deliberately shifted slightly toward smaller models for inference reasons.
+
+### Step 2 — Inference-aware (Sardana) Cases A, B, C
+
+Now total compute is $C_{\text{total}} = 6 N D_{\text{tr}} + 2 N D_{\text{inf}}$, with the constraint that the model achieve the same loss $L^* = L(3 \times 10^{11}, 5.6 \times 10^{12})$ as the Chinchilla solution above. Define $r = D_{\text{inf}}/D_{\text{tr}}$. Sardana's closed-form correction factor for the optimal $N$ is approximately
+
+$$
+N^{**} = N^*_{\text{ch}} \cdot \left( \frac{1}{1 + r/3} \right)^{\frac{\beta}{\alpha + \beta + \alpha \beta}}
+$$
+
+The exponent is $\beta / (\alpha + \beta + \alpha\beta) = 0.366 / (0.714 + 0.127) = 0.435$.
+
+**Case A — light inference, $D_{\text{inf}} = 10^{11}$ tokens (100B inference tokens lifetime).** This corresponds to a research-only or pre-release model. Then $r = 10^{11}/5.6 \times 10^{12} = 0.018$, the correction factor $(1/(1 + 0.006))^{0.435} \approx 0.997$, and $N^{**} \approx 0.997 \cdot 300\text{B} \approx 300$B. The inference correction is negligible. Chinchilla-optimal is essentially correct.
+
+**Case B — medium inference, $D_{\text{inf}} = 10^{13}$ tokens (10T inference tokens lifetime).** This corresponds to a moderately-deployed model. Then $r = 10^{13}/5.6 \times 10^{12} \approx 1.79$ and the correction factor
+
+$$
+\left( \frac{1}{1 + 0.60} \right)^{0.435} = (0.625)^{0.435} \approx 0.820
+$$
+
+so $N^{**} \approx 0.82 \cdot 300\text{B} = 246$B. The corresponding training-token count rises modestly; the $T/P$ ratio moves to approximately 24. This is mild over-training.
+
+**Case C — heavy inference, $D_{\text{inf}} = 10^{15}$ tokens (1 quadrillion inference tokens lifetime).** This is the right order of magnitude for a popular API-served frontier model over twelve months. Then $r = 10^{15}/5.6 \times 10^{12} \approx 179$ and the correction factor
+
+$$
+\left( \frac{1}{1 + 59.7} \right)^{0.435} = (0.0165)^{0.435} \approx 0.149
+$$
+
+so $N^{**} \approx 0.149 \cdot 300\text{B} = 45$B. To still hit the loss target $L^* \approx 1.97$ nats with the smaller 45B model, the training-token count must rise — solving $L(45\text{B}, D^{**}_{\text{tr}}) = L^*$ gives $D^{**}_{\text{tr}} \approx 9$-10T tokens. The $T/P$ ratio is now roughly 220 — deep over-training territory.
+
+### Lifecycle FLOP comparison
+
+For Case C, total lifecycle compute under each path:
+
+| Path | Pretraining FLOPs | Inference FLOPs | Total |
+| --- | --- | --- | --- |
+| Chinchilla (300B / 5.6T) | $6 \cdot 3 \times 10^{11} \cdot 5.6 \times 10^{12} = 1.0 \times 10^{25}$ | $2 \cdot 3 \times 10^{11} \cdot 10^{15} = 6.0 \times 10^{26}$ | $\approx 6.1 \times 10^{26}$ |
+| Sardana (45B / 10T) | $6 \cdot 4.5 \times 10^{10} \cdot 10^{13} = 2.7 \times 10^{24}$ | $2 \cdot 4.5 \times 10^{10} \cdot 10^{15} = 9.0 \times 10^{25}$ | $\approx 9.3 \times 10^{25}$ |
+
+The Sardana path saves approximately 85% of lifecycle FLOPs at this inference scale, almost all of which comes from the inference term: a 45B model is approximately $300/45 \approx 7$× cheaper to serve than a 300B model at the same throughput. The pretraining cost rises modestly (from $1.0 \times 10^{25}$ to $2.7 \times 10^{24}$ FLOPs is actually a *decrease*, because the smaller-model-longer-training path here remains within the original training-compute budget), but the inference savings dominate by orders of magnitude.
+
+### Concrete frontier interpretation
+
+The right answer for a frontier lab in 2026 with $10^{25}$ FLOPs of training compute and an expected $10^{15}$ inference-token lifetime is a model in the 30-60B active-parameter range trained for 5-10T tokens — not a 300B / 5.6T Chinchilla-optimal model. This is exactly the regime occupied by Llama-3 70B, Qwen2.5 72B, DeepSeek-V3 (37B active), Mistral Large, and the broader 2025-2026 frontier landscape covered in the next section.
+
+---
+
+## Frontier-lab landscape, May 2026 {#frontier-practice}
+
+The table below summarises the scaling-law-related parameters and observed tokens-per-parameter ratios across the labs publishing usable data as of May 2026. For MoE models, $T/P$ is reported on the *active* parameter axis, because that is what dictates per-token FLOPs and the inference economics that drive over-training decisions. The "exponent" columns are populated only where the relevant paper reports a parametric fit.
+
+<ComparisonTable
+  caption="Scaling-law exponents and frontier T/P ratios. Where a row reports no parametric fit, the T/P column reflects the empirical training-token-to-parameter ratio of the named model. Active parameters used for MoE."
+  columns={["Source / Model", "Year", "Method", "α (params)", "β (data)", "a = N_opt exponent in C", "T/P", "Source"]}
+  rows={[
+    ["Kaplan et al.", "2020", "Independent power-law fits", "0.076", "0.095", "0.73", "1-2", "https://arxiv.org/abs/2001.08361"],
+    ["Chinchilla — Approach 1 (envelope)", "2022", "Fixed-N sweep envelope", "—", "—", "~0.50", "~20", "https://arxiv.org/abs/2203.15556"],
+    ["Chinchilla — Approach 2 (IsoFLOP)", "2022", "IsoFLOP minimisation", "—", "—", "0.49 (80% CI 0.46–0.53)", "~20", "https://arxiv.org/abs/2203.15556"],
+    ["Chinchilla — Approach 3 (parametric, orig.)", "2022", "L = E + A/N^α + B/D^β", "0.34", "0.28", "0.46", "~70 (inconsistent w/ A1/A2)", "https://arxiv.org/abs/2203.15556"],
+    ["Besiroglu et al. refit", "2024", "Re-run of Approach 3 to convergence", "0.348", "0.366", "0.51", "~20", "https://arxiv.org/abs/2404.10102"],
+    ["Porian et al.", "2024", "Kaplan setup + 4 corrections", "—", "—", "~0.50 (95% CI 0.49–0.50)", "~20", "https://arxiv.org/abs/2406.19146"],
+    ["Pearce & Song", "2024", "Methodological reconciliation", "—", "—", "~0.50", "~20", "https://arxiv.org/abs/2406.12907"],
+    ["DeepSeek-LLM", "2024", "IsoFLOP in (M, D) space; quality-dependent", "0.524 (model FLOPs)", "0.476", "0.524 in M", "varies with data quality", "https://arxiv.org/abs/2401.02954"],
+    ["Sardana et al.", "2023", "Inference-aware Chinchilla", "0.18", "0.24", "depends on r", "100-10,000 (function of inf. demand)", "https://arxiv.org/abs/2401.00448"],
+    ["Gadre et al.", "2024", "Over-training law L(C, M) + downstream", "η (indep. of M)", "—", "—", "tested 5-640", "https://arxiv.org/abs/2403.08540"],
+    ["Llama-3 / 3.1", "2024", "IsoFLOP + downstream NLL fit", "—", "—", "0.53 (in N_opt = 0.29 C^0.53)", "39 (405B) - 1875 (8B)", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-3 8B", "2024", "Empirical, 15T tokens", "—", "—", "—", "1,875", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-3 70B", "2024", "Empirical, 15T tokens", "—", "—", "—", "214", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-3 405B", "2024", "Empirical, 15.6T tokens", "—", "—", "—", "39 (near Chinchilla for this scale)", "https://arxiv.org/abs/2407.21783"],
+    ["Llama-4 Scout", "2025", "Empirical, 109B/17B active, 40T tokens", "—", "—", "—", "2,353 (active)", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Llama-4 Maverick", "2025", "Empirical, 400B/17B active, 22T tokens", "—", "—", "—", "1,294 (active)", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["Llama-4 Behemoth", "2025", "Empirical, 2T/288B active, 30T tokens", "—", "—", "—", "104 (active, near MoE compute-optimum)", "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"],
+    ["DeepSeek-V3", "2024", "Empirical, 671B/37B active, 14.8T tokens", "—", "—", "—", "400 (active) / 22 (total)", "https://arxiv.org/abs/2412.19437"],
+    ["Qwen2.5 72B", "2024", "Empirical, 18T tokens", "—", "—", "—", "250", "Alibaba Qwen 2.5 report"],
+    ["Mistral-7B", "2023", "Empirical, post-extension to 8T tokens", "—", "—", "—", "1,143", "Mistral disclosures"],
+    ["Gemma 2 9B", "2024", "Empirical, 8T tokens (distillation)", "—", "—", "—", "889", "Google Gemma 2 report"],
+    ["Clark et al. (MoE)", "2022", "Unified routed scaling, effective param count", "α_N on active", "α_E on experts", "—", "—", "https://arxiv.org/abs/2202.01169"],
+    ["Krajewski et al. (fine-grained MoE)", "2024", "L(N, D, G) with granularity G", "0.115", "0.147", "varies with G", "varies", "https://arxiv.org/abs/2402.07871"],
+    ["Abnar et al.", "2025", "Sparsity-optimal MoE", "—", "—", "—", "S* ≈ 8-16 active per 100 total", "https://arxiv.org/abs/2501.12370"],
+    ["Choshen et al. (Hitchhiker's Guide)", "2024", "Meta-analysis of 485 models", "—", "—", "—", "seed variance ≤ 4% in loss", "https://arxiv.org/abs/2410.11840"],
+    ["Sengupta et al.", "2025", "Chinchilla robustness perturbations", "—", "—", "—", "~20 (within ±15.2%)", "https://arxiv.org/abs/2509.23963"],
+    ["Epoch AI industry trend", "2026", "Open-weight model survey", "—", "—", "—", "~10 (2022) → ~300 (2025), 3.1×/yr", "https://epoch.ai/data-insights/training-tokens-per-parameter"],
+  ]}
+/>
+
+The Llama-4 numbers come from Meta's April 2025 herd announcement plus the Mascorro public analysis; Meta has not published an internal scaling-law derivation for the herd, so those rows should be read as best public estimate rather than a peer-reviewed fit. DeepSeek-V2 and V3 do not publish a separate MoE-specific scaling-law sweep — their $T/P$ ratios come from the disclosed training-token and active-parameter counts and reflect over-training decisions, not a published parametric fit.
+
+Reading down the table, the trajectory is clear. In 2020-2022 the field operated at $T/P$ values between 1 and 20 — Kaplan-era undersized data, then Chinchilla-corrected. Starting in 2023-2024, every published model crosses well above 20: even the largest Llama-3 405B at $T/P = 39$ slightly over-trains, the smaller Llama-3 variants over-train aggressively (8B at $T/P = 1875$), and Llama-4 Scout and Maverick push past $T/P = 1000$ on the active axis. DeepSeek-V3 sits at $T/P = 400$ on the active axis but $T/P = 22$ on the total axis — a useful reminder that the MoE numerator depends on which question is being asked. The Epoch AI industry-trend row captures the field-wide compression: open-weight models' tokens-per-active-parameter is growing roughly 3.1× per year, with no obvious sign of a plateau.
+
+---
+
+## Chapter summary {#summary}
+
+- The Kaplan (2020) framework — power-law fits, joint $L(N, D)$ form, derived compute-optimal allocation — is still the foundation. The specific exponents Kaplan reported ($\alpha_N = 0.076$, $\alpha_D = 0.095$, $a = 0.73$) are not, because of identifiable methodological errors closed by Porian (2024).
+- Chinchilla (Hoffmann 2022) replaced the Kaplan allocation with a $T/P \approx 20$ rule, derived three independent ways. The corrected parametric fit (Besiroglu 2024) is $\alpha \approx 0.35$, $\beta \approx 0.37$, $a \approx 0.51$, $T/P \approx 20$. The 20:1 rule is durable; the original Hoffmann Approach-3 confidence intervals were not.
+- DeepSeek-LLM (2024) showed that the exponents shift with data quality. Higher-quality corpora push the optimum toward more parameters; lower-quality corpora toward more tokens. Different labs rationally arrive at different exponents within a band of roughly $a \in [0.45, 0.58]$.
+- Sardana (2023) reframes the problem as minimising lifecycle compute under a target loss, including the $2 N D_{\text{inf}}$ inference term. For non-trivial inference demand, the optimum pushes $N$ down and $D_{\text{tr}}$ up — i.e. over-training. This is the right framework for every frontier 2025-2026 model.
+- Schaeffer (2023) showed that much of the BIG-Bench "emergent abilities" pattern is a metric artifact, partial but not complete. Gadre (2024) demonstrated that with the right averaged metric, loss-to-downstream-error is a clean power law. Two-stage prediction (compute $\to$ NLL $\to$ accuracy) is now the calibration standard.
+- MoE scaling laws (Clark 2022, Krajewski 2024, Abnar 2025) add the granularity and sparsity axes. The active-parameter count is the relevant $N$ for FLOPs and inference economics; total parameters set memory footprint. Optimal granularity rises with $N$; optimal sparsity sits near 6-12% activation.
+- The keystone honesty point: Chinchilla and Sardana answer different questions, and both answers are right. "$T/P = 20$" is the answer for minimising pretraining loss at fixed training compute; "$T/P$ in the hundreds or thousands" is the answer for minimising lifecycle compute given heavy expected inference load. Frontier 2025-2026 models sit at the second answer, and the gap between $T/P = 20$ and $T/P = 400$ is not a refutation of Chinchilla — it is Chinchilla applied to a different objective function.
+
+The next chapters extend this framework along two axes. [μP and hyperparameter transfer](/textbook/01d-mup-and-transfer) shows how Porian-style per-scale hyperparameter retuning can be automated, removing one of the methodological sources of scaling-law disagreement. [Schedules and batch](/textbook/01e-schedules-and-batch) returns to the loss-curve shape question — Kaplan's critical batch size survives, his LR-decay-is-essential claim does not — and shows how these choices shift the constants (though not the exponents) of the scaling law. [Data curriculum](/textbook/01f-data-curriculum) is where the data-quality story from Section [Data quality and exponent shifts](#data-quality) becomes operational.
+
+---
+
+<Sources items={[
+  {
+    authors: "Kaplan, J. et al.",
+    year: 2020,
+    title: "Scaling Laws for Neural Language Models",
+    venue: "arXiv:2001.08361",
+    url: "https://arxiv.org/abs/2001.08361",
+    note: "The foundational paper. Power-law fits in N, D, C; joint L(N,D) form; reported a=0.73 compute-optimal exponent. Methodologically superseded by Porian (2024)."
+  },
+  {
+    authors: "Hoffmann, J. et al.",
+    year: 2022,
+    title: "Training Compute-Optimal Large Language Models",
+    venue: "arXiv:2203.15556",
+    url: "https://arxiv.org/abs/2203.15556",
+    note: "Chinchilla. Three independent IsoFLOP-based approaches. 20-tokens-per-parameter rule. Approach 3 parametric fit α=0.34, β=0.28, E=1.69 — later corrected by Besiroglu."
+  },
+  {
+    authors: "Besiroglu, T., Erdil, E., Barnett, M., You, J.",
+    year: 2024,
+    title: "Chinchilla Scaling: A replication attempt",
+    venue: "arXiv:2404.10102",
+    url: "https://arxiv.org/abs/2404.10102",
+    note: "Re-running Hoffmann's Approach 3 to convergence: corrected fit α=0.348, β=0.366, E=1.82, a=0.5126. Identifies optimizer-stop and rounding errors in the original."
+  },
+  {
+    authors: "Porian, T., Achille, A., Maddison, C. et al.",
+    year: 2024,
+    title: "Resolving discrepancies in compute-optimal scaling of language models",
+    venue: "arXiv:2406.19146",
+    url: "https://arxiv.org/abs/2406.19146",
+    note: "Reproduces Kaplan's setup and identifies four corrections (last-layer FLOPs, scaled warmup, AdamW β2 per scale, non-embedding param counting) that recover N_opt ∝ C^0.50."
+  },
+  {
+    authors: "Pearce, T. and Song, J.",
+    year: 2024,
+    title: "Reconciling Kaplan and Chinchilla Scaling Laws",
+    venue: "arXiv:2406.12907",
+    url: "https://arxiv.org/abs/2406.12907",
+    note: "Independent, simpler reconciliation: attributes the Kaplan/Chinchilla gap primarily to non-embedding-only parameter counting plus small-scale bias."
+  },
+  {
+    authors: "Sengupta, A. et al.",
+    year: 2025,
+    title: "Evaluating the Robustness of Chinchilla Compute-Optimal Scaling",
+    venue: "arXiv:2509.23963",
+    url: "https://arxiv.org/abs/2509.23963",
+    note: "Four perturbation classes applied to Hoffmann's parameter table. 20:1 T/P ratio preserved exactly under multiplicative perturbations; within ±15.2% under additive."
+  },
+  {
+    authors: "Choshen, L. et al.",
+    year: 2024,
+    title: "A Hitchhiker's Guide to Scaling Law Estimation",
+    venue: "arXiv:2410.11840",
+    url: "https://arxiv.org/abs/2410.11840",
+    note: "Meta-analysis of 485 models. Seed variance up to 4% in loss is the largest source of scatter; recommends fitting to intermediate checkpoints."
+  },
+  {
+    authors: "Bi, X. et al. (DeepSeek-AI)",
+    year: 2024,
+    title: "DeepSeek LLM: Scaling Open-Source Language Models with Longtermism",
+    venue: "arXiv:2401.02954",
+    url: "https://arxiv.org/abs/2401.02954",
+    note: "Replaces N with model FLOPs per token M. Refits IsoFLOP in (M, D) space: a=0.524, b=0.476. Shows exponents shift with data quality."
+  },
+  {
+    authors: "Grattafiori, A. et al. (Meta)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "IsoFLOP fit N_opt = 0.29 C^0.53. T/P = 41 at 405B compute-optimum. Empirical IsoFLOP flatness near the minimum. Two-stage downstream prediction (NLL → accuracy)."
+  },
+  {
+    authors: "Sardana, N., Portes, J., Doubov, S., Frankle, J.",
+    year: 2023,
+    title: "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws",
+    venue: "arXiv:2401.00448",
+    url: "https://arxiv.org/abs/2401.00448",
+    note: "Lifecycle FLOP objective: 6 N D_tr + 2 N D_inf. Cost-optimal N**/N*_ch correction factor. Own fit α=0.18, β=0.24 over extreme T/P sweep."
+  },
+  {
+    authors: "Gadre, S. et al.",
+    year: 2024,
+    title: "Language models scale reliably with over-training and on downstream tasks",
+    venue: "arXiv:2403.08540",
+    url: "https://arxiv.org/abs/2403.08540",
+    note: "Over-training law L(C, M) with M=D/N hyperparameter. Loss-to-error power law Err(L) = ε - k exp(-γL). 0.05% downstream prediction error from 20× lower-compute extrapolation."
+  },
+  {
+    authors: "Ruan, Y., Maddison, C., Hashimoto, T.",
+    year: 2024,
+    title: "Observational Scaling Laws and the Predictability of Language Model Performance",
+    venue: "arXiv:2405.10938 (NeurIPS 2024 spotlight)",
+    url: "https://arxiv.org/abs/2405.10938",
+    note: "Fits scaling laws on ~100 already-published models via PCA on benchmark scores. Low-dimensional capability space; smooth sigmoidal downstream predictions, including agentic tasks."
+  },
+  {
+    authors: "Wei, J. et al.",
+    year: 2022,
+    title: "Emergent Abilities of Large Language Models",
+    venue: "arXiv:2206.07682",
+    url: "https://arxiv.org/abs/2206.07682",
+    note: "The original emergence claim. 137 BIG-Bench tasks; reports apparent discontinuous accuracy-versus-scale curves on a curated subset."
+  },
+  {
+    authors: "Schaeffer, R., Miranda, B., Koyejo, S.",
+    year: 2023,
+    title: "Are Emergent Abilities of Large Language Models a Mirage?",
+    venue: "arXiv:2304.15004 (NeurIPS 2023 best paper)",
+    url: "https://arxiv.org/abs/2304.15004",
+    note: "Argues most observed emergence is a metric artifact. 25 of 39 non-trivial-scale-dependent metrics show smooth behaviour under continuous re-scoring. Partial result, not a complete dissolution of emergence."
+  },
+  {
+    authors: "Suzgun, M. et al.",
+    year: 2022,
+    title: "Challenging BIG-Bench Tasks and Whether Chain-of-Thought Can Solve Them",
+    venue: "arXiv:2210.09261",
+    url: "https://arxiv.org/abs/2210.09261",
+    note: "Introduces BIG-Bench Hard. Reference for the curated emergence-claim subset."
+  },
+  {
+    authors: "Clark, A., de Las Casas, D., Guy, A. et al.",
+    year: 2022,
+    title: "Unified Scaling Laws for Routed Language Models",
+    venue: "arXiv:2202.01169 (ICML 2022 oral)",
+    url: "https://arxiv.org/abs/2202.01169",
+    note: "First MoE scaling-law paper. Defines effective parameter count N_eff. Saturation in benefit from additional experts in the low hundreds."
+  },
+  {
+    authors: "Krajewski, J., Ludziejewski, J. et al.",
+    year: 2024,
+    title: "Scaling Laws for Fine-Grained Mixture of Experts",
+    venue: "arXiv:2402.07871 (ICML 2024)",
+    url: "https://arxiv.org/abs/2402.07871",
+    note: "Adds granularity G axis. α=0.115, β=0.147, γ=0.58. Optimal G rises with N. 20× compute-efficiency vs. dense at 10^20 FLOPs."
+  },
+  {
+    authors: "Dai, D. et al. (DeepSeek-AI)",
+    year: 2024,
+    title: "DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models",
+    venue: "arXiv:2401.06066 (ACL 2024)",
+    url: "https://arxiv.org/abs/2401.06066",
+    note: "Fine-grained shared-expert MoE architecture. Defends higher effective-parameter multiplier from shared-expert isolation."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model",
+    venue: "arXiv:2405.04434",
+    url: "https://arxiv.org/abs/2405.04434",
+    note: "236B / 21B active, 8.1T tokens. Active-T/P ≈ 386."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2024,
+    title: "DeepSeek-V3 Technical Report",
+    venue: "arXiv:2412.19437",
+    url: "https://arxiv.org/abs/2412.19437",
+    note: "671B / 37B active, 14.8T tokens. Active-T/P ≈ 400."
+  },
+  {
+    authors: "Abnar, S. et al.",
+    year: 2025,
+    title: "Parameters vs FLOPs: Scaling Laws for Optimal Sparsity for Mixture-of-Experts Language Models",
+    venue: "arXiv:2501.12370",
+    url: "https://arxiv.org/abs/2501.12370",
+    note: "Optimal sparsity S* depends on training compute and total-parameter budget. Under typical settings S* ≈ 8-16 active per 100 total."
+  },
+  {
+    authors: "Yang, S. et al.",
+    year: 2025,
+    title: "Towards Greater Leverage: Scaling Laws for Mixture of Experts",
+    venue: "arXiv:2507.17702",
+    url: "https://arxiv.org/abs/2507.17702",
+    note: "Three-factor MoE scaling: activation ratio, granularity, shared-expert ratio. Confirms Krajewski's G ∈ [16, 64] optimal band."
+  },
+  {
+    authors: "Anonymous",
+    year: 2025,
+    title: "Scaling Laws Revisited: Modeling the Role of Data Quality in Language Model Pretraining",
+    venue: "ACL 2025 (arXiv:2510.03313)",
+    url: "https://arxiv.org/abs/2510.03313",
+    note: "Parameterises quality with Q ∈ (0,1]. Fits γ ≈ 0.17 (NMT) to 0.40 (CLM) for the quality exponent. Corroborating evidence for DeepSeek's data-quality finding."
+  },
+  {
+    authors: "Goyal, S. et al.",
+    year: 2024,
+    title: "Scaling Laws for Data Filtering — Data Curation cannot be Compute Agnostic",
+    venue: "CVPR 2024",
+    url: "https://openaccess.thecvf.com/content/CVPR2024/html/Goyal_Scaling_Laws_for_Data_Filtering--_Data_Curation_cannot_be_Compute_CVPR_2024_paper.html",
+    note: "Multimodal-pretraining setting. Compatible qualitative conclusions about quality-dependent exponents."
+  },
+  {
+    authors: "Sorscher, B. et al.",
+    year: 2022,
+    title: "Beyond Neural Scaling Laws: Beating Power Law Scaling via Data Pruning",
+    venue: "arXiv:2206.14486",
+    url: "https://arxiv.org/abs/2206.14486",
+    note: "Theoretical and empirical demonstration that high-quality data subsetting can produce sub-power-law improvements. Context for the data-quality discussion."
+  },
+  {
+    authors: "Epoch AI",
+    year: 2026,
+    title: "Training open-weight models is becoming more data intensive",
+    venue: "Epoch AI Data Insights",
+    url: "https://epoch.ai/data-insights/training-tokens-per-parameter",
+    note: "Tokens per (active) parameter for open-weight frontier models: ~10 in 2022, ~300 in 2025, growth rate ~3.1× per year."
+  },
+  {
+    authors: "Epoch AI",
+    year: 2026,
+    title: "Frontier language models have become much smaller",
+    venue: "Epoch AI Gradient Updates",
+    url: "https://epoch.ai/gradient-updates/frontier-language-models-have-become-much-smaller",
+    note: "Cross-lab trend: frontier active parameter counts in 2024-2026 are substantially smaller than the 2022-2023 peak, consistent with Sardana over-training prescription."
+  },
+  {
+    authors: "Besiroglu, T. (Epoch AI)",
+    year: 2024,
+    title: "Chinchilla Scaling: A replication attempt — blog write-up",
+    venue: "Epoch AI Blog",
+    url: "https://epoch.ai/blog/chinchilla-scaling-a-replication-attempt",
+    note: "Accessible write-up of the Besiroglu (2024) refit, with discussion of the optimizer-convergence and rounding bugs in the original Hoffmann fit."
+  },
+  {
+    authors: "Meta AI",
+    year: 2025,
+    title: "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+    venue: "Meta AI Blog, April 2025",
+    url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+    note: "Llama-4 Scout (109B/17B), Maverick (400B/17B), Behemoth (2T/288B). Source for Llama-4 T/P numbers in the comparison table."
+  },
+  {
+    authors: "de Vries, H.",
+    year: 2024,
+    title: "Go smol or go home (model size vs compute overhead)",
+    venue: "harmdevries.com",
+    url: "https://www.harmdevries.com/post/model-size-vs-compute-overhead/",
+    note: "Critical model size = 30% of Chinchilla-optimal at 100% compute overhead — the practical floor on inference-aware downsizing."
+  },
+  {
+    authors: "Biderman, S. et al.",
+    year: 2023,
+    title: "Pythia: A Suite for Analyzing Large Language Models Across Training and Scaling",
+    venue: "ICML 2023; arXiv:2304.01373",
+    url: "https://arxiv.org/abs/2304.01373",
+    note: "16 models 70M–12B, identical data order, 154 checkpoints each, 300B tokens; the public reproducibility scaffold for scaling-law replication."
+  },
+  {
+    authors: "HuggingFaceTB",
+    year: 2025,
+    title: "SmolLM3 base recipe (T/P = 3,733)",
+    venue: "huggingface.co/blog/smollm3",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "3B parameters trained on 11.2T tokens — the most extreme open-data overtraining anchor as of May 2026."
+  }
+]} />
