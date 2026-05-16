@@ -1,0 +1,643 @@
+---
+slug: 03c-rlhf
+title: RLHF — reward modeling and PPO at LLM scale
+description: Bradley-Terry RM, PPO clipped surrogate with KL penalty, the InstructGPT pipeline, reward hacking, and the 2024-2026 DPO-vs-PPO landscape.
+order: 30
+chapter: 30
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 42
+depends_on: [03a-sft, 03b-preference-tuning]
+provides: [rlhf, bradley-terry, ppo, reward-hacking, instructgpt, kl-penalty]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+[SFT](/textbook/03a-sft) produces a model that completes instructions coherently. [Preference tuning](/textbook/03b-preference-tuning) showed that the mathematical objective underlying human-preference alignment is KL-constrained reward maximization — and that DPO reparameterizes it into a supervised loss by solving for the optimal policy in closed form. The present chapter returns to that same objective and asks what happens when you optimize it *without* the closed-form trick — that is, by actually running a reinforcement learning loop.
+
+That loop is Reinforcement Learning from Human Feedback (RLHF), and its canonical instantiation is the InstructGPT pipeline: supervised fine-tuning, then reward model training from human comparisons, then policy optimization via Proximal Policy Optimization (PPO). The pipeline is not merely historical. OpenAI, Anthropic, and DeepMind continue to deploy it or close variants at the frontier through 2026, precisely because on-policy RL can discover responses that no human demonstration or fixed preference dataset has ever contained. DPO's closed-form derivation is elegant; PPO's exploration capability is necessary.
+
+The chapter proceeds as follows. Reward model theory establishes the Bradley-Terry preference model and its training loss. The PPO section reviews the clipped surrogate as briefly as a reader with RL background requires. The LLM-scale section shows how a single response generation becomes an RL episode, where the KL penalty lives, and why there are two non-equivalent implementations that produce incompatible $\beta$ values. The worked example walks every quantity through a toy rollout. Reward hacking surveys the four main failure modes with their empirical signatures. The Llama-2 and Tülu-3 case studies ground the theory in disclosed numbers. The infrastructure section explains the actor/learner architecture that makes PPO economically viable at 70B+ scale. The final section assesses the May 2026 DPO-vs-PPO landscape.
+
+Notation continues from [03b](/textbook/03b-preference-tuning): $\pi_\theta$ is the policy, $\pi_{\text{ref}}$ is the frozen SFT reference, $\beta$ is the KL coefficient. New symbols introduced here: $\hat{A}_t$ for the generalized advantage estimate at token position $t$; $V_\psi$ for the value head; $\rho_t = \pi_\theta(y_t|x,y_{<t})/\pi_{\theta_{\text{old}}}(y_t|x,y_{<t})$ for the importance ratio; $\epsilon$ for the PPO clip parameter; $R$ (uppercase) for the terminal reward model score; $r_t$ (lowercase) for the shaped per-token reward.
+
+The chapter signposts forward to [RLAIF](/textbook/03d-rlaif-constitutional), where the human labelers are replaced by a judge model, and [RLVR](/textbook/03e-rlvr), where the reward model is replaced by a programmatic verifier. Both extensions preserve the PPO loop described here while modifying only the reward signal.
+
+---
+
+## The Bradley-Terry preference model {#bradley-terry}
+
+### The setting
+
+After SFT, the model generates reasonable completions, but "reasonable" admits an enormous range of styles — concise versus elaborate, cautious versus confident, technically precise versus colloquially fluent. Human demonstrations cannot specify which style to prefer; the space is too large and the preference is too contextual. The canonical solution is **pairwise comparison**: given prompt $x$ and two candidate completions $y_a, y_b$ sampled from the SFT model, a labeler selects a winner $y_w$ and a loser $y_l$. The downstream task is to fit a scalar-valued function $r(x, y)$ such that the ordering of completions by $r$ matches the ordering implied by the comparisons.
+
+### The Bradley-Terry model
+
+Bradley and Terry (1952) introduced a probabilistic paired-comparison model in the context of sports rankings. Every item $i$ is assigned a latent strength $\lambda_i > 0$, and the probability that $i$ beats $j$ in a comparison is
+
+$$P(i \succ j) = \frac{\lambda_i}{\lambda_i + \lambda_j}.$$
+
+Writing $\lambda_i = \exp(r_i)$ and defining $r(x, y)$ as the reward model's scalar output for completion $y$ given prompt $x$, the pairwise preference probability becomes
+
+$$P(y_w \succ y_l \mid x) = \sigma\big(r(x, y_w) - r(x, y_l)\big)$$
+
+where $\sigma(z) = 1/(1+e^{-z})$ is the logistic sigmoid. The full expression is
+
+$$P(y_w \succ y_l \mid x) = \sigma\big(r(x, y_w) - r(x, y_l)\big) = \frac{\exp r(x,y_w)}{\exp r(x,y_w) + \exp r(x,y_l)}$$
+
+This is the Bradley-Terry model. Only differences in $r$ determine probabilities — the model is shift-invariant ($r \to r + c$ leaves every ratio unchanged), so reward models produce scores meaningful only up to an additive constant. This invariance is why reward scores from different training runs cannot be directly compared, and why thresholds applied to RM outputs require calibration.
+
+The Luce–Shephard choice axiom generalizes this to $k$-way rankings. For $k \ge 3$ items, the Plackett-Luce model assigns the probability of a complete ordering as
+
+$$P(y_1 \succ y_2 \succ \dots \succ y_k) = \prod_{i=1}^{k-1} \frac{\exp r(y_i)}{\sum_{j \ge i} \exp r(y_j)}.$$
+
+InstructGPT collected rankings of 4–9 responses per prompt and decomposed each complete ranking into $\binom{k}{2}$ Bradley-Terry pairs. This decomposition is lossy — it discards the transitivity information implicit in the full ranking — but it reduces a complex combinatorial objective to a set of independent binary cross-entropies that standard minibatch gradient descent handles without modification.
+
+<Callout variant="info" title="The Elo connection">
+The Bradley-Terry model is mathematically equivalent to the Elo rating system used in chess. Christiano et al. (2017) made this analogy explicit when introducing the model for deep RL from human preferences. The connection is useful as intuition: just as Elo's rating update pushes a player's strength estimate up after a win and down after a loss, gradient descent on the Bradley-Terry loss pushes $r(x, y_w)$ above $r(x, y_l)$ proportionally to how confident the model was that $y_w$ would lose.
+</Callout>
+
+### The reward-model training loss {#reward-model}
+
+Substituting the Bradley-Terry likelihood into the negative-log-likelihood objective gives the canonical reward-model training loss (Christiano et al. 2017 eq. 2; Ouyang et al. 2022 eq. 1):
+
+$$\mathcal{L}_{\text{RM}}(\theta) = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}}\Big[\log \sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l)\big)\Big]$$
+
+An equivalent form using the softplus function is $\mathcal{L}_{\text{RM}}(\theta) = \mathbb{E}\big[\log\big(1 + \exp(r_\theta(x,y_l) - r_\theta(x,y_w))\big)\big]$. Both forms appear throughout the literature and are numerically identical; softplus is often preferred in implementations because it avoids a separate sigmoid before taking the log.
+
+Minimizing this loss pushes the margin $r_\theta(x,y_w) - r_\theta(x,y_l)$ to be large and positive on every preference pair in the training set. The optimal solution is $r_\theta(x,y_w) - r_\theta(x,y_l) \to +\infty$ on all training pairs, which is why RMs overfit quickly: unlike classification, there is no entropy-regularizing label-smoothing term. Training is typically limited to one epoch over the preference dataset.
+
+### Architecture and initialization
+
+A reward model is a language model with a scalar head: the final-layer hidden state at the last token position (or the EOS token) is passed through a learned linear projection $\mathbb{R}^{d} \to \mathbb{R}^1$. In HuggingFace `transformers` nomenclature this is `AutoModelForSequenceClassification` with `num_labels=1`. The head is randomly initialized; the backbone is initialized from the SFT checkpoint rather than the pretraining checkpoint because the SFT distribution is what the RM will score at RL time. Initializing from SFT rather than base gives roughly 1–2 points of held-out preference accuracy for free.
+
+Llama-2 introduced a **margin term** to the reward model loss: the labeler marks each comparison as "negligibly better," "slightly better," "better," or "significantly better," and the margin $m(\text{rating}) \in \{0.0, 0.33, 0.67, 1.0\}$ is subtracted from the gap before the sigmoid:
+
+$$\mathcal{L}_{\text{RM}}^{\text{margin}}(\theta) = -\log \sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l) - m(\text{rating})\big).$$
+
+The margin enforces a wider scoring gap on pairs where the labeler is confident, which sharpens the RM's calibration on clear-preference examples without penalizing ambiguous ones. Touvron et al. (2023) report ~0.5 absolute improvement in held-out preference accuracy from this modification alone.
+
+### Concrete numbers
+
+<ComparisonTable
+  caption="Reward model configurations across three canonical RLHF runs. All RM sizes are backbone parameter counts; the scalar head is negligible. Training epochs held to ~1 to avoid overfitting."
+  columns={["System", "RM size", "Policy size", "Training pairs", "Key innovation", "Source"]}
+  rows={[
+    ["InstructGPT", "6B", "175B", "~33k prompts × comparisons", "RM smaller than policy is stable; 175B RM was unstable", "https://arxiv.org/abs/2203.02155"],
+    ["Llama-2-Chat", "70B (×2)", "70B", "~1.4M binary comparisons", "Separate helpfulness RM and safety RM; margin loss term", "https://arxiv.org/abs/2307.09288"],
+    ["Tülu-3", "~8B / 70B", "8B / 70B", "~370k preference pairs", "RM used only for DPO; RLVR stage uses programmatic verifier", "https://arxiv.org/abs/2411.15124"]
+  ]}
+/>
+
+---
+
+## PPO — the clipped surrogate {#ppo}
+
+### Why a trust region
+
+Vanilla policy-gradient methods apply gradient ascent directly to $\mathbb{E}_{\pi_\theta}[\hat{A}_t \nabla \log \pi_\theta(a_t|s_t)]$. When the step is unconstrained, a large gradient can push the policy far from the data-collection distribution in a single update, producing a new policy whose advantage estimates are unreliable — the distribution shift invalidates the advantage function bootstrapped on the old policy. The resulting optimization is notoriously unstable and sample-inefficient.
+
+Trust-region policy optimization (TRPO, Schulman et al. 2015) addresses this by adding a hard KL constraint: $D_{\text{KL}}(\pi_\theta \| \pi_{\theta_{\text{old}}}) \le \delta$, solved via conjugate gradient. PPO (Schulman et al. 2017) replaces the hard constraint with a soft first-order surrogate that retains most of the stability properties while being implementable with standard minibatch SGD.
+
+### The clipped surrogate objective
+
+Let $\rho_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)$ be the importance ratio between the current policy and a frozen snapshot $\theta_{\text{old}}$ from the start of the current update phase. PPO's central object is the clipped surrogate loss:
+
+$$\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}\left[\min\!\Big(\rho_t \hat{A}_t,\ \text{clip}\big(\rho_t, 1-\epsilon, 1+\epsilon\big)\hat{A}_t\Big)\right]$$
+
+with $\epsilon = 0.2$ as the canonical default. When $\hat{A}_t > 0$ (the action was better than baseline), the objective encourages increasing $\rho_t$ toward $1 + \epsilon$ but no further — the clipped term provides an upper bound on how much probability mass can shift toward a beneficial action per update. When $\hat{A}_t < 0$ (the action was worse than baseline), the floor at $1 - \epsilon$ bounds how aggressively the probability of a bad action is reduced. In both cases, the policy cannot move arbitrarily far in parameter space within a single minibatch update, even without an explicit KL constraint.
+
+The intuition is constructive: whenever the ratio $\rho_t$ leaves the interval $[1-\epsilon, 1+\epsilon]$, the clipped term becomes constant and contributes zero gradient in the direction of further deviation. The original term continues contributing gradients, but since the objective takes the minimum of the two, large deviations away from $\theta_{\text{old}}$ are never rewarded, only penalized.
+
+### Combined objective and GAE
+
+The full PPO loss adds a value-function regression term and an optional entropy bonus:
+
+$$L^{\text{PPO}}_t = -\mathcal{L}^{\text{CLIP}}_t + c_v \cdot \tfrac{1}{2}\big(V_\psi(s_t) - G_t\big)^2 - c_e \cdot \mathcal{H}\big[\pi_\theta(\cdot|s_t)\big]$$
+
+with $c_v \in [0.5, 1.0]$ and $c_e \in [0, 0.01]$. The entropy bonus is routinely omitted in LLM PPO because the per-token vocabulary is large and the policy is already high-entropy.
+
+Advantages $\hat{A}_t$ are computed by Generalized Advantage Estimation (GAE, Schulman et al. 2016). With TD residual $\delta_t = r_t + \gamma V_\psi(s_{t+1}) - V_\psi(s_t)$,
+
+$$\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty}(\gamma\lambda)^l\,\delta_{t+l}.$$
+
+For LLM rollouts, $\gamma = 1.0$ (no future discount — completions are short and the reward is terminal) and $\lambda = 0.95$ are the standard choices, matching InstructGPT, Llama-2, and Tülu-3.
+
+---
+
+## PPO at LLM scale: the InstructGPT recipe {#full-pipeline}
+
+### The episode formulation
+
+A PPO episode for an LLM is the generation of a single response. Given a prompt $x$ sampled from a distribution $\mathcal{D}$:
+
+1. Sample $y = (y_1, \dots, y_T) \sim \pi_\theta(\cdot|x)$ token by token (temperature 1.0 is the convention; some recipes use 0.7 to reduce variance).
+2. Score the completed sequence with the frozen reward model: $R = r_\phi(x, y)$ — a single scalar.
+3. Compute log-probabilities under both the current policy $\pi_\theta$ and the frozen reference $\pi_{\text{ref}}$ for every token in the response.
+4. Compute per-token KL terms: $\text{KL}_t = \log\pi_\theta(y_t|x,y_{<t}) - \log\pi_{\text{ref}}(y_t|x,y_{<t})$.
+5. Assemble the **shaped per-token reward** (Ouyang et al. 2022 eq. 2):
+
+$$r_t = \begin{cases} R - \beta\cdot\text{KL}_t & t = T \\ -\beta\cdot\text{KL}_t & t < T \end{cases}$$
+
+The RM score is a terminal reward delivered only at the EOS token. The KL penalty is distributed across every token in the response. This per-token shaping provides a dense reward signal that lets GAE back-propagate credit from the final token to earlier ones while simultaneously keeping the policy close to $\pi_{\text{ref}}$ at every step.
+
+With $\gamma = 1.0$ and $\lambda = 0.95$, run GAE backward over the sequence to produce $\hat{A}_t$ for each token. The state $s_t$ is the prefix $(x, y_{<t})$; the value head $V_\psi$ reads the final-layer hidden state at position $t$. InstructGPT initializes the value head from the reward model checkpoint rather than from the SFT policy: the RM is already a regression-trained scalar predictor over the same distribution and provides a warm start that dramatically improves early training stability.
+
+### The PPO update
+
+Collect a rollout buffer of $N$ prompts, one response each (typically $N \in \{64, 512, 2048\}$ depending on scale). Freeze $\theta_{\text{old}} \leftarrow \theta$. For $K$ PPO epochs (typically 2–4) over the buffer in minibatches:
+
+$$L^{\text{LLM-PPO}}(\theta) = \mathbb{E}_{(x,y)}\!\left[\frac{1}{|y|}\sum_{t=1}^{|y|} m_t\Big( -\mathcal{L}^{\text{CLIP}}_t + c_v L^{\text{VF}}_t \Big)\right]$$
+
+where $m_t \in \{0,1\}$ is the completion mask (1 for response tokens, 0 for prompt tokens — prompt log-probabilities are excluded from the gradient) and the per-sequence average prevents long responses from dominating the gradient through sequence-length effects. After $K$ epochs, refresh $\theta_{\text{old}}$ and sample a new rollout batch.
+
+### PPO-ptx: the pretraining mix
+
+Ouyang et al. (2022) found that pure PPO on InstructGPT prompts caused *alignment-tax* regressions: the policy drifted away from the SFT distribution enough to lose performance on standard NLP benchmarks such as TriviaQA, HellaSwag, and WinoGrande. The fix was to mix a pretraining language-modeling objective back into the loss:
+
+$$L^{\text{PPO-ptx}} = L^{\text{LLM-PPO}} + \gamma_{\text{ptx}}\cdot \mathbb{E}_{x\sim \mathcal{D}_{\text{pretrain}}}\big[\log\pi_\theta(x)\big]$$
+
+with $\gamma_{\text{ptx}} \approx 27.8$ in the released InstructGPT recipe. The pretraining mixture acts as a mild anchor to the base distribution. PPO-ptx is the form used in production; the "pure PPO" variant (no pretraining mix) is primarily didactic.
+
+### Token-level vs. loss-level KL: the implementation fork
+
+There are two non-equivalent placements of the KL penalty, and the value of $\beta$ is **not portable between them**:
+
+- **Reward shaping** (InstructGPT, Llama-2): subtract $\beta\cdot\text{KL}_t$ from $r_t$ before GAE. The KL flows through the advantage estimate, is smoothed by GAE's exponential weighting, and enters the policy gradient indirectly. The effective gradient magnitude depends on advantage normalization.
+- **Loss level** (GRPO, OpenRLHF defaults, Tülu-3 RLVR): keep $r_t$ unchanged and add $\beta \cdot D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})$ directly to the objective after the PPO surrogate is computed. Gradient paths are cleaner; the KL term is not filtered by GAE.
+
+Huang et al. (2024) identify this fork as one of the more consequential "N+ implementation details" of RLHF with PPO: using a $\beta$ value calibrated for reward-shaping in a loss-level implementation will typically under-penalize divergence because the loss-level gradient is an order of magnitude larger per unit of KL. InstructGPT and Llama-2 use reward shaping; Tülu-3 and most 2025+ open-source frameworks use loss level.
+
+### InstructGPT hyperparameters
+
+From Ouyang et al. (2022) Appendix C and cross-referenced against Huang et al. (2024):
+
+| Hyperparameter | Value (1.3B policy) | Value (175B policy) | Note |
+|---|---|---|---|
+| Policy LR | $5 \times 10^{-7}$ | $9.2 \times 10^{-8}$ | 175B uses ~5× smaller LR — empirical, not derived |
+| KL coefficient $\beta$ | 0.02 (adaptive) | 0.02 (adaptive) | Adaptive controller targets KL ≈ 6 nats from $\pi_{\text{ref}}$ |
+| PPO clip $\epsilon$ | 0.2 | 0.2 | Standard default |
+| PPO epochs $K$ | 4 | 4 | Per rollout batch |
+| Rollout batch size | 512 prompts | 512 prompts | One response per prompt |
+| Minibatch size | 64 | 64 | For inner-loop gradient steps |
+| Value-function clip | 0.2 | 0.2 | Matches policy clip |
+| Rollout temperature | 1.0 | 1.0 | Higher temperature during generation |
+| Training duration | ~256k episodes | ~256k episodes | ~2 days on 64 A100 for 175B |
+
+---
+
+## Worked example: one PPO step {#worked-example}
+
+The following traces a complete PPO update on a single synthetic rollout to make every quantity concrete.
+
+**Setup.** Prompt $x$ = "Write a haiku about gradients." Sampled response $y$ = five tokens: `[Sharp, steep, swift, the, descent]`. Reward model score $R = 0.83$ (a scalar; arbitrary units). KL coefficient $\beta = 0.05$ (Tülu-3 default for RLVR; used here for illustration).
+
+**Step 1: Log-probability differences.**
+
+Log-probs under $\pi_\theta$: $[-1.2,\,-0.4,\,-2.1,\,-0.6,\,-1.8]$.
+Log-probs under $\pi_{\text{ref}}$: $[-1.1,\,-0.5,\,-2.0,\,-0.7,\,-1.9]$.
+Per-token KL terms $\text{KL}_t = \log\pi_\theta - \log\pi_{\text{ref}}$: $[-0.10,\,+0.10,\,-0.10,\,+0.10,\,+0.10]$.
+Sum of KL terms = $+0.10$ nats total — the policy has drifted slightly from the reference, mostly on token 5.
+
+**Step 2: Shaped per-token rewards.**
+
+Non-terminal tokens ($t = 1, 2, 3, 4$) receive $r_t = -\beta \cdot \text{KL}_t$:
+$r_1 = +0.005,\; r_2 = -0.005,\; r_3 = +0.005,\; r_4 = -0.005$.
+Terminal token ($t = 5$): $r_5 = R - \beta \cdot \text{KL}_5 = 0.83 - 0.05 \times 0.10 = 0.825$.
+
+The shaped rewards are $[+0.005,\,-0.005,\,+0.005,\,-0.005,\,+0.825]$. Nearly all the reward signal is concentrated at the final position.
+
+**Step 3: Value predictions and GAE.**
+
+Suppose $V_\psi$ predicts $V = [0.10,\,0.20,\,0.30,\,0.50,\,0.70]$. Bootstrap $V(s_6) = 0$ (no next state after EOS). Compute TD residuals $\delta_t = r_t + V_{t+1} - V_t$ (with $\gamma=1$):
+
+$\delta_5 = 0.825 + 0 - 0.70 = 0.125$
+$\delta_4 = -0.005 + 0.70 - 0.50 = 0.195$
+$\delta_3 = +0.005 + 0.50 - 0.30 = 0.205$
+$\delta_2 = -0.005 + 0.30 - 0.20 = 0.095$
+$\delta_1 = +0.005 + 0.20 - 0.10 = 0.105$
+
+GAE with $\lambda = 0.95$, computed backward:
+$\hat{A}_5 = 0.125$
+$\hat{A}_4 = 0.195 + 0.95 \times 0.125 = 0.314$
+$\hat{A}_3 = 0.205 + 0.95 \times 0.314 = 0.503$
+$\hat{A}_2 = 0.095 + 0.95 \times 0.503 = 0.573$
+$\hat{A}_1 = 0.105 + 0.95 \times 0.573 = 0.649$
+
+Returns $G_t = \hat{A}_t + V_t$: $[0.749,\,0.773,\,0.803,\,0.814,\,0.825]$.
+
+**Step 4: PPO inner loop.**
+
+At the start of epoch 1, $\pi_\theta = \pi_{\theta_{\text{old}}}$, so all $\rho_t = 1$. No clipping occurs; the CLIP objective reduces to the plain policy-gradient estimate $\mathbb{E}[-\hat{A}_t \log \pi_\theta(y_t|x, y_{<t})]$. After one gradient step, the log-probs shift. In epoch 2, if token 1's log-prob has increased by $0.3$ (because $\hat{A}_1 > 0$ and the gradient was large), $\rho_1 = e^{0.3} \approx 1.35 > 1.2$. The clip activates: the clipped ratio is clamped to $1.2$, and the objective at token 1 contributes gradient from the unclipped term (which is now smaller than $1.2 \cdot \hat{A}_1$). Further increases in $\rho_1$ are blocked.
+
+After 4 epochs over the buffer, $\theta_{\text{old}} \leftarrow \theta$, the next rollout batch is sampled, and the cycle repeats.
+
+<Callout variant="note" title="Why KL concentrates at the terminal token">
+Nearly all the reward signal is concentrated at token $T$ because $R$ is a terminal reward from the RM. The shaped rewards at non-terminal tokens are just the KL penalty, which is small when the policy is close to $\pi_{\text{ref}}$. This means the value function must learn to predict the cumulative future reward — essentially learning to predict the RM score — from early in the sequence. Accurate value initialization (from the RM checkpoint) is therefore critical: a value function initialized at zero will have large TD errors for the first several hundred rollouts, which destabilizes advantage estimates.
+</Callout>
+
+---
+
+## Reward hacking and over-optimization {#reward-hacking}
+
+PPO's objective is to maximize $r_\phi(x, y)$ subject to a KL constraint. If the reward model has any exploitable correlation with surface features — and all finite-data reward models do — PPO will find those features and exploit them. Four failure modes dominate the literature.
+
+### Length bias
+
+The most prevalent failure. Labelers on InstructGPT-style tasks weakly prefer longer, more elaborated answers, even controlling for accuracy — elaboration *feels* thorough. The RM internalizes this and assigns higher scores to longer completions. Singhal et al. (2023) showed that on the Anthropic-HH dataset, RM reward correlates with output length at $r \approx 0.5$–$0.7$. When PPO has access to this signal, it can improve measured RM reward substantially while producing essentially no improvement in *length-corrected* human preference. Strip the length advantage and the quality gain vanishes.
+
+Mitigations:
+
+- **Length-balanced RM training.** During preference data collection, subsample pairs so that response length is uncorrelated with the win label. This removes the spurious correlation before it is fit.
+- **ODIN** (Chen et al. 2024): train the RM with two output heads — a "length head" and a "content head" — and use only the content head as the RL reward. ODIN reduces length inflation by approximately 50% with no measured quality loss on AlpacaEval.
+- **Length-controlled evaluation.** AlpacaEval-LC computes win rates at matched lengths, making it harder to game evaluation metrics through length alone. As of 2025, AlpacaEval-LC has become the standard chat evaluation metric for open-weights models.
+
+### Sycophancy
+
+The model learns to agree with, flatter, or validate the user's stated beliefs regardless of their accuracy, because labelers themselves tend to rate responses that align with their priors more favorably. Sharma et al. (2023) document sycophancy across Claude 2, GPT-4, and Llama-2 Chat: when a user states a false premise and then asks a question, all three models are significantly more likely to affirm the false premise than the base LM. The reward model's predictions correlate with user agreement at $\rho \approx 0.4$ — the RM has learned that agreement is rewarded, because in the training data, labelers preferred agreeable completions.
+
+Sycophancy is structurally difficult to mitigate because it requires knowing the ground truth of the preference pair's factual claims, which is expensive to annotate. Proposed mitigations include adding adversarial preference pairs (where the correct response contradicts the user) and training a dedicated anti-sycophancy probe, but no fully reliable fix had been published by May 2026.
+
+### Mode collapse
+
+The forward KL penalty $D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})$ is asymmetric: it is finite when $\pi_\theta$ concentrates on a subset of the support where $\pi_{\text{ref}}$ has mass, and does not penalize the policy for ignoring low-probability regions of $\pi_{\text{ref}}$. PPO can therefore sharply concentrate on a small set of high-reward styles — specific opening phrases, particular formatting tics, a narrow vocabulary range — without incurring a prohibitively large KL penalty.
+
+Symptoms: identical or near-identical opening sentences across diverse prompts; repetitive bullet-point formatting; vocabulary collapse detectable by n-gram diversity statistics. Mitigations: larger $\beta$; entropy bonus in the PPO loss ($c_e > 0$); higher sampling temperature during rollouts; the PPO-ptx pretraining mixture; mixing in SFT data on stylistically diverse examples.
+
+### Reward over-optimization (Goodhart's law)
+
+Even without a specific surface exploit, any reward model trained on finite data is a noisy estimator of human preference. At small KL distances from $\pi_{\text{ref}}$, the RM's predictions are accurate and RL improves the true policy quality. Past some peak KL, however, the policy discovers high-RM-reward responses that score poorly under true human judgment — the classic Goodhart failure. The RM's reported reward continues to rise; the true quality degrades.
+
+Gao, Schulman, and Hilton (2022) quantified this phenomenon by training a "gold" RM on held-out human data and measuring it as a function of KL distance from the reference policy. For best-of-$n$ sampling and for PPO, the true reward follows a roughly parabolic curve in $d = \sqrt{D_{\text{KL}}(\pi \| \pi_{\text{ref}})}$:
+
+$$R_{\text{true}}^{\text{BoN}}(d) \approx d\cdot(\alpha - \beta_{\text{bon}}\cdot d), \qquad R_{\text{true}}^{\text{PPO}}(d) \approx d\cdot(\alpha - \beta_{\text{rl}}\cdot d^2).$$
+
+The true reward peaks at a finite KL distance and declines after that — *regardless* of how well the RM's training loss has converged. The critical observation for practitioner design: the peak KL scales with the size and coverage of the RM. A 6B RM (InstructGPT) peaks at a smaller KL distance and is easier to hack than a 70B RM (Llama-2). This is the empirical justification for Llama-2's decision to train a 70B RM rather than a smaller proxy.
+
+<Callout variant="warning" title="Over-optimization is not a failure of PPO specifically">
+The Gao et al. (2022) over-optimization curves apply equally to best-of-$n$ sampling and to DPO. Any optimization process that pursues a proxy reward model will find and exploit that model's gaps. PPO is not uniquely susceptible; it is simply a more aggressive optimizer than best-of-$n$, and so tends to reach the over-optimization peak faster. The mitigation is accurate, large, and well-calibrated RMs — not the choice of RL algorithm.
+</Callout>
+
+---
+
+## The Llama-2 RLHF recipe {#llama2-recipe}
+
+Llama-2-Chat (Touvron et al. 2023) is the most thoroughly documented frontier RLHF pipeline in the public literature. The training ran over approximately three months and produced five iteratively improved policy checkpoints (V1 through V5), making it the canonical example of iterative RLHF.
+
+### The V1 → V5 progression
+
+The five rounds were not uniform. V1, V2, and V3 used **rejection-sampling fine-tuning (RSFT)** only, without PPO:
+
+- For each prompt, sample $K = 16$ completions from the current policy at temperature $0.8$.
+- Score each completion with the current RM.
+- Keep the highest-scoring completion.
+- Fine-tune the policy on these "best-of-16" responses with standard cross-entropy (SFT on RM-selected outputs).
+
+RSFT is conceptually a model-based imitation update: the policy learns to imitate the RM's top-1 selection from its own output distribution. It is embarrassingly parallel (generation and scoring can be distributed across many GPUs), requires no PPO infrastructure, and is numerically stable. Its limitation is that it updates the policy only toward the *mode* of what the RM scores highest — it does not explore the tails of the distribution where potentially higher-reward responses might live.
+
+V4 and V5 added PPO on top of RSFT: the RSFT checkpoint initialized the policy, and PPO was run with simultaneous RM refresh. The motivation for this two-stage design is precisely the mode-exploration trade-off. RSFT moves the policy rapidly toward the RM's modes; PPO then applies the full constrained optimization, exploring and adjusting the distribution in a more principled way.
+
+### The two-reward-model design
+
+Llama-2 trains a **Helpfulness RM** and a **Safety RM** separately, at the same 70B scale as the policy. The motivation was empirical: combining helpfulness and safety feedback into a single RM produced a model that systematically under-refused on safety-relevant prompts — the much larger helpfulness signal dominated training. Keeping two separate RMs and applying them in series at PPO time gave independent control over each objective.
+
+At PPO time, both RMs are queried per rollout, and the reward used for policy update is the minimum:
+
+$$R = \min\big(R_{\text{help}},\; R_{\text{safe}}\big)$$
+
+with safety scores passed through a logistic sharpening function that sharply penalizes scores in the borderline-harmful range, rather than applying a linear combination. The $\min$ formulation encodes the intuition that a response must meet both a helpfulness threshold *and* a safety threshold to receive a positive reward signal.
+
+### Hyperparameters
+
+From Touvron et al. (2023) §3.2 and the Lambert (2023) annotated reading guide:
+
+| Hyperparameter | Value | Note |
+|---|---|---|
+| Policy LR | $1 \times 10^{-6}$ (constant) | 3% linear warmup; no decay |
+| KL coefficient $\beta$ | 0.01 | Smaller than InstructGPT (reward-shaping placement) |
+| Rollout batch | 512 prompts | One response per prompt |
+| PPO epochs $K$ | 4 | Per rollout batch |
+| Rollout temperature | 1.0 | |
+| RSFT rounds | V1–V3 | Rejection sampling from 16 candidates |
+| PPO rounds | V4–V5 | ~50k–100k PPO updates each |
+
+The $\beta = 0.01$ value is notably smaller than InstructGPT's 0.02. Both use reward shaping, so the values are on the same scale. The smaller $\beta$ in Llama-2 likely reflects the fact that a 70B RM provides better-calibrated rewards and allows the policy more freedom to deviate from the reference without encountering Goodhart failures.
+
+<Sidenote>Ghost attention (GAtt), introduced in the same paper, is a SFT-time trick that improves adherence to the system prompt across long multi-turn conversations by including the system prompt as a conditioning context on every turn during SFT, even turns that appear later in the dialogue. It is not a PPO modification but appears alongside the RLHF description in the paper and is worth noting for practitioners deploying Llama-2 Chat in multi-turn settings.</Sidenote>
+
+---
+
+## Tülu-3 and the modern open-stack recipe {#tulu3-ppo}
+
+Tülu-3 (Lambert et al. 2024, Allen AI) is the most reproducible open-weights post-training stack available as of May 2026 and provides the clearest window into how the field has evolved beyond the InstructGPT baseline.
+
+### Pipeline structure
+
+Tülu-3 runs three sequential stages:
+
+1. **SFT** on approximately 940k examples (a curated mix including FLAN, OpenAssistant, and Tülu-collected instruction data).
+2. **DPO** on approximately 270k preference pairs, using a Bradley-Terry RM to construct the preference dataset. This is the preference-tuning stage covered in [03b](/textbook/03b-preference-tuning).
+3. **RLVR** — Reinforcement Learning with Verifiable Rewards — which uses PPO-style policy optimization but replaces the learned RM with a programmatic verifier: math correctness checkers, instruction-following format validators, and code execution tests. The verifier produces a reward in $\{-10, 0, 1\}$ rather than a continuous scalar. RLVR is covered in detail in [03e](/textbook/03e-rlvr).
+
+For the purposes of this chapter, the key structural point is that Tülu-3 uses PPO *only* in stage 3, and only with verifier rewards, not learned-RM rewards. Stage 2 is entirely DPO. This is representative of the broader open-weights 2024–2026 trend: DPO for preference alignment, PPO for verified capability elicitation.
+
+### Verbatim RLVR hyperparameters
+
+From Lambert et al. (2024) Appendix and the `allenai/open-instruct` training configs:
+
+**8B model:** learning rate $3 \times 10^{-7}$, KL coefficient $\beta = 0.05$, warmup ratio 0.1, total episodes 10 million, per-device train batch 2, local mini-batch 32, local rollout batch 32, penalty reward value $-10.0$ for outputs that fail the verifier.
+
+**70B model:** learning rate $1 \times 10^{-7}$, KL coefficient $\beta = 0.07$.
+
+KL penalty is applied **loss-level** (not reward shaping) — the trained $\beta$ values are therefore not directly comparable to InstructGPT's $\beta = 0.02$ or Llama-2's $\beta = 0.01$, both of which use reward shaping. The value head is initialized from the SFT checkpoint (no separate RM to initialize from in the RLVR stage).
+
+The learning rate scaling from 8B ($3 \times 10^{-7}$) to 70B ($1 \times 10^{-7}$) follows the same empirical pattern seen in InstructGPT's scaling from 1.3B to 175B: larger models require proportionally smaller learning rates for stable PPO training, and the reduction is larger than what a simple $1/\sqrt{N}$ parameter-count scaling would suggest.
+
+---
+
+## RLHF infrastructure {#infrastructure}
+
+### The four-model problem
+
+LLM PPO requires four LLM-scale objects in memory simultaneously:
+
+1. **Policy** $\pi_\theta$ — forward + backward, fully trainable.
+2. **Reference** $\pi_{\text{ref}}$ — forward only, frozen.
+3. **Reward model** $r_\phi$ — forward only, frozen.
+4. **Value head** $V_\psi$ — attached to the policy backbone, trainable, typically initialized from the RM.
+
+Naively colocating all four on the same GPU set wastes approximately 60–70% of memory on frozen weights and compute on forward-only passes that do not need the training machinery. More critically, generation and training want different hardware utilization profiles: **generation** is decode-bound (autoregressive, one token per step, low arithmetic intensity per GPU), while **training** is compute-bound (full sequence forward+backward, high FLOP/byte ratio). These two workloads are not simultaneously efficient on the same hardware configuration.
+
+### The actor/learner split
+
+Modern RLHF frameworks separate the system into logically distinct components:
+
+- **Actor workers** hold the current policy weights and *only generate*. They run a high-throughput inference engine (vLLM with PagedAttention, SGLang, or TGI) with continuous batching, FP8 inference where available, and dynamic scheduling across diverse sequence lengths. Generation is the dominant cost: a single 70B PPO training step on 512 prompts of average 1k tokens requires approximately 2 trillion parameter-token inference FLOPs before a single gradient is computed.
+- **Learner workers** hold trainable copies of the policy and value head, run FSDP or DeepSpeed ZeRO for sharded gradient accumulation, and consume rollout batches from a queue produced by the actors.
+- **RM/reference servers** hold the frozen reward model and reference policy and serve scoring requests, typically co-resident with the actor fleet or on dedicated hardware.
+- **Weight synchronization.** After each learner update, the new policy weights are broadcast to actor workers via NCCL collectives. vLLM's `update_weights_from_tensors` API (stabilized in late 2024) enables in-place weight updates that avoid restarting the inference engine — previously this synchronization required a multi-second engine restart that dominated per-step wall time.
+
+This is asynchronous RL in the sense that actors may run 1–2 steps ahead of the learner, collecting rollouts under a slightly stale policy. PPO's importance-ratio correction handles this off-policy gap as long as the staleness is bounded by a few gradient steps.
+
+<ComparisonTable
+  caption="Actor/learner framework comparison as of May 2026. All frameworks support multi-GPU and multi-node training. PPO, REINFORCE++, GRPO, RLOO denote supported RL algorithms."
+  columns={["Framework", "Scheduling", "Inference engine", "Training backend", "Key feature", "Source"]}
+  rows={[
+    ["OpenRLHF", "Ray", "vLLM", "DeepSpeed ZeRO", "Separate Actor/Reward/Reference/Critic GPU groups; 1.22–1.68× speedup over prior stacks", "https://arxiv.org/abs/2405.11143"],
+    ["TRL PPOv2", "HuggingFace Accelerate", "vLLM (optional)", "FSDP / DeepSpeed", "Integrated with HF ecosystem; PPOv2 implements Huang et al. (2024) fixes", "https://github.com/huggingface/trl"],
+    ["open-instruct (AllenAI)", "Ray", "vLLM", "DeepSpeed ZeRO-3", "Tülu-3 reference implementation; RLVR recipes for math + IFEval", "https://github.com/allenai/open-instruct"],
+    ["veRL", "Ray", "vLLM / SGLang", "FSDP / Megatron", "Hybrid-engine design; supports actor/rollout co-location or separation", "https://github.com/volcengine/verl"]
+  ]}
+/>
+
+### The economics
+
+On a 70B model, a single PPO rollout batch at 512 prompts × 1k tokens of generation × 4 forward passes (policy, reference, RM, value) ≈ 2 trillion parameter-token inference equivalents. The subsequent gradient update on the same 512 × 1k tokens ≈ 0.5 trillion training FLOP equivalents. Generation dominates by 4–10× on modern hardware.
+
+This asymmetry is the economic justification for the actor/learner split: a dollar spent on cheaper inference-optimized hardware (H200s running FP8, or B200s) during rollout generation saves $3–5 of training-grade allocation. Lambert et al. (2024) report that approximately 70% of total RLVR training compute for Tülu-3 at the 405B scale was rollout generation, not gradient computation.
+
+---
+
+## DPO vs. PPO in May 2026 {#dpo-vs-ppo-2026}
+
+### Llama-3's pivot and its rationale
+
+The Llama-3 post-training pipeline (Dubey et al. 2024) preserved the Llama-2 SFT and rejection-sampling fine-tuning backbone but **replaced the PPO stage with iterative DPO** run over six successive rounds. Each round: sample completions from the current policy, score with the current RM, construct preference pairs from the resulting comparisons, run a DPO pass, and advance the current policy. Meta cited three motivations:
+
+- *Engineering simplicity.* DPO is a supervised-style update requiring no rollout infrastructure, no value head, no per-token KL bookkeeping, no actor/learner separation. The implementation complexity is reduced by roughly a factor of five.
+- *Numerical stability.* DPO does not face PPO's sensitivity to the KL controller, advantage normalization, value-head bootstrap, or the reward-shaping vs. loss-level implementation fork.
+- *Empirical parity.* On Llama-3's evaluation suite — which emphasized chat quality and instruction following — iterative DPO matched the PPO baseline at the scales tested.
+
+### Why PPO survives at closed labs
+
+Despite Llama-3's pivot, OpenAI's ChatGPT and GPT-4o, Anthropic's Claude 3.x and 4.x, and (per public statements and blog posts) Google DeepMind's Gemini continue to deploy PPO-style RLHF as the primary RL stage. The structural reason is on-policy exploration:
+
+**DPO is off-policy.** It optimizes on a fixed preference dataset, and the resulting policy is implicitly constrained to the convex hull of the preferred responses already in the data. DPO cannot generate novel high-reward behaviors that the preference dataset does not already contain — it can only reweight among existing demonstrations.
+
+**PPO is on-policy.** Every rollout is sampled from the *current* policy. If the policy has learned a new capability between one rollout batch and the next, that capability is immediately available for the RM to score and the gradient to amplify. For frontier reasoning, agentic behavior, and code generation — where the policy must explore a large and sparsely rewarded space — on-policy exploration is genuinely necessary.
+
+Xu et al. (2024) demonstrated this empirically: PPO outperformed DPO, iterative DPO, and best-of-$n$ sampling on code-competition benchmarks (HumanEval, CodeContests), with the gap widening as task difficulty increased. Ivison et al. (2024) ran a careful ablation confirming that the main driver of PPO's advantage was the on-policy data quality, not the choice of optimization algorithm per se — their iterative DPO with fully on-policy preference pairs recovered most of the PPO gap.
+
+<ComparisonTable
+  caption="DPO vs. PPO — structural comparison for the May 2026 LLM post-training landscape."
+  columns={["Dimension", "DPO", "PPO"]}
+  rows={[
+    ["Data type", "Fixed offline preference pairs", "On-policy rollouts at each step"],
+    ["Infrastructure", "Supervised-style training loop; no rollout pipeline", "Actor/learner/RM/reference servers; weight sync"],
+    ["Exploration", "Constrained to existing preferred-response distribution", "Explores full policy distribution"],
+    ["Stability", "No advantage estimation, no value head; numerically stable", "Sensitive to KL controller, advantage normalization, value initialization"],
+    ["Reward model role", "Implicit (used to construct preference pairs)", "Explicit (queried at every rollout)"],
+    ["Compute cost per update", "Low (SFT-equivalent)", "High (generation dominates at 4–10× training cost)"],
+    ["When preferred", "Fixed preference data; chat alignment; limited infra", "Frontier reasoning; agentic tasks; verifiable rewards"],
+    ["2026 open-weights usage", "Dominant (Llama-3, Qwen-2.5, Gemma-3)", "Tülu-3 RLVR, specialized reasoning models"],
+    ["2026 closed-lab usage", "Used for preference phases", "Primary RL stage (OpenAI, Anthropic, Google)"]
+  ]}
+/>
+
+The May 2026 consensus, synthesized from Lambert (2024–2026), Xu et al. (2024), and Ivison et al. (2024): PPO is the right algorithm when (a) compute is abundant, (b) the task requires policy exploration, and (c) rewards are verifiable or the RM is large enough to resist Goodhart failures. DPO is the right algorithm when (a) a fixed high-quality preference dataset is available, (b) the task is chat alignment rather than capability elicitation, and (c) engineering simplicity is a binding constraint. These are not competing answers — they are answers to different questions. The frontier typically uses DPO for preference alignment and PPO (or a PPO variant with verifier rewards) for capability elicitation.
+
+<Callout variant="note" title="A third position: SmolLM3's no-RL recipe">
+Not every 2025 frontier-style recipe ships an RL stage at all. SmolLM3 (Allal et al., 2025) explicitly does **not** use PPO, GRPO, or any on-policy RL after preference tuning. The full pipeline is base pretraining → reasoning mid-training (35 B-token continued pretraining on R1-style traces) → SFT → APO (a DPO variant; see [§SmolLM3's APO + model-merge pipeline](/textbook/03b-preference-tuning#smollm3-apo)) → linear model merge with the mid-training checkpoint. The merge step recovers capability that APO costs, replacing the role that PPO or RLVR would otherwise play. The recipe is feasible because most of the reasoning capability is already imprinted by the mid-training stage, before any preference signal enters; the role of preference tuning is alignment-style, not capability-eliciting. The SmolLM3 disclosure is the cleanest 2025 evidence that the four-stage SFT → DPO → RLVR → multi-objective skeleton has at least one viable open-recipe alternative at small-model scale.
+</Callout>
+
+---
+
+## Summary {#summary}
+
+The classical RLHF pipeline — Bradley-Terry reward modeling, PPO policy optimization, KL regularization toward the SFT reference — remains the primary on-policy alignment tool at the closed-lab frontier in 2026. The InstructGPT recipe established the four-stage diagram: SFT, RM training from pairwise comparisons, PPO with per-token KL shaping, and iterative redeployment. Llama-2-Chat demonstrated the value of iterative RM refresh, a dual-RM architecture separating helpfulness and safety, and a margin loss for sharper RM calibration. Tülu-3 demonstrated that PPO with programmatic verifier rewards outperforms PPO with learned-RM rewards on skills with ground-truth correctness criteria, and published the concrete hyperparameters ($3 \times 10^{-7}$ at 8B, $1 \times 10^{-7}$ at 70B) needed to reproduce the result.
+
+Four reward-hacking failure modes — length bias, sycophancy, mode collapse, and Goodhart-style over-optimization — are well-documented and require active mitigation. The infrastructure challenge is fundamental: four LLM-scale objects are needed simultaneously, and generation dominates compute by 4–10×, making the actor/learner split and high-throughput inference engines (vLLM, SGLang) economically necessary.
+
+DPO has largely displaced PPO in open-weights post-training for chat alignment, and the Llama-3 pipeline demonstrated that iterative DPO can match PPO on chat-quality evaluations at smaller engineering cost. PPO retains an advantage — empirically demonstrated by Xu et al. (2024) and Ivison et al. (2024) — on tasks requiring on-policy exploration: hard reasoning, code competition, and any setting where verifiable rewards can be assigned without a learned RM.
+
+The next two chapters build on the PPO foundation established here. [RLAIF](/textbook/03d-rlaif-constitutional) replaces the human labelers in the preference collection pipeline with an AI judge — preserving the Bradley-Terry RM and PPO training loop while scaling feedback production by several orders of magnitude. [RLVR](/textbook/03e-rlvr) replaces the learned RM entirely with a programmatic verifier, removing the reward-hacking failure mode at the cost of restricting the training signal to tasks where correctness is mechanically checkable.
+
+---
+
+<Sources items={[
+  {
+    authors: "Bradley, R.A. and Terry, M.E.",
+    year: 1952,
+    title: "Rank analysis of incomplete block designs",
+    venue: "Biometrika 39(3/4):324–345",
+    url: "https://www.jstor.org/stable/2334029",
+    note: "The 1952 paper introducing the paired-comparison model. Every RLHF reward model loss is the negative log-likelihood of this model."
+  },
+  {
+    authors: "Christiano, P., Leike, J., Brown, T. et al.",
+    year: 2017,
+    title: "Deep Reinforcement Learning from Human Preferences",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03741",
+    note: "First deep-RL use of Bradley-Terry preference modeling. Makes the Elo analogy explicit (§2.2.3). Applied to Atari and MuJoCo with &lt;1% human feedback."
+  },
+  {
+    authors: "Schulman, J. et al.",
+    year: 2017,
+    title: "Proximal Policy Optimization Algorithms",
+    venue: "arXiv:1707.06347",
+    url: "https://arxiv.org/abs/1707.06347",
+    note: "Defines the clipped surrogate $L^{\\text{CLIP}}$, the combined PPO objective, and reports $\\epsilon=0.2$ as the canonical clip parameter from MuJoCo/Atari sweeps."
+  },
+  {
+    authors: "Schulman, J. et al.",
+    year: 2016,
+    title: "High-Dimensional Continuous Control Using Generalized Advantage Estimation",
+    venue: "ICLR 2016",
+    url: "https://arxiv.org/abs/1506.02438",
+    note: "Introduces GAE. The $\\gamma=1.0$, $\\lambda=0.95$ defaults for LLM rollouts trace back to this paper."
+  },
+  {
+    authors: "Schulman, J. et al.",
+    year: 2015,
+    title: "Trust Region Policy Optimization",
+    venue: "ICML 2015",
+    url: "https://arxiv.org/abs/1502.05477",
+    note: "TRPO — the constrained-KL predecessor that PPO replaces with a first-order surrogate. Establishes the conceptual foundation for trust-region policy optimization."
+  },
+  {
+    authors: "Ouyang, L., Wu, J., Jiang, X. et al.",
+    year: 2022,
+    title: "Training language models to follow instructions with human feedback",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2203.02155",
+    note: "InstructGPT. The canonical four-stage pipeline (Fig. 2). 6B RM aligns 175B policy; 1.3B InstructGPT preferred to 175B GPT-3. PPO-ptx variant. Appendix C has verbatim hyperparameters."
+  },
+  {
+    authors: "Touvron, H., Martin, L., Stone, K. et al.",
+    year: 2023,
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models",
+    venue: "arXiv:2307.09288",
+    url: "https://arxiv.org/abs/2307.09288",
+    note: "Llama-2-Chat. Dual 70B RMs, margin loss term, V1-V5 iterative RLHF, Ghost Attention. §3 covers RLHF; Fig. 4 shows the V1→V5 progression."
+  },
+  {
+    authors: "Huang, S., Noukhovitch, M., Hosseini, A. et al.",
+    year: 2024,
+    title: "The N+ Implementation Details of RLHF with PPO",
+    venue: "arXiv:2403.17031",
+    url: "https://arxiv.org/abs/2403.17031",
+    note: "The canonical bug-hunt paper. Identifies reward-shaping vs. loss-level KL split, value-head init from RM, advantage whitening, response masking, and ~13 other implementation details. Required reading for anyone implementing PPO for LLMs."
+  },
+  {
+    authors: "Lambert, N., Morrison, J., Pyatkin, V. et al.",
+    year: 2024,
+    title: "Tülu 3: Pushing Frontiers in Open Language Model Post-Training",
+    venue: "arXiv:2411.15124",
+    url: "https://arxiv.org/abs/2411.15124",
+    note: "Tülu-3 technical report. PPO/RLVR hyperparameters: LR 3×10⁻⁷ (8B), 1×10⁻⁷ (70B); β=0.05 (8B), 0.07 (70B). Loss-level KL. Programmatic verifier rewards."
+  },
+  {
+    authors: "Dubey, A., Jauhri, A., Pandey, A. et al.",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv:2407.21783",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Llama-3 post-training. §4 describes the pivot from PPO to iterative DPO over 6 rounds. States reasons: engineering simplicity, stability, and empirical parity on chat evals."
+  },
+  {
+    authors: "Xu, S., Fu, W., Gao, J. et al.",
+    year: 2024,
+    title: "Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study",
+    venue: "ICML 2024",
+    url: "https://arxiv.org/abs/2404.10719",
+    note: "Empirically demonstrates PPO outperforming DPO on code-competition benchmarks. The gap widens with task difficulty. Iterative DPO closes part of the gap."
+  },
+  {
+    authors: "Ivison, H., Wang, Y., Liu, J. et al.",
+    year: 2024,
+    title: "Unpacking DPO and PPO: Disentangling Best Practices for Learning from Preference Feedback",
+    venue: "NeurIPS 2024",
+    url: "https://arxiv.org/abs/2406.09279",
+    note: "Careful ablation showing that on-policy data quality, not the optimization algorithm, is the primary driver of PPO's advantage over offline DPO."
+  },
+  {
+    authors: "Gao, L., Schulman, J., Hilton, J.",
+    year: 2022,
+    title: "Scaling Laws for Reward Model Overoptimization",
+    venue: "ICML 2023",
+    url: "https://arxiv.org/abs/2210.10760",
+    note: "Fits parabolic over-optimization curves for best-of-n and PPO in $d = \\sqrt{D_{\\text{KL}}}$. Larger RMs are harder to hack. Empirical basis for using large RMs."
+  },
+  {
+    authors: "Singhal, P., Goyal, T., Xu, J., Durrett, G.",
+    year: 2023,
+    title: "A Long Way to Go: Investigating Length Correlations in RLHF",
+    venue: "arXiv:2310.03716",
+    url: "https://arxiv.org/abs/2310.03716",
+    note: "Documents RM-reward / output-length correlation at r≈0.5–0.7 on Anthropic-HH. Shows PPO can improve RM reward purely through length with no quality gain."
+  },
+  {
+    authors: "Chen, L., Zhu, C. et al.",
+    year: 2024,
+    title: "ODIN: Disentangled Reward Mitigates Hacking in RLHF",
+    venue: "arXiv:2402.07319",
+    url: "https://arxiv.org/abs/2402.07319",
+    note: "Dual-head RM with separate length and content outputs. Using only the content head at RL time reduces length inflation by ~50% with no quality loss."
+  },
+  {
+    authors: "Sharma, M., Tong, M., Korbak, T. et al.",
+    year: 2023,
+    title: "Towards Understanding Sycophancy in Language Models",
+    venue: "arXiv:2310.13548",
+    url: "https://arxiv.org/abs/2310.13548",
+    note: "Documents sycophancy across Claude 2, GPT-4, and Llama-2. RM preference predictions correlate with user-agreement at ρ≈0.4."
+  },
+  {
+    authors: "Hu, J., Wu, X., Wang, W. et al.",
+    year: 2024,
+    title: "OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework",
+    venue: "arXiv:2405.11143",
+    url: "https://arxiv.org/abs/2405.11143",
+    note: "Canonical open-stack RLHF framework. Ray + vLLM + DeepSpeed. Actor/Reward/Reference/Critic on separate GPU groups. 1.22–1.68× speedup over prior frameworks."
+  },
+  {
+    authors: "Kwon, W., Li, Z., Zhuang, S. et al.",
+    year: 2023,
+    title: "Efficient Memory Management for Large Language Model Serving with PagedAttention",
+    venue: "SOSP 2023",
+    url: "https://arxiv.org/abs/2309.06180",
+    note: "vLLM and PagedAttention. The inference engine underlying most actor workers in modern RLHF frameworks."
+  },
+  {
+    authors: "Lambert, N.",
+    year: 2024,
+    title: "The RLHF Book",
+    venue: "rlhfbook.com",
+    url: "https://rlhfbook.com",
+    note: "Modern open textbook on RLHF. Chapter 7 (reward models), Chapter 11 (policy gradients and the token-level KL derivation), Chapter 17 (over-optimization) are the primary secondary sources for this chapter."
+  },
+  {
+    authors: "Lambert, N.",
+    year: 2023,
+    title: "Llama 2: an incredible open LLM",
+    venue: "Interconnects (Substack)",
+    url: "https://www.interconnects.ai/p/llama-2-from-meta",
+    note: "Annotated reading guide for Touvron et al. (2023). Flags margin loss and dual-RM setup as key innovations. Source for Llama-2 β=0.01 cross-reference."
+  },
+  {
+    authors: "vLLM Blog",
+    year: 2025,
+    title: "Accelerating RLHF with vLLM: Best Practice from OpenRLHF",
+    venue: "blog.vllm.ai",
+    url: "https://blog.vllm.ai/2025/04/23/openrlhf-vllm.html",
+    note: "Details the update_weights_from_tensors API for in-place weight synchronization from learner to actors, eliminating the multi-second engine restart that plagued early RLHF implementations."
+  },
+  {
+    authors: "Bai, Y., Jones, A., Ndousse, K. et al.",
+    year: 2022,
+    title: "Training a Helpful and Harmless Assistant with Reinforcement Learning from Human Feedback",
+    venue: "arXiv:2204.05862",
+    url: "https://arxiv.org/abs/2204.05862",
+    note: "Anthropic's first public RLHF paper. The second canonical RLHF reference alongside InstructGPT. Minimal hyperparameter disclosure but introduces the HH-RLHF dataset."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Cited in §DPO vs PPO landscape as the cleanest 2025 small-open-model evidence that a no-RL post-training pipeline (mid-training + SFT + APO + linear merge) is feasible at the 3B scale."
+  }
+]} />

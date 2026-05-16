@@ -1,0 +1,387 @@
+---
+slug: 03a-sft
+title: Supervised fine-tuning
+description: Loss masking, data quality vs quantity, the 2024-2026 SFT recipes from Tülu-3, Llama-3-Instruct, and OLMo-2-Instruct.
+order: 28
+chapter: 28
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 35
+depends_on: [01e-schedules-and-batch, 00g-tokenization-and-objectives]
+provides: [sft, loss-masking, instruction-data, distillation, chat-templates]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Supervised fine-tuning (SFT) takes a pretrained base model — trained on web-scale unlabeled text — and converts it into an instruction-following checkpoint that responds coherently to structured multi-turn conversations. The objective is mathematically identical to pretraining: next-token cross-entropy loss on a sequence. The difference is entirely in the data distribution, the per-token loss mask, and the sequence length distribution. SFT is continued pretraining with a different dataset and a different mask.
+
+The chapter develops the theory and practice of SFT as of May 2026. After the orientation, it covers the loss function and masking variants, then addresses the settled 2024–2026 position on the quantity-versus-quality tradeoff (reconciling LIMA's 1,000-example claim with Tülu-3's 939K-example result). Five data-source families are named: human-annotated, distilled from stronger models, self-generated synthetic, Magpie extraction, and public eval-adjacent structured sets. Multi-turn chat templates for Llama-3 and ChatML are specified at the token level, including operational pitfalls. Two frontier recipes are detailed verbatim: Llama-3-Instruct (six iterative rounds, 10M+ human examples, 25M+ synthetic) and Tülu-3 (939K examples, open dataset, reproducible hyperparameters). OLMo-2-Instruct is presented as the reference end-to-end open recipe. A concrete 7B SFT recipe with 1M examples is worked out end-to-end.
+
+The chapter assumes the reader has completed the pretraining module. It cross-references backward to [Schedules and batch](/textbook/01e-schedules-and-batch) for learning-rate choice (one order of magnitude below pretraining peak, 1e-6 to 2e-5) and batch size (128–256 sequences, not millions of tokens), [Tokenization and objectives](/textbook/00g-tokenization-and-objectives) for cross-entropy loss without auxiliary terms, and [FSDP and ZeRO](/textbook/02e-fsdp-and-zero) for single-node FSDP sufficiency at sub-70B scale. It forward-references [Preference tuning](/textbook/03b-preference-tuning) (DPO, IPO, SimPO) as the next phase consuming the SFT checkpoint, and [RLHF](/textbook/03c-rlhf) (PPO, GRPO, RLVR) as the reward-optimisation phase.
+
+---
+
+## The SFT objective and loss mask {#loss}
+
+### The objective is unchanged
+
+Both pretraining and SFT optimize next-token cross-entropy:
+
+$$\mathcal{L}(\theta) = -\sum_{t=1}^{T} m_t \log p_\theta(x_t \mid x_{<t})$$
+
+where $x_{1:T}$ is the tokenized training sequence and $m_t \in \{0, 1\}$ is a per-token loss mask. In pretraining, $m_t = 1$ for all tokens except padding. In SFT, $m_t = 0$ on system and user turn tokens and $m_t = 1$ on assistant turn tokens — the standard recipe. There is no auxiliary KL regularization, no preference model, no reward signal. SFT is **continued pretraining on a different data distribution with a different mask**. The bracket reading "fine-tuning is just more pretraining" is precise at this level.
+
+This objective is one of the few aspects of LLM training that has remained constant since the pretraining era. The cross-entropy formulation on next-token prediction is identical; only the conditioning changes. This stability means that practitioners can reuse most of the infrastructure and intuitions from pretraining — the optimizer choice, the learning-rate schedule shape, the distributed-training machinery — but must recalibrate the hyperparameters for the drastically different data regime and example-length distribution.
+
+### What changes between pretraining and SFT
+
+**Data distribution.** Pretraining ingests a web-scale token stream (40–90% web text, remainder code, books, math, multilingual). SFT ingests structured conversations of $(system, user, assistant)$ turns, typically 10K–10M examples totalling 0.1B–10B tokens. The distribution shift is enormous: the ratio of training tokens is roughly $10^4$–$10^5$ smaller, and the per-example structure is dialogic instead of monologic.
+
+**Sequence length.** Pretraining typically uses 4K–128K context. SFT uses 4K–16K, with 4K–8K as the modal choice in 2024–2026. Training beyond the SFT context length and then deploying at the SFT max-length is one of the most common post-training bugs.
+
+**Mask.** The instruction tokens are conditioning, not targets. Forcing the model to predict the user's words from the system prompt teaches nothing useful; per Shi et al. 2024, this is mildly harmful for short-completion data.
+
+**Loss normalization.** Pretraining uses token-mean loss: $\sum \mathcal{L}_t / \text{(unmasked tokens in batch)}$. SFT can use either token-mean or sample-mean (per-example mean, then batch mean). Tülu-3 explicitly documents sum-loss accumulation, normalized over total unmasked tokens in the global batch. This matters when example lengths vary by an order of magnitude.
+
+### Loss masking variants {#loss-masking}
+
+Three named strategies appear in public recipes:
+
+| Variant | Mask | Used by | Notes |
+|---------|------|---------|-------|
+| **Mask prompt** (standard) | $m_t = 0$ on system+user, $m_t = 1$ on assistant | Llama-3, Tülu-3, OLMo-2, TRL defaults | The canonical choice. Standard cross-entropy on target tokens only. |
+| **Unmask all** | $m_t = 1$ everywhere | Early Alpaca code; some early recipes | Treats SFT as ordinary LM training. Empirically degrades short-completion tasks. |
+| **Prompt-loss-weight** | $m_t = \lambda \in (0, 1)$ on prompt, 1 on response | OpenAI legacy API; Shi et al. 2024 | Small $\lambda \approx 0.1$ acts as regularizer for medium/long completions; harmful for short. |
+
+The standard in the HuggingFace alignment-handbook, TRL, and Llama-3 / Tülu-3 codebases is mask-prompt. Shi et al. 2024 ("Instruction Fine-Tuning: Does Prompt Loss Matter?", arXiv:2401.13586) ran a systematic ablation of prompt-loss-weight $\lambda$ across short, medium, and long completions. Finding: short completions (1–20 tokens, classification tasks) benefit from full masking ($\lambda = 0$), medium completions (50–500 tokens) can accept mild regularization ($\lambda \in [0, 0.1]$), and long completions (>500 tokens including chain-of-thought) again prefer full masking. The recommendation is $\lambda = 0$ (full prompt mask) universally — the configuration simplicity is worth the forgone mild regularization gain.
+
+Additional questions sometimes grouped under "loss masking":
+
+- **Mask formatting tokens?** Llama-3's DPO recipe masks `<|eot_id|>` and header tokens to prevent tail repetition or abruptly terminating (a *DPO* stability fix, not SFT). In SFT, the `<|eot_id|>` at the assistant turn's end *must* be in the loss; that is precisely where the model learns when to stop generating.
+- **Mask system turns?** Some recipes mask the system token but leave the system *content* in the prompt (because the system is shared across the conversation, not a turn the model produces). All standard recipes do this implicitly by masking everything outside assistant turns.
+- **Multi-turn masking.** In a $k$-turn conversation, the standard is to compute loss on all $k$ assistant turns and mask all $k$ user turns. Some early recipes only computed loss on the final assistant turn, throwing away ~50% of the training signal. The modern consensus: use all assistant turns.
+
+<Callout variant="note" title="Packing with cross-document masking">
+SFT examples have wide length distributions (median ~500 tokens, p99 ~4,000). Without packing, batches are padded to the max length in the batch — 5–10× waste. Standard 2024–2026 practice: concatenate examples until the next exceeds `max_length`, insert a boundary token, pass cumulative sequence-length offsets to FlashAttention-2 (`cu_seqlens` argument) to prevent attention across examples, and apply per-example loss masks. This yields ~2× tokens/sec speedup with no quality loss (Krell et al. 2024). HuggingFace's `DataCollatorWithFlattening` is the reference implementation.
+</Callout>
+
+---
+
+## Data quality vs. quantity: the settled 2024–2026 position {#data-quality-vs-quantity}
+
+### LIMA and the 1,000-example baseline
+
+Zhou et al. 2023 ("LIMA: Less Is More for Alignment," arXiv:2305.11206) proposed that 1,000 carefully curated prompt-response pairs are sufficient to align a 65B base model. The data came from:
+
+- 750 high-quality answers from Stack Exchange, wikiHow, and Reddit (hand-filtered by heuristic);
+- 250 manually authored examples (50 in-team, 200 from annotators).
+
+The model was LLaMA-65B, trained with AdamW ($\beta_1=0.9, \beta_2=0.95$, weight decay 0.1), peak LR $1 \times 10^{-5}$ decaying linearly to $1 \times 10^{-6}$, batch size 32, **15 epochs**, and dropout rising from 0% to 30% across layers. Human evaluators preferred LIMA's outputs to GPT-4 in 43%, Bard in 58%, and text-davinci-003 in 65% of single-turn preference comparisons. The paper's **Superficial Alignment Hypothesis**: "Almost all knowledge is learned in pretraining; instruction tuning teaches only output format."
+
+### Tülu-3 and the scale consensus
+
+Two years later, Lambert et al. 2024 ("Tülu 3: Pushing Frontiers in Open Language Model Post-Training," arXiv:2411.15124) demonstrated that **carefully curated millions beat carefully curated thousands** for nearly every downstream task. The Tülu-3 SFT mixture contains 939,344 prompts, refined iteratively by skill axis. Iterative data-mix refinement — start from per-skill mixtures, combine into a preview mix, add/remove datasets to fix lagging skills, decontaminate against eval benchmarks — was the headline contribution.
+
+### Reconciliation
+
+As of 2026, three principles reconcile the two findings.
+
+**LIMA was right about pretraining holding the capabilities.** No amount of SFT data teaches a base model facts or skills it does not already have latent representations for. A base model that cannot solve calculus problems will not learn to do so from a 1M-example SFT mix lacking calculus. SFT shapes the surface manifold — how the model surfaces and formats what it knows — not the underlying competence. This is the Superficial Alignment Hypothesis at its strongest.
+
+**LIMA was wrong about the ceiling.** LIMA's claim holds for "style-appropriate responses to single-turn general-knowledge questions." It fails decisively for:
+- Math (MATH, GSM8k, AIME) — needs hundreds of thousands of worked solutions to elicit reliable chain-of-thought.
+- Code (HumanEval+, LiveCodeBench) — needs tens of thousands of execution-verified code traces.
+- Long context (RULER, LongBench) — needs SFT data where the query depends on information spanning 4K–128K tokens.
+- Tool use / function calling — needs structured multi-turn traces showing when and how to invoke external tools.
+- Instruction following (IFEval) — needs verifiable-constraint examples ("the answer must be in JSON", "respond in exactly three paragraphs").
+- Multilingual benchmarks (MGSM, MMLU multilingual) — needs per-language coverage and code-switching examples.
+- Safety / refusals (XSTest, WildGuardMix) — needs both explicitly harmful prompts with refusals and benign-looking prompts that are actually harmful with helpful responses that don't refuse.
+- Multi-turn dialogue (MT-Bench-101) — needs genuine multi-turn structure, not single-turn questions formatted as multi-turn.
+
+In the 2024 view, each of these axes is *independent*: the math capability is separable from the code capability, which is separable from the instruction-following capability. SFT distributes training signal across these axes. A 1K-example random mix will scatter signal and fail at all of them; a 1K-example focus on one axis will succeed at that axis alone; a 1M-example carefully balanced mix across all axes will succeed at all of them.
+
+**Scale matters with sharply diminishing returns past ~1M.** Tülu-3 stops at ~940K prompts. Llama-3 does six iterative rounds on data totalling ~10M human-annotated + 25M+ synthetic, but Meta's reports and the open literature provide no evidence of further gains from scale alone past 1M–2M per round — what helps is **adding new skill axes, improving response quality, or iterating DPO/reward-model pairs**. Adding another 500K examples in the same distribution as your existing 939K produces marginal improvement; adding 50K examples in a new skill axis that your 939K barely covers (e.g., a specialized domain you care about) produces noticeable improvement. The cross-derivative (new axis, high quality) beats the scalar (same axis, more scale).
+
+<Sidenote>Response quality is now defined as "generated by GPT-4o, Claude 3.5+, or a stronger model, then filtered" — not "written by a human." Tülu-3: "All new synthetic SFT datasets contain responses created by either GPT-4o or Claude 3.5 Sonnet (for coding)." The shift from human-written to model-generated responses reflects the 2024–2025 consensus: scaling annotation is economically infeasible; distilling from a stronger model is faster and cheaper. The only remaining human-intensive phase is curation — choosing which prompts to include, filtering low-quality teacher outputs, decontaminating against benchmarks — not generation.</Sidenote>
+
+The settled position: aim for **roughly 1M high-quality prompts** distributed across your skill axes, with response quality dominating any further increase in scale alone. Beyond 1M, the 2026 consensus is to iterate: produce the best 1M-example SFT checkpoint, measure performance on your downstream tasks, identify the lagging skill axes (math, code, refusal accuracy, etc.), synthesize targeted data for those axes, and iterate SFT + DPO + eval. This is the Llama-3 and Tülu-3 approach — not a single massive fit, but iterative refinement.
+
+---
+
+## Data sources {#data-sources}
+
+Five families of data account for nearly all 2024–2026 SFT. Each family has different cost-quality tradeoffs and use cases.
+
+**Human-annotated.** Annotators write prompts and gold responses (InstructGPT tradition). Slow ($1–5 per example at scale), expensive (a 10M-example corpus costs $10–50M), but high-fidelity for flagship models. Quality is not random; experts (subject-matter specialists, ex-teachers) produce better data than crowdworkers. Public sets: OpenAssistant (Köpf et al. 2024, Apache 2.0, ~10K conversation trees from volunteer annotators), No Robots (Rajani et al. 2023, CC-BY-NC, 9.5K from skilled annotators), Dolly-15k (Databricks 2023, CC-BY-SA, 15K from employees, the highest-quality small set). Llama-3 reports "over 10M human-annotated examples" across six rounds — the largest publicly cited human SFT collection, though Meta does not release the actual examples.
+
+**Distilled from a stronger model.** Take prompts (real or synthetic), sample responses from GPT-4o ($0.015/1M input tokens, cheap at scale), Claude 3.5 Sonnet ($3/1M input, more expensive but better at code), DeepSeek-V3 (also good at reasoning, training-time inference), or Llama-3-405B-Instruct (free if you own the weights). Train a smaller model on teacher samples. The dominant 2024–2026 mode for academic and small-lab work because the cost-to-quality ratio is unbeatable. Examples: Stanford Alpaca (Taori et al. 2023, 52K examples sampled from text-davinci-003, &lt;$500 total cost, established the template that all later work copied), OpenHermes-2.5 (teknium 2023, 1M examples, mostly GPT-4), Zephyr-7B-β (Tunstall et al. 2023, 200K filtered UltraChat examples from ChatGPT).
+
+**Self-generated synthetic (Self-Instruct family).** Wang et al. 2022 seeded with 175 hand-written tasks, prompted a strong model to generate new instructions in-context, filtered, and trained. Modern variants: Evol-Instruct / WizardLM (Xu et al. 2023, iteratively rewrite simple instructions into "deeper" / "broader" versions using prompt mutations, produced 250K examples from Alpaca's 52K as input), Persona-driven (Tülu-3's method, condition on a sampled persona like "an expert pediatric oncologist" or "a retired NYC bus driver" plus a verifiable-instruction template like "write a GSM-style word problem and solve it", generates 30K–150K per skill axis). The persona method is a diversity hammer: empirically produces 2–3× wider problem distribution than templated seeding alone.
+
+**Magpie extraction.** Xu et al. 2024 ("Magpie," ICLR 2025) observed that an aligned model like Llama-3-Instruct, when prompted with only the left side of the chat template (system header + special tokens, but empty user content), will *generate both* a plausible user query *and* its own response. This is the model in "instruction-following mode," generating examples of instructions it can follow. This bypasses both seed prompts and the need for a separate teacher model. They generated 4M candidate instructions (by sampling from Llama-3-70B-Instruct), filtered with another model to ~300K high-quality examples, and fine-tuned Llama-3-8B-base on them. Result: matched the official Llama-3-8B-Instruct quality despite that model using 10M+ human + 25M+ synthetic examples. The efficiency gains are striking: 300K examples (no annotation cost, pure inference) ≈ 35M examples (combined human + synthetic from meta). Magpie is the purest form of data extraction — no human annotation, no external teacher, just the model generating its own training data.
+
+**Public eval-adjacent and structured.** Datasets designed to teach specific benchmarkable skills. FLAN v2 (Longpre et al. 2023, 90K prompts in Tülu-3, strong on classification/QA/summarization), NuminaMath-TIR (Beeching et al. 2024, 64K math problems with tool-integrated reasoning, designed to teach verifiable problem-solving), Aya (Singh et al. 2024, 100K multilingual across 65 languages, engineered for language balance), CoCoNot (Brahman et al. 2024, 11K refusal-only examples, teaching when to refuse), WildGuardMix / WildJailbreak (Han et al. 2024, 100K + 50K safety-related prompts in both directions — harmful prompts with refusals, benign-looking harmful prompts with helpful non-refusal responses). These are high-value-density datasets: fewer examples, but each one directly addresses a benchmark or capability gap.
+
+---
+
+## Chat templates {#templates}
+
+Two formats dominate open-weights SFT in 2026.
+
+### ChatML format
+
+Used by Qwen, OpenChat, Mistral variants, original OpenAI:
+
+```
+<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{user_1}<|im_end|>
+<|im_start|>assistant
+{assistant_1}<|im_end|>
+<|im_start|>user
+{user_2}<|im_end|>
+<|im_start|>assistant
+{assistant_2}<|im_end|>
+```
+
+Special tokens: `<|im_start|>` and `<|im_end|>`. The role is plain text after `<|im_start|>`.
+
+### Llama-3 format
+
+Used by Llama-3, 3.1, 3.2, 3.3, 4 families:
+
+```
+<|begin_of_text|>
+<|start_header_id|>system<|end_header_id|>
+
+{system}<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+{user_1}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+
+{assistant_1}<|eot_id|>
+```
+
+Special tokens: `<|begin_of_text|>` (conversation start, position 0 only), `<|start_header_id|>` / `<|end_header_id|>` (role boundaries), `<|eot_id|>` (end-of-turn). The double newline after `<|end_header_id|>` is required by the tokenizer. Tool-call turns use `<|python_tag|>`; tool outputs use role `ipython`.
+
+### System prompt as a distinct turn
+
+Since Llama-3, **the system prompt is its own turn with its own header**, not elided into the first user message. This has three consequences:
+
+1. Training data must include examples with and without system prompts. A model trained only with system turns will hallucinate one at inference; one trained without will ignore the provided system prompt.
+2. The system turn must be in the input but masked in the loss (it is not assistant output).
+3. System content matters for steerability. Tülu-3 includes 240 hardcoded examples teaching identity via the system turn ("I am OLMo, made by Ai2").
+
+### Token-level pitfalls
+
+- **Trailing `<|eot_id|>` must be in the loss.** Models learn *when to stop* from this signal. Masking it produces models that refuse to terminate.
+- **Leading `<|begin_of_text|>` appears once at conversation start.** Bad implementations insert it at every turn — a parse error in the chat template.
+- **Trailing whitespace matters.** The double newline after `<|end_header_id|>` is part of the format; stripping it breaks Llama-3 parsing.
+- **`<|eot_id|>` vs `<|end_of_text|>`.** Llama-3 has separate end-of-turn (within conversation) and end-of-text (end of pretraining sequence) tokens. SFT uses only `<|eot_id|>`.
+
+---
+
+## The Llama-3-Instruct recipe {#frontier-recipes}
+
+The Llama-3 herd paper (Dubey et al. 2024, arXiv:2407.21783) is the most detailed public description of frontier-scale SFT. Post-training is **six rounds**, each:
+
+1. SFT on the current data mix.
+2. Reward-model training on preference data.
+3. Rejection sampling: sample $K \in [10, 30]$ outputs per prompt, keep the best per the reward model.
+4. DPO (direct preference optimization, deferred to [Preference tuning](/textbook/03b-preference-tuning)) on the (best, worst) pairs.
+
+The SFT data evolves: rejection-sampled examples from round $r$ become SFT data for round $r+1$. This creates a virtuous cycle: each round's best-of-N sampling produces high-quality new examples, which feed into the next round's SFT, which produces better rejection-sampled outputs. The six-round iteration is the secret behind Llama-3's quality; a single massive 35M-example SFT would underperform.
+
+**Hyperparameters for SFT per round:** Learning rate $10^{-5}$ for 405B and 70B models; slightly higher for 8B (community recipes use ~$2 \times 10^{-5}$, likely $1.5$–$2 \times 10^{-5}$). Steps: 8,500–9,000 per round. Loss: standard cross-entropy on target tokens, mask on prompt tokens (the "mask prompt" variant from §Loss). Batch size: inferred from community FSDP recipes at ~256 sequences × 8,192 tokens context. Sequence length: 8,192 throughout all six rounds (notably higher than Tülu-3's 4,096, reflecting Meta's focus on long-context capabilities). Format: Llama-3 chat template (detailed in §Chat templates). No weight decay reported; default AdamW settings assumed. No explicit mention of packing in the paper; community implementations add it for efficiency.
+
+**Data composition (Table 7 of herd report):** The seven domains represent Meta's hypothesis about which skills transfer at frontier scale.
+
+- General English (4.7 avg turns): Human-written examples, rejection-sampled outputs from previous rounds, and synthetic examples. The largest bucket by volume.
+- Code (2.7 turns): Synthetic examples generated from Llama-3 itself in a self-improving loop (problem → solution → execution verification). Notably the shortest average turn count, reflecting code's "one-shot answering" nature.
+- Multilinguality (3.0 turns): Native annotators (not machine translation) for eight languages besides English. This is where the "speak my language" capability lives.
+- Math & reasoning (1.6 turns): Human-written stepwise solutions plus synthetic examples. The lowest turn count (single-shot solving, no back-and-forth).
+- Long context (6.3 turns): Synthetic Q&A over long documents (book QA, code-repository QA, summarization). Specifically engineered to bring SFT into the 8K–128K regime.
+- Tool use (4.0 turns): Function-call traces, both single-turn and multi-turn, for Brave-search, Wolfram Alpha, Python interpreter, and internal tools.
+- Factuality & steerability (4.7 turns): Curated, mostly system-prompt-conditioned. This is where examples like "I am Llama, made by Meta" live — explicit identity teaching via the system turn.
+
+**Total data across all six rounds: over 10 million human-annotated examples plus 25 million+ synthetically generated examples.** The human figures represent Meta's annotation capacity across multiple labs and contractors; the synthetic figures dominate by volume and grow across rounds as rejection sampling generates more high-quality training data. The iterative approach means Meta never fit a single massive dataset once; instead, they iterated, monitored benchmark progress, and pruned or added datasets dynamically.
+
+---
+
+## Tülu-3: reproducible recipe {#tulu-3-recipe}
+
+Tülu-3 (Lambert et al. 2024, arXiv:2411.15124) is the open counterpoint: every dataset, hyperparameter, and script is released. **939,344 prompts total: 57% public, 43% synthetic.**
+
+| Component | Prompts | Source |
+|-----------|--------:|--------|
+| Persona MATH | 149,960 | synthetic, persona-driven, GPT-4o |
+| Evol CodeAlpaca | 107,276 | Luo et al. 2023 |
+| Aya | 100,000 | Singh et al. 2024 (multilingual) |
+| WildChat GPT-4 | 100,000 | Zhao et al. 2024 |
+| FLAN v2 | 89,982 | Longpre et al. 2023 |
+| NuminaMath-TIR | 64,312 | Beeching et al. 2024 |
+| WildGuardMix | 50,000 | Han et al. 2024 |
+| WildJailbreak | 50,000 | Wildteaming 2024 |
+| Persona GSM | 49,980 | synthetic |
+| Persona Python | 34,999 | synthetic, Claude-3.5 |
+| Persona IF | 29,980 | synthetic, verifiable constraints |
+| Persona Algebra | 20,000 | synthetic |
+| CoCoNot | 10,983 | Brahman et al. 2024 (refusals) |
+| SciRIFF | 10,000 | Wadden et al. 2024 |
+| No Robots | 9,500 | Rajani et al. 2023 |
+| OpenAssistant Guanaco | 7,132 | Köpf et al. 2024 |
+| TableGPT | 5,000 | Zha et al. 2023 |
+| Hardcoded | 240 | identity / system-prompt examples |
+
+**Hyperparameters for Llama-3.1-8B-base:** AdamW, $\beta_1=0.9, \beta_2=0.999$, no weight decay. Learning rate: $5 \times 10^{-6}$ for 8B, $2 \times 10^{-6}$ for 70B (one order of magnitude below pretraining peak). Schedule: linear decay with linear warmup, 0.03 warmup ratio. Effective batch: 128 sequences. Epochs: 2. Max sequence: 4,096. Loss accumulation: sum, normalized over total unmasked tokens in global batch. Loss masking: mask prompt fully. Packing: yes, with cross-document attention masking. Precision: bf16.
+
+The persona-driven method: sample a persona from ~50K (e.g., "an air-traffic controller at LAX"), provide a data-synthesis template (e.g., "Write a single GSM-style word problem, then solve it step by step"), optionally include a format example. GPT-4o generates the prompt; same model or Claude-3.5 for code generates the response. This diversity hammer empirically produces a much wider problem distribution than seed-instruction templates alone.
+
+---
+
+## OLMo-2-Instruct: fully open recipe {#olmno-2}
+
+OLMo-2 (Walsh et al. 2025, "2 OLMo 2 Furious," arXiv:2501.00656) applies the Tülu-3 pipeline to a fully-open base model. Reported sizes: 7B, 13B, 32B. The SFT mix is a near-clone of Tülu-3's, adjusted to remove WildChat-derived examples that overlap with OLMo-2's pretraining data (OLMo-2 pretrains on Dolma, which already includes some WildChat). The "OLMo-2 variant" of the mix is published as `allenai/tulu-3-sft-olmo-2-mixture`.
+
+OLMo-2-Instruct is the cleanest end-to-end *open-everything* SFT recipe in 2026: base weights, base data (Dolma 1.8), SFT data, SFT code (HF Trainer), SFT logs, intermediate checkpoints — all published. For a reader who wants to reproduce a current-quality SFT model from scratch, OLMo-2 is the reference.
+
+**Reported numbers for OLMo-2-7B-Instruct:**
+- Base: OLMo-2-7B (4 trillion tokens pretraining on Dolma + Dolmino-Mix-1124 anneal).
+- SFT: ~939K examples (Tülu-3-OLMo-2-mixture), 2 epochs, peak LR $5 \times 10^{-6}$, batch 128 sequences, 4,096 max length.
+- Downstream: DPO on 271K preference pairs (deferred to [Preference tuning](/textbook/03b-preference-tuning)).
+- RLVR: math + code with verifier feedback (deferred to [RLHF](/textbook/03c-rlhf)).
+
+The publishing of intermediate checkpoints (especially the SFT-only checkpoint before DPO) is valuable for research: it isolates the contribution of SFT from the contribution of downstream alignment, making it possible to study each stage's effect independently.
+
+<Callout variant="note" title="SmolLM3's mid-training + SFT pipeline as a worked example">
+SmolLM3 (Allal et al., 2025) splits what other recipes call "SFT" into **two stages**, exposing a structure that the OLMo-2 and Tülu-3 single-stage recipes elide.
+
+**Stage 1 — Reasoning mid-training.** Before SFT proper, SmolLM3 runs an additional pretraining-style stage on a 35 B-token mixture of `OpenThoughts3-1.2M` and an NVIDIA `Llama-Nemotron` subset containing R1-style reasoning traces. Trained for four epochs (≈140 B tokens) under the ChatML template with *wrapped* packing — chosen, the playbook reports, to avoid imprinting too much structure from the chat format onto the base. The mid-trained checkpoint feeds into the SFT stage and becomes the merge anchor in [preference tuning](/textbook/03b-preference-tuning).
+
+**Stage 2 — SFT.** A 1.8 B-token mixture across 22 datasets: **1.0 B non-reasoning tokens** across 12 datasets and **0.8 B reasoning tokens** across 10 datasets. Four epochs (≈8 B tokens total). BFD (best-fit decreasing) packing replaces the wrapped packing of mid-training, restoring the standard SFT format. Loss is masked on user turns and on tool-call results.
+
+The per-stage learning rate, batch size, and DPO-comparable hyperparameters are not publicly disclosed in the blog post or the playbook; the count of datasets, epochs, and token budgets is the disclosed surface. SmolLM3 is the cleanest 2025 example of the *split-SFT* pattern — reasoning mid-training before instruction-tuning SFT — that closed-frontier reasoning models (o-series, R-series) are presumed to use in some form. Cross-reference: the R1-trace distillation discussed in §[Distillation](#distillation) is the same data source family as SmolLM3's mid-training mix.
+</Callout>
+
+---
+
+## Distillation {#distillation}
+
+Distillation in SFT means: take a stronger model $T$ (teacher), generate responses for a prompt corpus, train a smaller model $S$ (student) via standard SFT on those responses. In the 2024–2026 consensus, this is purely "treat teacher samples as ground truth" — no temperature-matched logit distillation (Hinton 2015, still relevant for knowledge distillation in general but not standard in LLM instruction tuning), no matching teacher's logit distributions, no layer-wise alignment losses. Just cross-entropy loss on the student matching the teacher's tokens.
+
+### Why pure SFT distillation works as well as it does
+
+Three mechanisms emerged clearly in the 2024–2025 cycle:
+
+**(1) Capability transfers, not knowledge.** Distillation does not teach the student new facts. A 7B base model has been pretrained on the same web and code, so it possesses the latent representations for most knowledge. Distillation teaches the student to *surface and format* that knowledge in the teacher's style — to solve math problems step-by-step instead of guessing, to follow instructions precisely instead of drifting into context, to refuse harmful requests consistently. This explains why distillation onto a strong base (Llama-3.1-8B, which is itself well-trained) works far better than distillation onto a weak base of the same size.
+
+**(2) Response quality dominates response count.** Magpie's ablations and the long history from Alpaca onward (Taori et al. 2023) show that 50K high-quality GPT-4o responses beat 500K GPT-3.5 responses in head-to-head evaluation. The implication: spend your annotation or API budget on teacher quality (GPT-4o, Claude 3.5, DeepSeek-V3) rather than scale. A 300K set of Llama-3-405B-Instruct samples (Magpie) proved sufficient to match Llama-3-8B-Instruct's quality despite the official model using 10M+ examples.
+
+**(3) Long-CoT reasoning transfers.** The DeepSeek-R1-Distill series (DeepSeek-AI 2025, arXiv:2501.12948) released R1-distilled variants: Qwen2.5-Math-7B distilled from R1, trained on 800K R1-generated reasoning traces at 32K context, matched R1's solve rate on MATH-500 despite being 7B to R1's 671B. This was novel. The 2023 prior was "reasoning is a fundamental capability and won't transfer to a much smaller model cheaply"; R1-Distill refuted that. The full-trace distillation — not just the final answer, but the entire 5K–15K token reasoning path — proved essential.
+
+### Open-weights distillation chains in 2026
+
+Several production chains exist:
+
+**Llama-3 family within Llama-3 family.** Meta's Llama-3.2 describes the 1B and 3B models as distillations of Llama-3.1-70B. The technical report notes logit-matching distillation (Hinton 2015) rather than pure SFT, trading some interpretability for tighter alignment to the teacher's confidence. This is rarer in the open-source world.
+
+**DeepSeek-V3/R1 → Qwen/Llama multi-size.** The headline 2025 distillation result. DeepSeek-R1 (a 671B training-time-reasoning model that outputs step-by-step chain-of-thought) was distilled to Qwen2.5-Math-7B/14B/32B and Llama-3.1-70B-Instruct via pure SFT on 800K reasoning traces. The distilled models retain R1's problem-solving accuracy on math benchmarks while being 20–100× smaller. The method was straightforward: inherit R1's traces as-is (5K–15K token reasoning + final answer), SFT the student models on them at the student's native context length.
+
+**GPT-4o → open base.** Used by Tülu-3 (generating synthetic responses for persona-driven templates), Magpie's GPT-4 variants, and many small-team projects. Licensing remains officially grey under OpenAI's ToS ("you may not use outputs to train competing models"), but enforcement against academic research and small labs is rare, and Tülu-3's approach (using outputs for a specific open-source project, not for a commercial closed-source competitor) has not triggered cease-and-desists as of May 2026. The legal precedent from Alpaca (2023) remains contested: technically a ToS violation, practically tolerated.
+
+**Llama-3.3-70B as an open teacher.** The fully open-source path: use Llama-3.3-70B-Instruct as the teacher (no API cost, can run on-premise or in the cloud cheaply), generate responses for your prompt corpus, SFT a smaller base on them. Tülu-3's persona-synthesis pipeline also optionally uses Llama-3-405B-Instruct for persona prompt generation, though the final responses use GPT-4o (cheaper at scale).
+
+---
+
+## Worked example: 7B recipe with 1M examples {#worked-example}
+
+**Setup:** Llama-3.1-8B-base (or OLMo-2-7B for fully open), Tülu-3 mixture (~1M examples), goal: match Tülu-3-8B-SFT quality.
+
+**Hyperparameters:**
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Optimizer | AdamW | Standard, no reason to change. |
+| $\beta_1, \beta_2$ | 0.9, 0.999 | Note $\beta_2 = 0.999$ (vs pretraining's 0.95) — short run, want longer EMA. |
+| Weight decay | 0 | Tülu-3 reports none; 0.01 also fine. |
+| Peak LR | $5 \times 10^{-6}$ | One order of magnitude below pretraining; see [Schedules and batch](/textbook/01e-schedules-and-batch). |
+| Schedule | Linear decay | Cosine also fine. Total steps known. |
+| Warmup ratio | 0.03 | 3% of total steps. |
+| Effective batch | 128 sequences | × 4,096 tokens ≈ 525K tokens/step. |
+| Per-GPU micro batch | 2 sequences | 8 GPUs × 2 = 16; grad accumulation 8×. |
+| Max sequence | 4,096 | Tülu-3 default. Bump to 8K if base is 8K-pretrained. |
+| Packing | Yes, FA-2 cross-doc masking | ~2× throughput. |
+| Loss masking | Mask prompt fully ($\lambda=0$) | Shi et al. 2024 recommendation. |
+| Epochs | 2 | Tülu-3 default. 1 underfits; 3 overfits and degrades long-CoT. |
+| Precision | bf16 | Standard. |
+| Grad clip | 1.0 | Standard. |
+| Distributed | FSDP (8 GPUs) | No TP/PP at 7B. |
+
+**Step budget:** 1M examples × 2 epochs = 2M examples. 2M / 128 batch = 15,625 steps. ~5 sec/step on 8×H100 with FA-2: ~22 hours wall-clock. Cost: ~$550 at $25/hr (May 2026 rates).
+
+**Checkpoints and evaluation (every 500 steps):**
+- **AlpacaEval-2 length-controlled win rate** vs GPT-4-Turbo. Single-turn helpfulness benchmark, win-rate normalized for response length (longer is not automatically better). Measures general instruction-following.
+- **IFEval (Instruction-Following Eval).** Format constraints and verifiable instructions. Strict-prompt accuracy measures exact compliance with format requirements (output JSON in this structure, etc.).
+- **GSM8k 8-shot math.** Grade-school math word problems, in-context learning. Expect SFT to add ~10–15 points to base.
+- **HumanEval+ pass@1 code.** Functional correctness of generated code. SFT is where code capability blooms because code SFT data is abundant and execution is verifiable.
+- **MT-Bench score.** Multi-turn question answering. Tests dialogue coherence and context retention across turns.
+- **50-prompt internal regression set.** Test your own priorities: does it refuse correctly? Does it speak the language you requested? Does it respect system-prompt steering? Custom evaluation is where you catch model-specific failures before deployment.
+
+**Common bugs to catch:**
+1. Chat template applied with HF `apply_chat_template`, generation prompt off during training.
+2. Loss mask verified by hand on 5 examples: sum of unmasked tokens should match assistant-turn lengths.
+3. `<|eot_id|>` *is* in the loss; `<|begin_of_text|>` *is not*.
+4. Packing cross-doc mask is block-diagonal (check attention pattern on a 2-example pack).
+5. Eval set decontaminated against training mix (Tülu-3: 8-gram overlap heuristic).
+6. No NaN/Inf in first 10 steps (canary for tokenizer mismatch).
+
+**What you should observe:**
+- Training loss starts at ~2.0–2.5 (base model on chat-formatted data), ends at ~0.9–1.1.
+- Eval-set perplexity drops 30–50% in epoch 1, plateaus with 5–10% additional drop in epoch 2. The large epoch-1 drop reflects the major distribution shift from pretraining; epoch 2's smaller drop is the fine-tuning of an already-familiar distribution.
+- AlpacaEval-2 length-controlled win rate jumps from ~5–10% (base model) to ~25–40% after epoch 2. Tülu-3-SFT's published scores are ~33%; full Tülu-3 after DPO is ~42%. This means SFT alone bridges ~70% of the gap from base to full post-training; DPO/alignment adds the remaining ~30%.
+- IFEval strict-prompt (verifiable constraints, exact format matching) improves from ~25% (base) to ~65% (end of SFT). This dramatic jump shows that SFT is the phase where format-following capability is learned.
+- GSM8k 8-shot math performance typically improves from base to base+10–15 points. Tülu-3-8B-SFT achieves ~54% on GSM8k; further improvements come from RLVR (verifier-based reward, deferred to [RLHF](/textbook/03c-rlhf)).
+- HumanEval+ pass@1 for code typically rises from 20–30% (base) to 40–50% (SFT). Code is the skill where SFT alone buys the most, because code SFT data is abundant and execution-verifiable.
+
+---
+
+## Summary {#summary}
+
+Supervised fine-tuning is next-token cross-entropy loss on chat-formatted instruction data with per-token masking that zeros out prompt tokens. The objective is mathematically identical to pretraining; only the data distribution, mask, and sequence-length distribution differ. This identity means that the pretraining intuitions — optimizer choice, learning-rate schedule shape, distributed-training machinery — transfer directly, but the hyperparameters must be recalibrated for the vastly different data regime.
+
+The 2024–2026 consensus on data scale: aim for **roughly 1M high-quality examples**, distributed across your skill axes (math, code, instruction-following, multilingual, long-context, tool use, safety). Response quality (generated by GPT-4o, Claude 3.5+, or stronger models, then filtered) dominates response count; 50K high-quality examples beat 500K mediocre ones. LIMA's 1K-example result remains valid for single-turn helpfulness but fails decisively when benchmarks require depth across multiple skill axes. Tülu-3 and Llama-3's scale-up to millions per round demonstrates that past ~1M, **new skill axes matter more than adding more examples in the same axis**. The cross-derivative (new domain, high quality) beats the scalar (more examples, same distribution).
+
+Five data-source families provide paths from a base model to instruction-following parity with closed models:
+1. Human-annotated (slow, expensive, high-fidelity; used for Llama-3's 10M+ examples).
+2. Distilled from stronger models (cheap, scalable; GPT-4o, Claude 3.5, DeepSeek-R1 as teachers).
+3. Self-generated synthetic (persona-driven, Evol-Instruct variants; Tülu-3's 400K+ examples).
+4. Magpie extraction (fully automated generation from an aligned model; 300K examples match 10M from Llama-3).
+5. Public eval-adjacent and structured (FLAN, NuminaMath, Aya, safety mixes; high-value density).
+
+The Llama-3 herd paper and Tülu-3's open release provide the reference recipes. Llama-3 is the scale leader (10M+ human, 25M+ synthetic across six rounds) with proven results; Tülu-3 is the reproducibility leader (939K examples, all datasets released, all code public, full hyperparameters disclosed). OLMo-2-Instruct combines both approaches: it applies Tülu-3's methodology to a fully-open pretrained base, releasing base weights, SFT data, SFT code, intermediate checkpoints, and evaluation logs. For a reader building a production SFT pipeline, OLMo-2 is the reference.
+
+From the SFT checkpoint, post-training continues into two further phases. [Preference tuning](/textbook/03b-preference-tuning) (DPO, IPO, SimPO) consumes the SFT model and refines alignment to human preferences learned from paired comparisons. [RLHF](/textbook/03c-rlhf) (PPO, GRPO, RLVR) optimizes against explicit reward models or verifier signals. Both techniques start from the SFT checkpoint; some recipes (Llama-3, Tülu-3) iterate SFT and preference-tuning across multiple rounds, creating a virtuous cycle where each phase's outputs feed the next phase's inputs.
+
+<Sources>
+
+- Wang et al. 2022, "Self-Instruct," arXiv:2212.10560
+- Zhou et al. 2023, "LIMA: Less Is More for Alignment," arXiv:2305.11206
+- Taori et al. 2023, "Stanford Alpaca," https://crfm.stanford.edu/2023/03/13/alpaca.html
+- Xu et al. 2023, "WizardLM (Evol-Instruct)," arXiv:2304.12244
+- Ding et al. 2023, "UltraChat," arXiv:2305.14233
+- Tunstall et al. 2023, "Zephyr: Direct Distillation of LM Alignment," arXiv:2310.16944
+- Dubey et al. 2024, "The Llama 3 Herd of Models," arXiv:2407.21783
+- Xu et al. 2024, "Magpie," arXiv:2406.08464
+- Lambert et al. 2024, "Tülu 3: Pushing Frontiers in Open Language Model Post-Training," arXiv:2411.15124
+- Krell et al. 2024, "Enhancing Training Efficiency Using Packing with Flash Attention," arXiv:2407.09105
+- Shi et al. 2024, "Instruction Fine-Tuning: Does Prompt Loss Matter?" arXiv:2401.13586
+- Zhao et al. 2024, "WildChat," arXiv:2405.01470
+- Walsh et al. 2025, "2 OLMo 2 Furious," arXiv:2501.00656
+- DeepSeek-AI 2025, "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning," arXiv:2501.12948
+- Allal, L. B. et al. (Hugging Face) 2025, "SmolLM3: smol, multilingual, long-context reasoner," https://huggingface.co/blog/smollm3 — split mid-training + SFT pipeline (35 B-token reasoning mid-training × 4 epochs ≈ 140 B; 1.8 B-token SFT × 4 epochs ≈ 8 B; BFD packing; loss masked on user turns and tool-call results).
+- Allal, L. B. et al. (Hugging Face) 2025, "The Smol Training Playbook," https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook — companion operational disclosure.
+
+</Sources>

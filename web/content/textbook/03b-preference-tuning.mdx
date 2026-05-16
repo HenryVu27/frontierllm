@@ -1,0 +1,582 @@
+---
+slug: 03b-preference-tuning
+title: Preference tuning (DPO, IPO, KTO, SimPO, ORPO)
+description: The DPO derivation from the RLHF objective, plus its 2024 successors (IPO, KTO, SimPO, ORPO) and the β hyperparameter.
+order: 29
+chapter: 29
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 38
+depends_on: [03a-sft]
+provides: [dpo, ipo, kto, simpo, orpo, preference-pair, beta-hyperparameter]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Supervised fine-tuning, covered in [SFT](/textbook/03a-sft), teaches a pretrained model to follow instructions by maximum-likelihood imitation of demonstration data. The resulting model is fluent and responsive, but it has two failure modes that more SFT cannot correct. First, the loss has no negative signal: it maximises $\log \pi(y_\text{target} \mid x)$ and has no mechanism to push down the probability of a known-bad completion. If two responses exist — one accurate, one hallucinated — SFT can train on the accurate one, but the model's *relative ordering* of the two is left undefined by the objective. Second, SFT targets the empirical distribution of its demonstration corpus. When that corpus is 60th-percentile quality, the trained model targets 60th-percentile quality. Human raters consistently prefer model samples over reference demonstrations when both are blinded — a finding established by Christiano et al. (2017) on Atari-style tasks and confirmed by Stiennon et al. (2020) on summarisation. The ceiling imposed by the quality of demonstrations is real.
+
+Preference data — triples $(x, y_w, y_l)$ in which an annotator or a stronger model has marked $y_w$ as preferred over $y_l$ for prompt $x$ — provides the missing signal. The SFT checkpoint is the warm-start from which preference tuning almost always begins. As of May 2026, every published frontier post-training recipe — Llama-3, Tülu-3, OLMo-2, Zephyr, Mixtral-Instruct, and the Qwen-2.5 instruct line — includes at least one preference-tuning stage after SFT. The remaining design question is the loss function.
+
+This chapter develops five answers to that question. Direct Preference Optimization (DPO) is derived in full from the KL-constrained RLHF objective and receives the most attention, because it is the default at frontier scale. IPO, KTO, SimPO, and ORPO are then presented as targeted modifications of DPO, each fixing a named failure mode. The chapter concludes with a detailed treatment of the $\beta$ hyperparameter that appears in all five methods, a geometric reading of what the DPO loss actually optimises, a frontier-practice section calibrated to May 2026, and a fully worked numerical example.
+
+One partial exception is worth noting at the outset. Qwen-3 (Alibaba, May 2025) does not include a standalone DPO stage; its preference signal enters through GRPO, a group-relative policy-gradient method covered in [Reasoning RL](/textbook/03f-reasoning-rl). The preference-tuning paradigm described here is standard for general chat alignment; reasoning-first frontier recipes are diverging toward RLVR/GRPO. Both paradigms are active in May 2026.
+
+**Notation.** $\pi_\theta$ is the policy being trained, $\pi_\text{ref}$ is the frozen reference model (the SFT checkpoint), $y_w$ is the preferred response ("winner"), $y_l$ is the rejected response ("loser"), and $x$ is the prompt. $\beta > 0$ is the temperature coefficient that controls the KL leash. $\sigma(\cdot)$ denotes the sigmoid function $\sigma(z) = 1/(1 + e^{-z})$.
+
+---
+
+## DPO derivation {#dpo-derivation}
+
+### The RLHF objective
+
+Classical RLHF, as described by Ouyang et al. (2022) for InstructGPT, trains a reward model $r_\phi$ from preference data and then maximises expected reward under a KL constraint that prevents the policy from drifting too far from the reference:
+
+$$\max_{\pi_\theta} \; \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot \mid x)}\bigl[r_\phi(x, y)\bigr] \;-\; \beta \, \mathbb{D}_{\mathrm{KL}}\!\bigl[\pi_\theta(\cdot \mid x) \,\Vert\, \pi_{\mathrm{ref}}(\cdot \mid x)\bigr].$$
+
+The scalar $\beta$ controls the tradeoff: large $\beta$ keeps $\pi_\theta$ near $\pi_\text{ref}$; small $\beta$ allows more reward-seeking movement. Solving this with PPO requires two separate trained objects — the reward model $r_\phi$ and the policy $\pi_\theta$ — plus an online RL loop that generates rollouts from $\pi_\theta$ at training time. DPO eliminates both.
+
+### Closed-form optimal policy
+
+The KL-constrained maximisation has an analytic solution. For any reward function $r$, the unique policy that maximises the objective is (Rafailov et al., 2023, Appendix A.1; originally Peters & Schaal, 2007; Peng et al., 2019):
+
+$$\pi_r(y \mid x) \;=\; \frac{1}{Z(x)} \,\pi_{\mathrm{ref}}(y \mid x) \exp\!\left(\frac{r(x, y)}{\beta}\right), \qquad Z(x) = \sum_y \pi_{\mathrm{ref}}(y \mid x)\exp\!\left(\frac{r(x, y)}{\beta}\right).$$
+
+This is a Boltzmann distribution with energy $-r/\beta$ and base measure $\pi_\text{ref}$. The partition function $Z(x)$ is a sum over all possible responses — intractable to compute for token sequences. Classical RLHF sidesteps $Z(x)$ by using PPO to optimise the objective stochastically. DPO takes a different route.
+
+### The DPO change of variables
+
+Solving the optimal-policy equation for the reward function that produced it:
+
+$$r(x, y) \;=\; \beta \log\frac{\pi_r(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)} \;+\; \beta \log Z(x).$$
+
+This is the DPO change of variables. Any reward function $r$ uniquely determines an optimal policy $\pi_r$, and conversely any policy implicitly defines a reward — up to the additive constant $\beta \log Z(x)$, which depends only on $x$, not on $y$.
+
+The key insight is that this constant is prompt-dependent but *response-independent*. If the reward is compared across two responses $y_1$ and $y_2$ at the same prompt $x$, the constant cancels:
+
+$$r(x, y_1) - r(x, y_2) \;=\; \beta\log\frac{\pi_r(y_1 \mid x)}{\pi_{\mathrm{ref}}(y_1 \mid x)} - \beta\log\frac{\pi_r(y_2 \mid x)}{\pi_{\mathrm{ref}}(y_2 \mid x)}.$$
+
+The intractable $Z(x)$ is gone.
+
+### Bradley–Terry kills the partition function
+
+Preference data is modelled under the Bradley–Terry assumption: the probability that a human prefers response $y_1$ over $y_2$ given prompt $x$ is
+
+$$p^*(y_1 \succ y_2 \mid x) \;=\; \sigma\bigl(r^*(x, y_1) - r^*(x, y_2)\bigr).$$
+
+This depends only on the *difference* of rewards at the same prompt. Substituting the DPO change of variables into this difference — at the same $x$, the $\beta \log Z(x)$ terms cancel identically — yields:
+
+$$p^*(y_1 \succ y_2 \mid x) \;=\; \sigma\!\left(\beta\log\frac{\pi^*(y_1 \mid x)}{\pi_{\mathrm{ref}}(y_1 \mid x)} - \beta\log\frac{\pi^*(y_2 \mid x)}{\pi_{\mathrm{ref}}(y_2 \mid x)}\right).$$
+
+The preference probability is now expressed entirely in terms of the optimal policy and the reference policy. No reward model, no partition function.
+
+---
+
+## The DPO loss {#dpo-loss}
+
+Replacing the (unknown) optimal policy $\pi^*$ with the parametric policy $\pi_\theta$ and maximising the log-likelihood of the observed preferences $(y_w \succ y_l)$ gives the DPO loss:
+
+$$\mathcal{L}_{\mathrm{DPO}}(\pi_\theta;\pi_{\mathrm{ref}}) \;=\; -\,\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}}\!\left[\log\sigma\!\left(\beta\log\frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} \;-\; \beta\log\frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)}\right)\right].$$
+
+Define the **implicit reward** of a response under the current policy:
+
+$$\hat{r}_\theta(x, y) \;\triangleq\; \beta\log\frac{\pi_\theta(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)}.$$
+
+The DPO loss is then a binary cross-entropy classifier that takes the margin $\hat{r}_\theta(x, y_w) - \hat{r}_\theta(x, y_l)$ as the logit. Minimising the loss drives the model to assign higher implicit reward to $y_w$ than to $y_l$.
+
+The gradient has a revealing form (Rafailov et al., 2023, eq. 7):
+
+$$\nabla_\theta \mathcal{L}_{\mathrm{DPO}} \;=\; -\,\beta\,\mathbb{E}\!\left[\underbrace{\sigma\!\bigl(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w)\bigr)}_{\text{importance weight }w}\;\bigl(\nabla_\theta\log\pi_\theta(y_w \mid x) - \nabla_\theta\log\pi_\theta(y_l \mid x)\bigr)\right].$$
+
+Three properties are worth internalising. First, the gradient increases the log-probability of $y_w$ and decreases the log-probability of $y_l$ by equal magnitudes per example; DPO exerts symmetric upward and downward pressure. Second, the importance weight $w = \sigma(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w))$ is large when the model currently orders the pair *incorrectly* (assigns higher implicit reward to the rejected response) — incorrectly ordered pairs dominate the gradient, providing a natural difficulty-weighted curriculum. Third, $\beta$ scales the gradient linearly: too small a $\beta$ produces a vanishing learning signal; too large a $\beta$ allows the policy to move far from $\pi_\text{ref}$ per step and risks reward hacking through spurious features such as response length or hedging phrases.
+
+<Callout variant="note" title="DPO is RLHF collapsed, not replaced">
+DPO and PPO-RLHF are the same Lagrangian under different solution methods. DPO is the *closed-form* solution of the KL-constrained RLHF objective when the reward parameterisation is collapsed onto the policy via the log-ratio change of variables. In the infinite-data, infinite-capacity, Bradley–Terry-consistent limit, both methods converge to the same optimal policy. What DPO gains is the elimination of the reward model and the online RL loop; what it loses is the distributional correction that PPO provides through on-policy rollouts. The chapter on [RLHF and PPO](/textbook/03c-rlhf) returns to this with the explicit reward model and the online loop.
+</Callout>
+
+**What DPO is and is not.** DPO is maximum likelihood on Bradley–Terry preferences under the assumption that a Bradley–Terry-consistent optimal policy exists in the model class. It is not a fundamentally new objective — it is RLHF with the reward parameterised through the policy. In terms of wall-clock cost, DPO is approximately $1\times$ the cost of SFT on the same data, compared to $3$–$10\times$ for PPO-based RLHF. The cost reduction comes entirely from removing the reward model training and the online rollout generation. The price is that DPO is trained on a fixed offline preference dataset; if $\pi_\theta$ moves far from the distribution under which the preferences were labelled, the implicit reward is undefined on the new samples. This motivates the iterative / on-policy DPO recipes described in the frontier-practice section.
+
+---
+
+## IPO: when sigmoid saturates {#ipo}
+
+Azar et al. (2023) identify a degenerate behaviour of DPO in the deterministic-preference limit: when labellers consistently prefer $y_w$ over $y_l$ with probability approaching 1, the Bradley–Terry log-likelihood loss has a nearly-zero gradient as soon as the model achieves any positive margin, because $\sigma(z) \to 1$ and $\log \sigma(z) \to 0$ as $z \to \infty$. The loss does not penalise margins that are unnecessarily large. Because the KL constraint in DPO enters only implicitly through the log-ratio in $\hat{r}_\theta$, it cannot prevent $\pi_\theta$ from assigning near-unit probability to $y_w$ — which is the same as overfitting.
+
+In practice this manifests as overfitting on preference datasets where one option is obviously better, exactly the regime produced by careful label cleanup or AI-labelling with strong raters.
+
+Azar et al. introduce the $\Psi$-PO family, a generalised preference loss parametrised by a free function $\Psi$:
+
+$$\mathcal{L}_{\Psi\text{-PO}} \;=\; -\,\mathbb{E}\!\left[\Psi\!\bigl(p(y_w \succ y_l \mid x)\bigr)\right].$$
+
+DPO corresponds to $\Psi(p) = \log(p/(1-p))$, the logit transform, which is the source of sigmoid saturation. **IPO chooses $\Psi = \text{identity}$**, yielding, after substituting the Bradley–Terry reparametrisation and a $\tau^{-1}$ scaling, a squared loss against a fixed target margin:
+
+$$\mathcal{L}_{\mathrm{IPO}} \;=\; \mathbb{E}_{(x, y_w, y_l)}\!\left[\left(\log\frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \log\frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)} \;-\; \frac{1}{2\tau}\right)^{\!2}\right].$$
+
+The target margin $1/(2\tau)$ is finite, so the squared loss maintains a non-zero gradient even on correctly ordered examples — the regulariser bites throughout training, not only when the model errs.
+
+The theoretical advantage of IPO is genuine: in a two-arm bandit with deterministic preferences, DPO's policy collapses to a Dirac mass on $y_w$, while IPO converges to a well-defined Boltzmann mixture (Azar et al., 2023, §5). The empirical advantage is less consistent. The Hugging Face preference-tuning study (Tunstall, Beeching, von Werra, 2024) ran DPO and IPO head-to-head on Zephyr-7B and OpenHermes-2.5-Mistral-7B with full $\beta$ / $\tau$ sweeps; IPO underperformed DPO on MT-Bench across both base models, with best performance at $\tau = 0.01$ in both cases.
+
+The community consensus by May 2026 is that IPO identifies the right failure mode — DPO can saturate under deterministic preferences — but the cure is not decisive for production-scale preference datasets, which are noisy enough that Bradley–Terry consistency holds in expectation and saturation is rarely the binding failure. IPO is the correct diagnosis. The practical alternative to the saturation problem is length-normalised DPO (Section [Frontier recipes](#frontier-recipes)).
+
+---
+
+## KTO: prospect theory and the unpaired-data setting {#kto}
+
+DPO and IPO both require **paired** preferences: each training example is a triple $(x, y_w, y_l)$. In production annotation pipelines, labellers more often produce **pointwise** judgements — a single thumbs-up or thumbs-down on $(x, y)$ — because pairwise comparison is expensive and requires the labeller to see two completions simultaneously. Converting pointwise to paired by joining within a prompt discards information when only one judgement exists for a given $x$.
+
+KTO (Ethayarajh et al., 2024) is derived from Kahneman–Tversky prospect theory (Kahneman & Tversky, 1979), which models human utility as concave in gains relative to a reference point and convex in losses — the **loss-aversion asymmetry**. Ethayarajh et al. formalise a class of "human-aware losses" (HALOs) that includes DPO, PPO-RLHF, and SLiC as special cases, and derive KTO as the HALO that maximises Kahneman–Tversky utility on pointwise data.
+
+For each sample $(x, y)$ labelled desirable ($y_w$) or undesirable ($y_l$), the KTO value function is:
+
+$$v_{\mathrm{KT}}(x, y) \;=\; \begin{cases} \sigma\!\bigl(\beta\,(\hat{r}_\theta(x, y) - z_0)\bigr) & \text{if } y \text{ is desirable} \\ \sigma\!\bigl(\beta\,(z_0 - \hat{r}_\theta(x, y))\bigr) & \text{if } y \text{ is undesirable} \end{cases}$$
+
+where $z_0$ is the **reference point**, set per batch as the running mean implicit reward under the reference policy, and $\hat{r}_\theta(x, y) = \beta \log(\pi_\theta(y \mid x)/\pi_\text{ref}(y \mid x))$ is the DPO implicit reward. The KTO loss is then:
+
+$$\mathcal{L}_{\mathrm{KTO}} \;=\; \mathbb{E}_{(x,y) \sim \mathcal{D}}\bigl[\lambda\,(1 - v_{\mathrm{KT}}(x, y))\bigr],$$
+
+where $\lambda \in \{\lambda_D, \lambda_U\}$ are separate loss-aversion weights for desirable and undesirable labels. Ethayarajh et al. recommend $\lambda_D = \lambda_U = 1$ on balanced datasets; if the dataset is imbalanced, the weights are adjusted to equalise the effective contribution of desirable and undesirable examples to the gradient.
+
+Three properties define KTO's practical niche. First, data efficiency: KTO outperforms DPO on the same data when the data is genuinely unpaired and pairing would require within-prompt joining that discards single-label examples. At 1B–30B scale on standard paired-converted benchmarks, KTO is competitive with DPO (Ethayarajh et al., 2024, Table 1). Second, robustness to label noise: because the loss treats each example individually rather than comparing a pair, a noisy label affects only its own gradient; a noisy pair in DPO has the wrong sign for *both* sides simultaneously. Third, KTO still requires the reference policy to compute $z_0$ and the implicit reward — it is not reference-free in the sense that SimPO is.
+
+<Sidenote>The HALO framing that Ethayarajh et al. use to derive KTO also recovers DPO as a special case when utility is measured by the logit transform. This is not a coincidence: both methods are derived from the same KL-constrained RLHF objective; they differ only in what human decision model is assumed when constructing the loss from preference data. KTO assumes prospect-theoretic utility; DPO assumes the logit-transform utility that underlies the Bradley–Terry model.</Sidenote>
+
+---
+
+## SimPO: dropping the reference model {#simpo}
+
+For a 70B base model, holding $\pi_\text{ref}$ in memory alongside $\pi_\theta$ during preference tuning roughly doubles VRAM. The reference model serves no purpose other than appearing in the loss formula. Meng, Xia, and Chen (2024) ask whether a preference loss can be defined without it.
+
+The observation is that the DPO implicit reward $\beta \log(\pi_\theta(y \mid x)/\pi_\text{ref}(y \mid x))$ is length-extensive: for a response of $|y|$ tokens, the log-probability is a sum of $|y|$ terms, so longer responses have lower total log-probability and appear "worse" even when they are qualitatively better. This is the **length bias** of DPO. The fix is to normalise by response length. Replacing the log-ratio reward with a length-normalised log-probability:
+
+$$\hat{r}_{\mathrm{SimPO}}(x, y) \;=\; \frac{\beta}{|y|} \sum_{t=1}^{|y|} \log \pi_\theta(y_t \mid x, y_{<t}),$$
+
+removes both the dependence on $\pi_\text{ref}$ and the length bias simultaneously. The SimPO loss is then the Bradley–Terry cross-entropy on this reward, plus a fixed **target margin** $\gamma > 0$ that demands the preferred response score strictly higher than the rejected response by at least $\gamma$:
+
+$$\mathcal{L}_{\mathrm{SimPO}} \;=\; -\,\mathbb{E}\!\left[\log\sigma\!\left(\frac{\beta}{|y_w|}\sum_t \log\pi_\theta(y_{w,t} \mid x, y_{w,<t}) - \frac{\beta}{|y_l|}\sum_t \log\pi_\theta(y_{l,t} \mid x, y_{l,<t}) - \gamma\right)\right].$$
+
+Two design choices are folded into this loss. Length normalisation ($1/|y|$ factor) corrects the length bias and makes per-token log-probabilities comparable across responses of different lengths. The target reward margin $\gamma$ generalises the standard Bradley–Terry loss ($\gamma = 0$ recovers DPO without $\pi_\text{ref}$) and sets a minimum gap that the model must maintain between the preferred and rejected implicit rewards.
+
+Because $\hat{r}_\text{SimPO}$ is now per-token-comparable while the unnormalised DPO reward is $O(|y|)$, the $\beta$ value must be substantially larger to recover comparable margins. Typical SimPO recipes use $\beta = 2$–$10$ with $\gamma = 0.5$–$1.5$, compared to $\beta = 0.01$–$0.1$ for unnormalised DPO.
+
+**A critical caveat.** The "no reference model" claim applies to the loss only. Meng et al. always initialise from an SFT checkpoint; starting from a bare pretrained model without SFT initialisation does not work. The SFT checkpoint plays an implicit reference-anchor role through initialisation, even though it does not appear in the gradient computation. SimPO's claim is more precisely "no reference model in the loss", not "no reference model in the pipeline."
+
+On AlpacaEval-2 and Arena-Hard, Meng et al. report SimPO exceeds DPO by 6.4 and 7.5 points respectively on Llama-3-8B-Instruct. Several subsequent reproductions — including the Tülu-3 ablations (Lambert et al., 2024) — find the gap is small or reversed when DPO is properly length-controlled. The most defensible interpretation is that **SimPO's practical gain over vanilla DPO is primarily the length normalisation**, not the reference-model removal. The Tülu-3 recipe recovers the same benefit by applying length normalisation to the standard DPO loss while retaining $\pi_\text{ref}$ in the numerator and denominator of the implicit reward.
+
+---
+
+## ORPO: SFT and preference in one stage {#orpo}
+
+DPO and the methods above all assume an SFT warm-start. The SFT → DPO sequence consumes two training runs, two optimizer states, and two compute budgets. ORPO (Hong, Lee, and Thorne, 2024) folds them into one.
+
+The argument is straightforward. SFT alone already produces positive preference signal: it raises $\log \pi(y_w \mid x)$ for every chosen response in the demonstration corpus. What SFT lacks is any negative signal on $y_l$. Add a small penalty that pushes $\log \pi(y_l \mid x)$ down, and one training run accomplishes both goals.
+
+ORPO defines the per-response odds:
+
+$$\mathrm{odds}_\theta(y \mid x) \;=\; \frac{\pi_\theta(y \mid x)}{1 - \pi_\theta(y \mid x)}.$$
+
+The ORPO loss for a preference pair $(x, y_w, y_l)$ is a standard SFT NLL term on the chosen response plus a log-odds-ratio penalty:
+
+$$\mathcal{L}_{\mathrm{ORPO}} \;=\; \underbrace{-\log\pi_\theta(y_w \mid x)}_{\mathcal{L}_{\mathrm{NLL}}} \;-\; \lambda \cdot \underbrace{\log\sigma\!\left(\log\frac{\mathrm{odds}_\theta(y_w \mid x)}{\mathrm{odds}_\theta(y_l \mid x)}\right)}_{\mathcal{L}_{\mathrm{OR}}}.$$
+
+The first term is standard SFT on the chosen response. The second term maximises the log of the sigmoid of the log-odds-ratio, driving $\mathrm{odds}(y_w) / \mathrm{odds}(y_l) > 1$. The hyperparameter $\lambda$ controls the relative weight of the preference signal; Hong et al. recommend $\lambda \approx 0.1$–$1.0$.
+
+**Why odds and not log-probability?** The log-probability ratio $\log(\pi(y_w)/\pi(y_l))$ is exactly the DPO implicit reward without $\pi_\text{ref}$. It is unbounded above as $\pi(y_l) \to 0$, which means a model that has already assigned near-zero probability to the rejected response can satisfy this term with an infinitesimal gradient — the same saturation problem that motivated IPO, now in the reference-free setting. The odds ratio $\mathrm{odds}(y_w)/\mathrm{odds}(y_l)$ behaves differently. The log-odds-ratio depends on the *absolute* probabilities of both responses, not just their ratio, which ensures a non-vanishing gradient until both reach extreme confidence simultaneously.
+
+Hong et al. demonstrate that ORPO, starting from a base (non-SFT-tuned) Mistral-7B on UltraFeedback, achieves AlpacaEval-2 length-controlled win-rate of approximately 12.2% and MT-Bench score of 7.32 in a single training stage — competitive with SFT-then-DPO at a lower total compute cost.
+
+In May 2026, ORPO is widely used in academic and open-source small-model recipes (Mistral-ORPO-α and -β, multiple Llama-3-8B-ORPO community models), but no published frontier-scale recipe at or above 70B uses ORPO as the production preference-tuning algorithm. Two reasons are commonly cited: frontier labs already run SFT for reasons independent of preference tuning (tool-use formatting, refusal calibration, multi-turn conventions), so the two-stage cost is already paid; and ORPO does not have an established length-control story at scale.
+
+---
+
+## The β hyperparameter {#beta}
+
+The scalar $\beta$ appears in all five methods but plays a structurally different role in each. Table 1 consolidates these roles and the empirically validated ranges as of May 2026.
+
+<ComparisonTable
+  caption="Table 1. β (or equivalent) across preference-tuning methods. Source URLs in the rightmost column. 'Typical value' reflects frontier-practice defaults as of May 2026."
+  columns={["Method", "β's role", "Typical value (May 2026)", "Source"]}
+  rows={[
+    ["DPO (unnormalised)", "Inverse temperature of the KL-constrained RLHF objective; scales the sigmoid logit and the gradient magnitude.", "0.01–0.1 for 7–13B; 0.1 for Llama-3 405B; sweep 0.01 best on Zephyr, 0.6 best on OpenHermes in HF blog", "https://arxiv.org/abs/2305.18290; https://huggingface.co/blog/pref-tuning"],
+    ["DPO (length-normalised, Tülu-3)", "Same role as DPO, but the implicit reward is now O(1/|y|) per token rather than O(|y|) total; must be rescaled upward to maintain comparable logit magnitudes.", "β = 5 (Tülu-3, OLMo-2; equivalent to ~0.05–0.1 in unnormalised units)", "https://arxiv.org/abs/2411.15124"],
+    ["IPO", "Inverse-square-loss scale; the target log-ratio margin is 1/(2τ), where τ plays the role of β. A smaller τ demands a larger margin.", "τ = 0.01 in HF blog ablation", "https://arxiv.org/abs/2310.12036; https://huggingface.co/blog/pref-tuning"],
+    ["KTO", "Inverse temperature in the sigmoid of the Kahneman–Tversky value function; controls sharpness of the preference boundary.", "β = 0.1 (Ethayarajh et al. default); β = 0.01 in HF blog reproduction", "https://arxiv.org/abs/2402.01306; https://huggingface.co/blog/pref-tuning"],
+    ["SimPO", "Scale on the length-normalised per-token log-probability reward; must be large because the reward is O(1) rather than O(|y|).", "β = 2.0–10.0; standard Llama-3 SimPO recipe β = 2.5, γ = 0.55", "https://arxiv.org/abs/2405.14734"],
+    ["ORPO", "β is absent; the equivalent hyperparameter is λ, the weight on the log-odds-ratio penalty relative to the NLL term.", "λ = 0.1–1.0", "https://arxiv.org/abs/2403.07691"],
+  ]}
+/>
+
+The unifying interpretation across methods is that $\beta$ controls **how much the policy is permitted to move from its initialisation per unit of preference signal.** Small $\beta$ allows large steps per preference pair, enabling faster adaptation but increasing the risk of policy drift and reward hacking through spurious correlates of human preference — response length, hedging phrases, formatting. Large $\beta$ acts as a strong KL leash, producing a model that is very close to $\pi_\text{ref}$ regardless of the preference data, which is also a failure mode.
+
+$\beta$ is the single most consequential hyperparameter in preference tuning, and there is no principled formula for it from first principles. The current best practice (Tunstall et al., 2024) is a fine-grained sweep over the range $\{0.001, 0.005, 0.01, 0.05, 0.1, 0.5\}$ on a held-out preference set, using length-controlled win-rate on a chat benchmark as the selection criterion.
+
+**Implicit-reward distribution diagnostic.** A useful operational check: after several hundred gradient steps, plot the distribution of the held-out implicit reward margin $\hat{r}_\theta(x, y_w) - \hat{r}_\theta(x, y_l)$. A healthy DPO run shows mass concentrated between $+1$ and $+3$ with most of the distribution positive. A long left tail (many pairs with $\hat{r}_l > \hat{r}_w$) indicates $\beta$ is too large and the model cannot move from $\pi_\text{ref}$. A bimodal distribution with spikes at $\pm 10$ or higher indicates $\beta$ is too small and the model has overfit specific preference pairs. The product $\beta \times |\log(\pi_\theta/\pi_\text{ref})|$ is what the sigmoid sees; getting this product in a well-conditioned range is the practical content of $\beta$ selection.
+
+---
+
+## The geometry of DPO {#geometry}
+
+### DPO as a contrastive classifier
+
+The DPO loss is logistic regression in implicit-reward space. The "feature" of each training example is the pair $(\hat{r}_\theta(x, y_w), \hat{r}_\theta(x, y_l))$; the label is "the first exceeds the second." Training drives the decision boundary apart: the model learns to separate preferred and rejected responses in the one-dimensional space of $\hat{r}_\theta(x, \cdot)$. This interpretation is exact, not analogical.
+
+### The implicit KL constraint
+
+Unlike PPO-RLHF, DPO does not have an explicit KL penalty term in the loss. The KL constraint is hidden in the $\pi_\text{ref}$ denominator of the implicit reward: $\hat{r}_\theta(x, y)$ only rewards moves *relative to* $\pi_\text{ref}$, so the loss does not directly reward absolute probability mass on $y_w$ — only probability mass in excess of the reference. This encodes a soft KL leash.
+
+The leash is not, however, equivalent to a hard KL penalty. Pal et al. (2024) observe empirically that DPO can move substantially farther from $\pi_\text{ref}$ than the nominal $\beta$-implied KL budget predicts, particularly on prompts that fall outside the distribution of the labelled preference dataset. This **DPO drift** is a real failure mode, not a theoretical artefact, and is one of the motivations for the NLL regulariser added by the Llama-3 recipe.
+
+### The symmetry between chosen and rejected
+
+DPO's gradient pushes $y_w$ up and $y_l$ down by equal magnitudes per example — the gradient is symmetric in chosen and rejected. There is no "prefer to push $y_w$ more than $y_l$" built into the DPO loss. KTO breaks this symmetry by introducing separate loss-aversion weights $\lambda_D$ and $\lambda_U$. ORPO breaks it more aggressively by applying the NLL term exclusively to $y_w$ and the odds-ratio penalty to the pair; the SFT signal is asymmetric by construction.
+
+### The "secretly a reward model" interpretation
+
+The title of Rafailov et al. (2023) is literal: after DPO training, $\pi_\theta$ is simultaneously a generation model and a reward model. The implicit reward $\hat{r}_\theta(x, y) = \beta\log(\pi_\theta(y \mid x)/\pi_\text{ref}(y \mid x))$ provides a scalar quality score for any $(x, y)$ pair without additional training. This is the mechanism behind iterative DPO: sample new responses from the current $\pi_\theta$, score them with the implicit reward, label the highest-scoring as $y_w$ and lowest-scoring as $y_l$, and run another DPO step. Both Llama-3 and Tülu-3 exploit this structure. The boundary between "iterative DPO with on-policy rollouts" and "RLHF with a learned reward model" is deliberately thin; the [RLHF chapter](/textbook/03c-rlhf) traces the continuum explicitly.
+
+---
+
+## Frontier recipes {#frontier-recipes}
+
+### Tülu-3 (Allen AI, November 2024) — length-normalised DPO
+
+Tülu-3 is the most thoroughly ablated open frontier post-training recipe and the canonical reference for DPO done correctly at scale (Lambert et al., 2024).
+
+The algorithm is **length-normalised DPO**: the DPO implicit reward $\beta \log(\pi_\theta(y \mid x)/\pi_\text{ref}(y \mid x))$ is replaced by $({\beta}/{|y|}) \sum_t \log(\pi_\theta(y_t)/\pi_\text{ref}(y_t))$. Note that $\pi_\text{ref}$ is retained — this is DPO with a per-token-normalised reward, not SimPO. The $\beta$ value is **5** (rescaled upward because the per-token normalisation compresses reward magnitudes; this is equivalent to $\approx 0.05$–$0.1$ on the unnormalised scale).
+
+The preference data is UltraFeedback re-rated by GPT-4 augmented with on-policy completions sampled from the Tülu-3 SFT checkpoint and scored by GPT-4. The on-policy contribution is critical: pure off-policy UltraFeedback gives strictly worse results in the Tülu-3 ablation. The pipeline position is SFT → length-norm DPO → RLVR (verifiable-reward RL), with the DPO stage improving general instruction following before RLVR fine-tunes mathematical reasoning.
+
+The Tülu-3 ablation finding is the most cited single data point on algorithm choice in this space: length-normalised DPO outperformed vanilla DPO, SimPO, and PPO on their internal evaluation suite. The gap to SimPO was small, consistent with the interpretation that SimPO's advantage over DPO is primarily the length normalisation.
+
+OLMo-2 (Allen AI, January 2025) explicitly adopts the Tülu-3 post-training recipe including length-normalised DPO with $\beta = 5$, making this the Allen AI house style as of May 2026.
+
+### Llama-3 herd (Meta, July 2024) — iterative DPO with NLL regularisation
+
+Section 4.1.4 of the Llama-3 report (Llama Team, 2024) is the most cited production DPO specification in the literature. The algorithm is vanilla DPO with three engineering modifications:
+
+**Modification 1 — NLL regulariser.** An additional $0.2 \times$ NLL loss on the chosen response $y_w$ is added to the DPO loss: $\mathcal{L} = \mathcal{L}_{\mathrm{DPO}} + 0.2 \cdot (-\log \pi_\theta(y_w \mid x))$. This is now standard in production DPO (sometimes called "DPO+SFT"). It stabilises training and prevents the catastrophic forgetting of SFT-learned fluency that can occur when the DPO gradient pushes $y_l$ down so aggressively that the model's generation quality regresses.
+
+**Modification 2 — Formatting token masking.** Special tokens — `<|begin_of_text|>`, `<|eot_id|>`, and header markers — are masked out of both $y_w$ and $y_l$ in the DPO loss. Without this, the model learns to push down the end-of-turn token in $y_l$, which then causes it to suppress that token in $y_w$ as well, producing repetition and abrupt truncation artefacts.
+
+**Modification 3 — Iterative.** Six rounds of (1) sample fresh responses from current $\pi_\theta$ → (2) re-rate with a reward model → (3) DPO update. Each round produces a new $\pi_\theta$ which becomes $\pi_\text{ref}$ for the next round, keeping the reference model close to the current policy and preventing the off-policy gap from widening.
+
+The reported hyperparameters are $\beta = 0.1$, learning rate $10^{-6}$ for smaller models and $5 \times 10^{-7}$ for the 405B variant, one epoch per round. The Llama-3 report explicitly states: "We adopt a relatively simple post-training procedure based on supervised finetuning (SFT), rejection sampling (RS), and direct preference optimization (DPO)." PPO-based RLHF is absent.
+
+### Mistral / Mixtral (Mistral AI, 2023–2025) — vanilla DPO
+
+Mixtral-8×7B-Instruct, Mistral-Small, Mistral-Medium, and Mistral-Large all use SFT followed by DPO, with no publicly disclosed deviation from the canonical recipe. The community reproduction Zephyr-7B-β uses $\beta = 0.01$–$0.1$ on the same SFT initialisation and is the standard open reference implementation.
+
+### Qwen-3 (Alibaba, May 2025) — the GRPO exception
+
+Qwen-3's post-training pipeline does not include a standalone DPO stage. The sequence is: long-CoT cold-start SFT → reasoning RL with GRPO → continual SFT for thinking/non-thinking fusion → general-domain RL. Preference signal enters via GRPO's group-relative advantages, not via a pairwise DPO loss (Qwen Team, 2025).
+
+This represents the most significant divergence from the DPO-as-default paradigm in May 2026. Reasoning-first frontier recipes are converging on GRPO or similar policy-gradient methods for the preference signal; general chat-alignment recipes remain DPO-dominant. The [Reasoning RL chapter](/textbook/03f-reasoning-rl) develops GRPO and RLVR in detail.
+
+### SmolLM3's APO + model-merge pipeline {#smollm3-apo}
+
+SmolLM3 (Allal et al., 2025) is the cleanest 2025 open small-model disclosure of a third recipe family: **Anchored Preference Optimization** (APO; D'Oosterlinck et al., 2024) followed by a *post-hoc model merge* with the pre-APO checkpoint. The recipe occupies a distinct point on the preference-tuning landscape — neither standard DPO (the Tülu-3 / OLMo-2 / Llama-3 default) nor GRPO (the Qwen-3 reasoning-first divergence).
+
+APO is a DPO variant that addresses a specific failure mode named in D'Oosterlinck et al. (2024): when the SFT reference and the preference data come from different distributions, the standard DPO objective is underspecified and the optimisation can drift away from useful policy improvement. APO adds an explicit anchor term that ties the optimised policy to the reference distribution at controlled positions, recovering the well-posedness DPO loses in that regime. The loss surface and the $\beta$ role are otherwise close to standard DPO.
+
+SmolLM3's data construction is unusual on two axes. Non-reasoning preferences come from the public **Tulu3 preference dataset** (the same source the Tülu-3 recipe uses). Reasoning preferences are synthetic pairs: the chosen response is sampled from **Qwen3-32B**, the rejected from **Qwen3-0.6B** — a "stronger-vs-weaker model" pair construction that side-steps the cost of human annotation for reasoning-heavy prompts. Training is capped at 24 K sequence length (most reasoning prompts fall below this).
+
+The capability-recovery step is the recipe's most novel ingredient. APO improves alignment-style metrics but the playbook reports it also costs measurable capability on standard benchmarks. SmolLM3 recovers the lost capability with a **linear model merge**: the APO-trained "model soup" is blended with the pre-APO mid-training checkpoint at weights 0.9 / 0.1. Allal et al. (2025) report this merge ratio as the result of an ablation, and frame it as a cheap alternative to running a second SFT pass to restore base capability.
+
+Hyperparameter disclosure for APO is partial — the $\beta$ value, learning rate, batch size, and epoch count are not in the blog or playbook. The 0.9 / 0.1 merge weights and the 24 K maximum sequence length are the disclosed surfaces. Notably, SmolLM3 does **not** apply RLVR or on-policy RL after APO; the linear merge is the final post-training step. This makes SmolLM3 the cleanest open recipe for a non-RL alignment pipeline in 2025–2026.
+
+### The 2026 consensus recipe
+
+The following six-point recipe reflects the practice of Tülu-3, OLMo-2, and Llama-3 as of May 2026 for general chat alignment on a new SFT model:
+
+1. **Algorithm.** Length-normalised DPO with the NLL regulariser ($0.1$–$0.2$ weight on $y_w$) and formatting tokens masked. This is the Tülu-3 / Llama-3 hybrid that combines the two most robustly validated improvements.
+
+2. **$\beta$.** Start at $\beta = 0.1$ (unnormalised) or $\beta = 5$ (length-normalised). Sweep $\pm$ half a decade on a small held-out eval set.
+
+3. **Iterate.** At minimum two rounds. Round-1 preferences from an external rater (UltraFeedback, GPT-4 re-rating); round-2+ from on-policy sampling scored by the round-1 model's implicit reward. Six rounds is the Llama-3 standard; two is the minimum for meaningful distributional correction.
+
+4. **Data mix.** Aim for 30–70% on-policy completions; the remainder off-policy. Avoid re-using prompts seen in the SFT phase — prompt overlap hurts.
+
+5. **Length control.** Length normalisation (the $1/|y|$ factor) is the cheapest robust fix. R-DPO (Park et al., 2024) adds an explicit length-penalty regulariser as an alternative: $\mathcal{L}_{\text{R-DPO}} = \mathcal{L}_{\mathrm{DPO}} + \alpha \cdot \mathbb{E}[|y_w| - |y_l|]$.
+
+6. **Validation.** Track the held-out implicit-reward gap distribution; track response length and refusal-rate drift. Stop when length-controlled win-rate on a chat benchmark (MT-Bench, Arena-Hard, WildBench) plateaus across two consecutive rounds.
+
+---
+
+## Worked example {#worked-example}
+
+This section computes the DPO loss and gradient for a single concrete preference pair, establishing numerical grounding for the derivation. The reader should verify all steps independently; the computation fits in approximately 30 lines of PyTorch.
+
+### Setup
+
+**Prompt.** $x$ = "What is the capital of France?"
+
+**Preferred response.** $y_w$ = "The capital of France is Paris."
+
+**Rejected response.** $y_l$ = "Paris, France is a famous city." (on-topic but does not answer the question)
+
+After passing $y_w$ and $y_l$ through both $\pi_\theta$ and $\pi_\text{ref}$, the total sequence log-probabilities are:
+
+| | $\log \pi_\theta(y_w \mid x)$ | $\log \pi_\text{ref}(y_w \mid x)$ | $\log \pi_\theta(y_l \mid x)$ | $\log \pi_\text{ref}(y_l \mid x)$ |
+|---|---|---|---|---|
+| Value | $-12.4$ | $-15.0$ | $-18.0$ | $-18.5$ |
+
+The interpretation: $\pi_\theta$ has increased its log-probability of the preferred response by $2.6$ nats relative to $\pi_\text{ref}$ (i.e., the current policy already favours $y_w$ relative to reference), and increased its log-probability of the rejected response by only $0.5$ nats relative to $\pi_\text{ref}$. The model is already in the correct direction, but the margin is small.
+
+### Implicit rewards ($\beta = 0.1$)
+
+$$\hat{r}_\theta(x, y_w) \;=\; \beta\,\bigl(\log\pi_\theta(y_w \mid x) - \log\pi_{\mathrm{ref}}(y_w \mid x)\bigr) \;=\; 0.1 \times (-12.4 - (-15.0)) \;=\; 0.1 \times 2.6 \;=\; 0.26.$$
+
+$$\hat{r}_\theta(x, y_l) \;=\; 0.1 \times (-18.0 - (-18.5)) \;=\; 0.1 \times 0.5 \;=\; 0.05.$$
+
+### DPO loss
+
+The logit margin:
+
+$$\Delta \;=\; \hat{r}_\theta(x, y_w) - \hat{r}_\theta(x, y_l) \;=\; 0.26 - 0.05 \;=\; 0.21.$$
+
+The DPO loss for this single pair:
+
+$$\mathcal{L} \;=\; -\log\sigma(0.21) \;=\; -\log(0.5523) \;=\; 0.5935.$$
+
+For comparison, a random policy with $\Delta = 0$ has loss $-\log(0.5) = 0.6931$. The model has captured a small but genuine margin, reducing the loss by approximately 0.10 nats from the uninformative baseline.
+
+### Gradient sign and importance weight
+
+The importance weight for this pair:
+
+$$w \;=\; \sigma\!\bigl(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w)\bigr) \;=\; \sigma(-0.21) \;=\; 0.4477.$$
+
+The gradient update (schematic, sign only):
+
+$$\nabla_\theta\mathcal{L} \;=\; -\beta \cdot 0.4477 \cdot \bigl(\nabla_\theta\log\pi_\theta(y_w \mid x) - \nabla_\theta\log\pi_\theta(y_l \mid x)\bigr).$$
+
+The negative sign in front means the gradient step *increases* $\log\pi_\theta(y_w \mid x)$ and *decreases* $\log\pi_\theta(y_l \mid x)$. After the update, the implicit-reward margin $\Delta$ will be slightly larger — say $0.22$ — and the loss will decrease accordingly.
+
+### The incorrectly ordered case
+
+Suppose the log-probabilities were reversed: $\log\pi_\theta(y_w \mid x) = -18.0$, $\log\pi_\theta(y_l \mid x) = -12.4$. Then:
+
+$$\hat{r}_\theta(x, y_w) = 0.1 \times (-18.0 - (-15.0)) = -0.3, \qquad \hat{r}_\theta(x, y_l) = 0.1 \times (-12.4 - (-18.5)) = 0.61.$$
+
+$$\Delta = -0.3 - 0.61 = -0.91, \qquad \mathcal{L} = -\log\sigma(-0.91) = -\log(0.287) = 1.247.$$
+
+The loss is more than twice as large. The importance weight becomes $w = \sigma(0.91) = 0.713$ — significantly larger than the $0.4477$ from the correctly ordered case — so the gradient step is also larger. Examples on which the model is most wrong dominate the gradient by design.
+
+### What β does
+
+Re-run the original example with $\beta = 0.5$: $\Delta = 0.5 \times 2.1 = 1.05$, $\mathcal{L} = -\log\sigma(1.05) = 0.288$. The loss is lower because the sigmoid sees a larger logit, but the gradient now moves $\pi_\theta$ farther from $\pi_\text{ref}$ per step. With $\beta = 0.01$: $\Delta = 0.01 \times 2.1 = 0.021$, $\mathcal{L} = -\log\sigma(0.021) = 0.689$ — essentially the uninformative baseline, because the model's log-ratio differences are too small to produce a useful training signal.
+
+The practical message: $\beta$ multiplied by the log-ratio margin is what $\sigma$ sees. Get the product into the range $[0.1, 3]$ for typical training dynamics; outside this range, either the loss is too flat (small product) or the gradient pushes the policy too aggressively away from $\pi_\text{ref}$ (large product).
+
+---
+
+## Summary {#summary}
+
+Preference tuning is the standard mechanism for injecting negative feedback after [SFT](/textbook/03a-sft). DPO derives from the same KL-constrained RLHF objective as classical PPO-RLHF; the derivation shows that the intractable partition function cancels under the Bradley–Terry preference model, leaving a simple binary cross-entropy loss on log-ratio margins. The implicit reward $\hat{r}_\theta(x, y) = \beta\log(\pi_\theta/\pi_\text{ref})$ makes every DPO-trained language model simultaneously a reward model.
+
+The four 2024 variants address specific failure modes of DPO:
+
+- **IPO** replaces the sigmoid cross-entropy with a squared loss against a fixed target margin, preventing saturation under deterministic preferences. It is theoretically sound but empirically inconsistent at production scale.
+- **KTO** operates on unpaired pointwise labels using a Kahneman–Tversky utility function, making it robust to label noise and efficient when paired data is expensive to collect.
+- **SimPO** removes the reference model and applies length normalisation, gaining memory efficiency; its primary practical advantage over DPO appears to be the length normalisation rather than the reference-model removal.
+- **ORPO** merges SFT and preference tuning into a single training stage via an odds-ratio penalty, eliminating the two-stage compute cost at the price of forgoing the benefits of an independent SFT phase.
+
+The $\beta$ hyperparameter — the single most consequential design choice in preference tuning — controls the KL leash between the trained policy and the reference model across all methods. There is no principled formula for $\beta$; log-scale sweeps over the range $0.001$–$0.5$ evaluated on a held-out preference set are the current best practice.
+
+In May 2026, the default frontier recipe is length-normalised DPO with an NLL regulariser, formatting-token masking, and at least two iterative rounds of on-policy data collection. This recipe is documented in Tülu-3, OLMo-2, and Llama-3. Qwen-3 represents the leading alternative paradigm — GRPO-based preference learning without a separate DPO stage — which is covered in [Reasoning RL](/textbook/03f-reasoning-rl). The boundary between iterative DPO with on-policy rollouts and full RLHF with an explicit reward model and PPO is thin; [the RLHF chapter](/textbook/03c-rlhf) traces the continuum.
+
+---
+
+<Sources items={[
+  {
+    authors: "Rafailov, R., Sharma, A., Mitchell, E., Manning, C. D., Ermon, S., and Finn, C.",
+    year: 2023,
+    title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model",
+    venue: "NeurIPS 2023",
+    url: "https://arxiv.org/abs/2305.18290",
+    note: "Introduces DPO: derives the closed-form RLHF-optimal policy, the log-ratio implicit reward, and the Bradley–Terry MLE loss. The theoretical foundation for this chapter."
+  },
+  {
+    authors: "Azar, M. G., Rowland, M., Piot, B., Guo, D., Calandriello, D., Valko, M., and Munos, R.",
+    year: 2023,
+    title: "A General Theoretical Paradigm to Understand Learning from Human Preferences",
+    venue: "AISTATS 2024",
+    url: "https://arxiv.org/abs/2310.12036",
+    note: "Introduces Ψ-PO family and IPO; proves DPO's saturation under deterministic preferences; the bandit experiment comparing DPO and IPO convergence."
+  },
+  {
+    authors: "Ethayarajh, K., Xu, W., Muennighoff, N., Jurafsky, D., and Kiela, D.",
+    year: 2024,
+    title: "KTO: Model Alignment as Prospect Theoretic Optimization",
+    venue: "ICML 2024",
+    url: "https://arxiv.org/abs/2402.01306",
+    note: "Derives KTO from Kahneman–Tversky prospect theory; introduces the HALO family; demonstrates competitiveness with DPO at 1B–30B scale on pointwise data."
+  },
+  {
+    authors: "Meng, Y., Xia, M., and Chen, D.",
+    year: 2024,
+    title: "SimPO: Simple Preference Optimization with a Reference-Free Reward",
+    venue: "NeurIPS 2024",
+    url: "https://arxiv.org/abs/2405.14734",
+    note: "Introduces length-normalised reference-free reward and target margin γ; reports 6.4 / 7.5 point gains over DPO on AlpacaEval-2 / Arena-Hard for Llama-3-8B-Instruct."
+  },
+  {
+    authors: "Hong, J., Lee, N., and Thorne, J.",
+    year: 2024,
+    title: "ORPO: Monolithic Preference Optimization without Reference Model",
+    venue: "EMNLP 2024",
+    url: "https://arxiv.org/abs/2403.07691",
+    note: "Derives ORPO as a single-stage SFT + preference-tuning objective via log-odds-ratio penalty; demonstrates on Mistral-7B starting from base (non-SFT) checkpoint."
+  },
+  {
+    authors: "Llama Team (Meta AI)",
+    year: 2024,
+    title: "The Llama 3 Herd of Models",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2407.21783",
+    note: "Section 4.1.4: iterative DPO recipe, β = 0.1, 6 rounds, NLL regulariser (0.2 weight), formatting-token masking, no PPO. The canonical production DPO specification."
+  },
+  {
+    authors: "Lambert, N., Morrison, J., Pyatkin, V., Huang, S., Ivison, H., Brahman, F., Miranda, L. J. V., Ammanabrolu, P., Smith, N. A., Zettlemoyer, L., and Hajishirzi, H.",
+    year: 2024,
+    title: "Tülu 3: Pushing Frontiers in Open Language Model Post-Training",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2411.15124",
+    note: "Most thorough open ablation of preference-tuning algorithms; β = 5 for length-normalised DPO; shows on-policy data is critical; DPO beats SimPO and PPO on their eval suite."
+  },
+  {
+    authors: "OLMo Team (Allen AI)",
+    year: 2025,
+    title: "2 OLMo 2 Furious",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2501.00656",
+    note: "Adopts Tülu-3 post-training recipe including length-normalised DPO with β = 5; replication signal for the Allen AI consensus recipe."
+  },
+  {
+    authors: "Qwen Team (Alibaba)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Post-training pipeline: cold-start SFT → GRPO → continual SFT → general RL; no standalone DPO stage. Primary counter-example to DPO-as-universal-default."
+  },
+  {
+    authors: "Christiano, P., Leike, J., Brown, T. B., Martic, M., Legg, S., and Amodei, D.",
+    year: 2017,
+    title: "Deep Reinforcement Learning from Human Preferences",
+    venue: "NeurIPS 2017",
+    url: "https://arxiv.org/abs/1706.03741",
+    note: "Original RLHF paper; establishes that human raters prefer model samples to demonstrations when blinded; the preference-signal motivation for post-SFT alignment."
+  },
+  {
+    authors: "Stiennon, N., Ouyang, L., Wu, J., Ziegler, D. M., Lowe, R., Voss, C., Radford, A., Amodei, D., and Christiano, P.",
+    year: 2020,
+    title: "Learning to Summarize from Human Feedback",
+    venue: "NeurIPS 2020",
+    url: "https://arxiv.org/abs/2009.01325",
+    note: "Applies RLHF to summarisation; confirms that models trained from human preferences outperform supervised baselines even when the baseline uses high-quality reference summaries."
+  },
+  {
+    authors: "Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A., Schulman, J., Hilton, J., Kelton, F., Miller, L., Simens, M., Askell, A., Welinder, P., Christiano, P., Leike, J., and Lowe, R.",
+    year: 2022,
+    title: "Training Language Models to Follow Instructions with Human Feedback (InstructGPT)",
+    venue: "NeurIPS 2022",
+    url: "https://arxiv.org/abs/2203.02155",
+    note: "The RLHF objective that DPO is derived from; PPO-based training with KL constraint; the formulation that DPO eliminates the reward model and online loop from."
+  },
+  {
+    authors: "Bradley, R. A. and Terry, M. E.",
+    year: 1952,
+    title: "Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons",
+    venue: "Biometrika 39(3/4)",
+    url: "https://www.jstor.org/stable/2334029",
+    note: "Original Bradley–Terry model; the preference-probability model $p(y_1 \\succ y_2) = \\sigma(r_1 - r_2)$ at the core of DPO's derivation."
+  },
+  {
+    authors: "Kahneman, D. and Tversky, A.",
+    year: 1979,
+    title: "Prospect Theory: An Analysis of Decision under Risk",
+    venue: "Econometrica 47(2)",
+    url: "https://www.jstor.org/stable/1914185",
+    note: "Original prospect theory; the loss-aversion asymmetry and reference-point utility that Ethayarajh et al. (2024) use to derive KTO."
+  },
+  {
+    authors: "Peng, X., Kumar, A., Zhang, G., and Levine, S.",
+    year: 2019,
+    title: "Advantage-Weighted Regression: Simple and Scalable Off-Policy Reinforcement Learning",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/1910.00177",
+    note: "Derives the closed-form KL-constrained optimal policy (the Boltzmann form that DPO inverts); predates the DPO paper but establishes the key mathematical result."
+  },
+  {
+    authors: "Park, R., Rafailov, R., Ermon, S., and Finn, C.",
+    year: 2024,
+    title: "Disentangling Length from Quality in Direct Preference Optimization",
+    venue: "ACL 2024 Findings",
+    url: "https://arxiv.org/abs/2403.19159",
+    note: "Introduces R-DPO: adds a length-penalty regulariser to the DPO loss to disentangle response length from quality. Alternative to length normalisation for controlling length bias."
+  },
+  {
+    authors: "Pal, A., Karkhanis, D., Roberts, M., Dooley, S., Gokaslan, A., and Biderman, S.",
+    year: 2024,
+    title: "Smaug: Fixing Failure Modes of Preference Optimisation with DPO-Positive",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2402.13228",
+    note: "Documents DPO drift: trained policies move farther from π_ref than the β-implied KL predicts; introduces DPO-Positive to correct the failure mode on noisy preference datasets."
+  },
+  {
+    authors: "Liu, Y., Zhao, T., Joshi, R., Khalman, M., Saleh, M., Liu, P. J., and Liu, J.",
+    year: 2024,
+    title: "LiPO: Listwise Preference Optimization through Learning-to-Rank",
+    venue: "arXiv",
+    url: "https://arxiv.org/abs/2402.01878",
+    note: "Extends DPO to listwise / Plackett–Luce preferences over ranked response sets; not yet standard at frontier scale but the leading listwise variant."
+  },
+  {
+    authors: "Tunstall, L., Beeching, E., and von Werra, L.",
+    year: 2024,
+    title: "Preference Tuning LLMs with Direct Preference Optimization Methods",
+    venue: "Hugging Face Blog",
+    url: "https://huggingface.co/blog/pref-tuning",
+    note: "Head-to-head comparison of DPO, IPO, and KTO on Zephyr-7B and OpenHermes-2.5-Mistral-7B with full β sweeps; most comprehensive published hyperparameter study."
+  },
+  {
+    authors: "Xiong, W., Dong, H., Ye, C., Wang, Z., Zhong, H., Ji, H., Jiang, N., and Zhang, T.",
+    year: 2023,
+    title: "Iterative Preference Learning from Human Feedback: Bridging Theory and Practice for RLHF under KL Constraint",
+    venue: "ICML 2024 Workshop",
+    url: "https://arxiv.org/abs/2312.11456",
+    note: "Theoretical and empirical treatment of iterative / on-policy DPO; the convergence analysis that motivates multi-round preference tuning."
+  },
+  {
+    authors: "Dong, H., Xiong, W., Pang, B., Wang, H., Zhao, H., Zhou, Y., Jiang, N., Sahoo, D., Xiong, C., and Zhang, T.",
+    year: 2024,
+    title: "RLHF Workflow: From Reward Modeling to Online RLHF",
+    venue: "TMLR 2024",
+    url: "https://arxiv.org/abs/2405.07863",
+    note: "The RLHFlow recipe; documents the continuum from offline DPO through iterative DPO to full online RLHF; practical companion to the Xiong et al. theory."
+  },
+  {
+    authors: "D'Oosterlinck, K., Xu, W., Develder, C., Demeester, T., Singh, A., Potts, C., and Kiela, D.",
+    year: 2024,
+    title: "Anchored Preference Optimization and Contrastive Revisions: Addressing Underspecification in Alignment",
+    venue: "arXiv:2408.06266",
+    url: "https://arxiv.org/abs/2408.06266",
+    note: "Introduces APO; identifies the underspecification failure of DPO when the SFT reference and preference data come from different distributions; supplies the anchor term used in the SmolLM3 recipe."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Source for the SmolLM3 APO + model-merge pipeline: Tulu3 + synthetic Qwen3-32B/0.6B pairs, 24 K max sequence length, 0.9 / 0.1 linear merge with mid-training checkpoint as the final post-training step."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "The Smol Training Playbook",
+    venue: "Hugging Face Spaces",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook",
+    note: "Companion operational disclosure for the SmolLM3 post-training recipe; ablation discussion behind the 0.9 / 0.1 merge weight choice."
+  },
+]} />

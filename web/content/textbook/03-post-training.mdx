@@ -1,0 +1,163 @@
+---
+slug: 03-post-training
+title: Post-training and reasoning — orientation
+description: How to read this module, the dependency chain across chapters, the notation conventions, and what the SFT → preference → RL → reasoning → agentic pipeline looks like in May 2026.
+order: 27
+chapter: 27
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 22
+depends_on: [02-distributed, 01-pretraining]
+provides: []
+last_reviewed: 2026-05-14
+---
+
+## About this module {#about}
+
+This module is a self-contained textbook on what happens after a base model is handed off to a post-training team. It covers the eight clusters of decisions a frontier-lab post-training team faces between the moment the base model is frozen and the moment a deployable assistant ships: how to do supervised fine-tuning, how to encode human preferences without RL, how to do RLHF with PPO at LLM scale, how to scale alignment via Constitutional AI and RLAIF, how to verify rewards from math and code execution, how to run the o-series / R1-style reasoning RL with GRPO, how to use step-level process supervision, and how to post-train agentic tool use.
+
+After finishing the eight chapters, a reader should be able to read the *post-training* section of any 2024–2026 frontier tech report — Llama-3's six-round iterative DPO, Tülu-3's SFT-DPO-RLVR cascade, DeepSeek-R1's cold-start + RL-only recipe, Anthropic's Constitutional AI for Claude, OpenAI's deliberative alignment for the o-series, SWE-RL's 273K-PR GRPO training — and understand each engineering decision: which loss objective, which reward function, which data-collection protocol, which RL infrastructure choice.
+
+The module does **not** teach the architecture itself ([Module 0](/textbook/00-prerequisites)) or pretraining ([Module 1](/textbook/01-pretraining)) or distributed-training internals ([Module 2](/textbook/02-distributed)). It treats them as fixed inputs. It also does not cover inference and serving (future Module 4), evaluation methodology (future Module 5), or mechanistic interpretability (future Module 5).
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier-model practice as of May 14, 2026. The DPO derivation, PPO clipped surrogate, GRPO objective, and Bradley–Terry preference model are durable mathematics. The comparison tables — which lab uses DPO vs PPO, which uses PRMs vs outcome rewards, the specific reasoning-RL recipes — age fastest. Reasoning RL in particular is the most-moving area in frontier work; recheck comparison tables every 3–6 months against the next round of public reports and system cards.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+Eight chapters in dependency order from the simplest (SFT) to the most-frontier (reasoning RL and agentic tool use). Each chapter builds on its predecessor; the [reading-order recommendations](#reading-order) section gives shortcuts.
+
+**[Chapter 28 — Supervised fine-tuning](/textbook/03a-sft)**
+The same cross-entropy loss as pretraining, applied to a different data distribution with assistant-token loss masking. The 1k-LIMA-examples vs Tülu-3's 939k debate, resolved with the modern position that quality and diversity dominate raw count. Five families of data sources: human-annotated, distilled from a stronger model, self-instruct synthetic, persona-driven (Tülu-3's method), and rejection-sampled from the model itself. Chat templates (ChatML, Llama-3 special tokens) and the three loss-masking variants (mask system / mask user / unmask all). A worked 7B SFT recipe with 1M examples and concrete hyperparameters.
+
+**[Chapter 29 — Preference tuning (DPO, IPO, KTO, SimPO, ORPO)](/textbook/03b-preference-tuning)**
+The DPO derivation from the RLHF objective: closed-form optimal policy under KL constraint, change of variables, Bradley–Terry partition-function cancellation, MLE loss. The loss $-\log \sigma(\beta \log \pi_\theta(y_w|x)/\pi_{\text{ref}}(y_w|x) - \beta \log \pi_\theta(y_l|x)/\pi_{\text{ref}}(y_l|x))$ and the geometry it imposes. The 2024 successors: IPO (Azar — no sigmoid overfit), KTO (Ethayarajh — unpaired data), SimPO (Meng — no reference model), ORPO (Hong — SFT + preference in one stage). The β hyperparameter and the 2025–2026 length-normalised DPO variants. A worked numerical computation with $\beta = 0.1$ on a single preference pair.
+
+**[Chapter 30 — RLHF, reward modeling, and PPO at LLM scale](/textbook/03c-rlhf)**
+The Bradley–Terry preference model $P(y_w \succ y_l | x) = \sigma(r(x, y_w) - r(x, y_l))$ and the resulting RM training loss. The PPO clipped surrogate $\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}[\min(\rho_t \hat{A}_t, \text{clip}(\rho_t, 1-\epsilon, 1+\epsilon) \hat{A}_t)]$ with the token-level KL penalty to the reference policy. The InstructGPT four-stage pipeline (pretrain → SFT → RM → PPO). Reward hacking: length bias, sycophancy, mode collapse, and Gao et al.'s over-optimisation scaling law. Llama-2's V1→V5 iterative rejection-sampling + PPO recipe and Tülu-3's PPO LRs ($3 \times 10^{-7}$ at 8B, $1 \times 10^{-7}$ at 70B). Why DPO largely displaced PPO in open-weights but PPO survives at closed labs that exploit on-policy exploration. RLHF infrastructure: actor/learner separation, vLLM rollouts, OpenRLHF.
+
+**[Chapter 31 — RLAIF and Constitutional AI](/textbook/03d-rlaif-constitutional)**
+Bai et al.'s Constitutional AI two-stage pipeline (SL-CAI critique–revise + RL-CAI preference labelling) with the verbatim wifi-hacking worked example. The constitution itself, evolving from 16 principles (2022) to ~60 (2023) to a ~23,000-word specification (2026). RLAIF's harmlessness gains: 88% (RLAIF) vs 76% (RLHF) vs 64% (SFT). Judge-pattern taxonomy: pairwise, pointwise (Tülu-3's 1–5 across 4 axes on 939k prompts), direct, and verifier-as-judge. Cost-quality tradeoff: $1–10 per human preference vs ~$0.01 per AI preference. Four failure modes of LLM judges: length bias, position bias, self-preference (GPT-4 scores 0.520 on bias benchmarks), homogenisation.
+
+**[Chapter 32 — RL with verifiable rewards (RLVR)](/textbook/03e-rlvr)**
+The verifier-as-reward pattern $r(x, y) = \text{verifier}(x, y) \in \{0, 1\}$. Math verifiers (symbolic check, ground-truth match) on MATH and GSM8K. Code verifiers (unit test, sandbox execution) on HumanEval, CodeContests, LiveCodeBench. Tool-call grounding (API return correctness). The DeepSeek-R1-Zero pure-RL results: AIME 15.6% → 71.0% with cons@64 reaching 86.7%. Reward sparsity (most rollouts get $r = 0$) and the curriculum strategies that mitigate it. A worked GSM8K-verifier example on a concrete rollout.
+
+**[Chapter 33 — Reasoning RL: o1, R1, GRPO](/textbook/03f-reasoning-rl)**
+The keystone reasoning-RL chapter. The Group Relative Policy Optimisation derivation: a policy gradient with a group-relative baseline that removes the need for a separate value head. The full GRPO loss with the $k_3$ KL estimator. The DeepSeek-R1 four-stage pipeline: cold-start SFT → R1-Zero-style RL → rejection-sampled SFT → safety-aligned RL. R1-Distill-Qwen-32B's distilled performance (72.6% AIME, 94.3% MATH-500, 1691 Codeforces) from R1's long-CoT trajectories. The "aha moment" — emergent self-correction during RL training. The o-series long-CoT story inferred from system cards. Test-time compute scaling and the per-token cost of longer thoughts. May 2026 reasoning-model landscape across DeepSeek-R1, OpenAI o3 / o4-mini, GPT-5, Claude 4.7 Opus thinking, Gemini 3 thinking, Qwen-3-Thinking, Kimi K2.
+
+**[Chapter 34 — Process reward models](/textbook/03g-process-rewards)**
+PRM vs ORM (outcome reward model): step-level rewards $r(s_t)$ vs final-answer reward $r(s_T)$. Lightman et al.'s PRM800K — 800K step-level human annotations on 75K solutions to 12K MATH problems, labelled `+1` / `0` / `-1`. Math-Shepherd's automated step-label collection. ReST-MCTS's MCTS-based step search. ProcessBench: DeepSeek-R1 at 83.5 F1 exceeds dedicated PRMs (Skywork-PRM-7B at 42.1 F1). The DeepSeek-R1 three-point indictment of PRMs in main pipelines: step-definition ambiguity, intermediate-correctness uncertainty, reward hacking. Where PRMs still win in May 2026: very long chains, sparse outcome rewards, offline reranking.
+
+**[Chapter 35 — Agentic post-training: tool-call SFT and agentic RL](/textbook/03h-tool-use-and-agents)**
+The "tools are extra tokens" framing with loss masking on tool-result tokens. Tool-call SFT: Toolformer's loss-reduction filter, Gorilla's retrieval-aware variant, ToolBench's 16,464-API benchmark. ReAct's Thought/Action/Observation format with +34 on ALFWorld and +10 on WebShop. OpenAI function-calling and Anthropic's harmony special tokens. Computer Use SFT: Anthropic CU (OSWorld 14.9% → 22.0%) and OpenAI Operator (OSWorld 38.1%, WebArena 58.1%, WebVoyager 87%). SWE-RL with 273K PRs, Llama-3.3-70B, difflib.SequenceMatcher reward, 41.0% on SWE-bench Verified after 512 H100 × 32h. The convergent 2026 agentic stack across Claude Opus 4.7 + MCP, OpenAI o3 / o4 native tools, Gemini 3 tool integration.
+
+---
+
+## Prerequisites for this module {#prereqs}
+
+The hard prerequisite is [Module 1 — Pretraining at scale](/textbook/01-pretraining), and through it [Module 0 — Prerequisites](/textbook/00-prerequisites). The module assumes the reader has internalised: the transformer block and FLOPs accounting, AdamW and learning-rate schedules, the SwiGLU MLP, the RMSNorm and QK-norm story, and BPE tokenisation. [Module 2 — Distributed training](/textbook/02-distributed) is a softer prerequisite — the post-training infrastructure section of Chapter 30 references actor/learner separation, vLLM rollouts, and FSDP-2 without re-defining them.
+
+Beyond Modules 0–2, two extra background expectations help:
+
+**Reinforcement-learning vocabulary at the textbook level.** Words like "policy", "value function", "advantage", "trajectory", "rollout", "on-policy", "off-policy", and "KL penalty" appear without re-definition. A reader who has worked through chapters 1–8 of Sutton & Barto, or who has trained a PPO agent on CartPole, will recognise the model. A reader without that background should read Chapter 30's reward-modeling section twice and consult the cited Schulman 2017 PPO paper if confused.
+
+**Comfort with the Bradley–Terry preference model.** Several chapters quote $P(y_w \succ y_l | x) = \sigma(r(x, y_w) - r(x, y_l))$ without re-deriving. Chapter 30 derives it; Chapters 29, 31, and 34 use it directly.
+
+**Reading a system card.** Several worked examples reference OpenAI o-series system cards, Anthropic Claude model cards, and DeepSeek-R1's arXiv paper. The reader does not need to read those documents in full, but should be willing to follow links to specific sections when the chapter flags them.
+
+---
+
+## The shape of a 2026 post-training run {#shape}
+
+Some scale to calibrate expectations across the module:
+
+- **Cost relative to pretraining.** Frontier post-training in 2026 typically costs 5–20% of the pretraining compute that produced the base model. Llama-3 post-training used $\sim 10\%$ of pretraining FLOPs; DeepSeek-R1's reasoning RL used a smaller fraction (the R1-Zero phase is on the order of $10^{20}$ FLOPs against a base trained at $\sim 10^{25}$ FLOPs).
+- **Data scale.** SFT data ranges from 1k (LIMA) to 10–30M examples (Llama-3's full mix, much of it synthetic). Preference data ranges from 100k (academic DPO recipes) to 1M+ (Tülu-3's 939k prompts). RLVR rollouts at frontier scale are in the millions of trajectories.
+- **Pipeline length.** Llama-3 ran *six* iterative SFT+DPO rounds. DeepSeek-R1 has *four* phases (cold-start SFT, RL-only, rejection-sampled SFT, safety-aligned RL). Tülu-3 has *three* (SFT, DPO, RLVR). The "post-training" name hides a multi-month engineering effort that often dominates the wall-clock between base-model freeze and deployment.
+- **Reasoning compute.** The o-series and R1 reasoning RL recipes use $10^4$ to $10^6$ test-time tokens per query at inference. Training-time compute for the RL phase is dominated by *rollout cost* (generating long-CoT trajectories) rather than gradient compute — flipping the pretraining-era assumption that compute is dominated by the matmuls.
+- **Reward function landscape.** Frontier May 2026 systems mix preference-trained reward models, AI-judge feedback, and verifiable rewards in proportions that depend on capability target. Llama-3 leans on human + AI hybrid; DeepSeek-R1 leans on RLVR (math/code) plus rule-based rewards (format); o-series is inferred to use a heavy RLVR + deliberative-alignment mix.
+
+---
+
+## Notation conventions {#notation}
+
+The module uses the following symbols. Chapter-local overloads are explicitly flagged on first use.
+
+- $\pi_\theta$ — the post-trained policy under optimisation.
+- $\pi_{\text{ref}}$ — the reference policy, usually the SFT model frozen.
+- $x$ — prompt; $y$ — response (possibly multi-turn).
+- $y_w, y_l$ — winning and losing response in a preference pair.
+- $r_\phi(x, y)$ — reward model with parameters $\phi$.
+- $\beta$ — KL or preference-strength coefficient (Chapter 29 DPO, Chapter 30 PPO).
+- $\sigma$ — sigmoid.
+- $\mathcal{D}$ — preference dataset.
+- $\rho_t = \pi_\theta(y_t | s_t) / \pi_{\theta_\text{old}}(y_t | s_t)$ — PPO importance ratio at token $t$.
+- $\hat{A}_t$ — token-level advantage estimate.
+- $\epsilon$ — PPO clip range (typically 0.2 in supervised RL; smaller in LLM RLHF).
+- $G$ — group size in GRPO.
+- $r_i$ — verifier reward for trajectory $i$.
+- $A_i = (r_i - \mu_G) / \sigma_G$ — group-relative advantage (GRPO).
+- $\hat{\mathcal{D}}_{\text{KL}}$ — KL divergence to reference policy.
+
+Module-wide notation inherited from Modules 0–2: $N$ (parameters), $D$ (tokens), $C$ (FLOPs), $W$ (world size), $\eta$ (learning rate), $B$ (batch size).
+
+---
+
+## Reading order recommendations {#reading-order}
+
+### First time through
+
+Chapters 28 through 35 in order. The math builds cumulatively: SFT (Chapter 28) is the simplest objective. Preference tuning (Chapter 29) introduces the Bradley–Terry framing and the DPO closed-form derivation. RLHF (Chapter 30) replaces the closed form with explicit reward modeling and PPO. Constitutional AI / RLAIF (Chapter 31) replaces human preferences with AI judges. RLVR (Chapter 32) replaces preference rewards with verifier rewards. Reasoning RL (Chapter 33) builds GRPO on top of RLVR. Process rewards (Chapter 34) is the step-level variant. Agentic post-training (Chapter 35) generalises the reward to sandboxed environments. Total reading time is six to seven hours of attentive reading.
+
+### For a post-training engineer at a small lab
+
+Chapters 28, 29, 32, 35. SFT is the floor; preference tuning is what works in open-weights as of 2026; RLVR is the new compute-efficient lever; agentic post-training is where the most-recent published recipes live (SWE-RL, AgentR1).
+
+### For a research scientist studying reasoning
+
+Chapters 32, 34, 33, 31. The order reverses the chapter sequence because GRPO is the *result* whose derivation depends on RLVR (Chapter 32), process supervision is the *contrast* (Chapter 34), the reasoning-RL chapter (Chapter 33) is the synthesis, and Constitutional AI / RLAIF (Chapter 31) is the alignment-side counterweight that frontier labs run *alongside* reasoning RL.
+
+### For a reader evaluating a frontier system card
+
+Read [§Frontier-lab landscape](/textbook/03f-reasoning-rl#frontier-landscape) in Chapter 33 first to calibrate the reasoning-model landscape. Then [§Frontier practice](/textbook/03d-rlaif-constitutional#frontier-practice) in Chapter 31 for the alignment story. Then [§Frontier recipes](/textbook/03c-rlhf#tulu3-ppo) in Chapter 30 and [§Frontier practice](/textbook/03h-tool-use-and-agents#frontier-practice) in Chapter 35 for the tool-integration angle. The other chapters fill in the *why* once a specific recipe needs interpretation.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module, a reader should be able to do all of the following without consulting external references:
+
+1. **Read the post-training section of any 2024–2026 frontier tech report** and identify the SFT → preference → RL → reasoning pipeline stage boundaries and the loss objective at each stage.
+2. **Derive the DPO loss from the RLHF objective** in five steps (closed-form optimal policy → change of variables → BT partition cancellation → MLE → gradient).
+3. **Derive the GRPO loss from the policy gradient** with the group-relative baseline argument.
+4. **Compare PRM vs ORM tradeoffs concretely** — step-definition cost, reward hacking susceptibility, ProcessBench evidence, when each wins.
+5. **Design a verifier-reward function for a custom domain** (e.g., SQL query correctness, regulatory compliance, contract review) following the RLVR pattern.
+6. **Predict reward-hacking failure modes** before they manifest — length bias, sycophancy, position bias, mode collapse — given a specific reward function.
+7. **Argue from first principles for or against** a specific post-training choice. The module's "no verdicts" voice gives the reader the evidence to form their own conclusions.
+
+The module does **not** claim to teach the operational craft — running a PPO infrastructure stack at frontier scale, debugging a reward-model collapse, or balancing helpful-vs-harmless tradeoffs in a production system. Those are skills that require the deployments themselves. The module teaches the *vocabulary* and the *published recipes* that make those skills learnable from experience instead of from scratch.
+
+---
+
+## What this module does not cover {#non-goals}
+
+- **Inference and serving.** KV-cache, paged attention, speculative decoding, vLLM/SGLang/TRT-LLM internals, continuous batching, structured-output decoding — future Module 4. (RLHF rollout infrastructure is covered in Chapter 30 at the level needed for training.)
+- **Evaluation methodology.** Benchmark contamination, capability elicitation, LMSYS Chatbot Arena methodology, calibration — future Module 5.
+- **Mechanistic interpretability and alignment beyond RL techniques.** SAEs, circuit-level analysis, scalable oversight, red-teaming — future Module 5.
+- **Specific safety taxonomy.** The module references safety as one of several objectives that post-training optimises; the *taxonomy* of harms and the *measurement* of misalignment is downstream of this module.
+- **Frontier labs comparative architecture.** GPT-5 vs Claude 4 vs Gemini 3 vs DeepSeek-R1 architectural comparisons — future Module 6.
+
+<Sources items={[
+  { authors: "Module 0 — Prerequisites", year: 2026, title: "Frontier-LLM textbook, Module 0", url: "/textbook/00-prerequisites" },
+  { authors: "Module 1 — Pretraining at scale", year: 2026, title: "Frontier-LLM textbook, Module 1", url: "/textbook/01-pretraining" },
+  { authors: "Module 2 — Distributed training", year: 2026, title: "Frontier-LLM textbook, Module 2", url: "/textbook/02-distributed" },
+  { authors: "Ouyang, L. et al.", year: 2022, title: "Training language models to follow instructions with human feedback (InstructGPT)", venue: "arXiv:2203.02155", url: "https://arxiv.org/abs/2203.02155", note: "The InstructGPT four-stage RLHF pipeline. Reference for every module that follows." },
+  { authors: "Rafailov, R. et al.", year: 2023, title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model", venue: "arXiv:2305.18290", url: "https://arxiv.org/abs/2305.18290", note: "The DPO paper. Closed-form RLHF without explicit RL." },
+  { authors: "DeepSeek-AI", year: 2025, title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning", venue: "arXiv:2501.12948", url: "https://arxiv.org/abs/2501.12948", note: "GRPO derivation and the R1 cold-start + RL-only recipe — the keystone reference for the reasoning chapter." },
+  { authors: "Bai, Y. et al.", year: 2022, title: "Constitutional AI: Harmlessness from AI Feedback", venue: "arXiv:2212.08073", url: "https://arxiv.org/abs/2212.08073", note: "Anthropic's Constitutional AI: SL-CAI + RL-CAI. The keystone reference for Chapter 31." },
+  { authors: "Lambert, N. et al.", year: 2024, title: "Tülu 3: Pushing Frontiers in Open Language Model Post-Training", venue: "arXiv:2411.15124", url: "https://arxiv.org/abs/2411.15124", note: "The most-disclosed open post-training recipe of 2024–2026. Reference for every module." },
+  { authors: "Lambert, N.", year: 2024, title: "Reinforcement Learning from Human Feedback (RLHF) Book", venue: "rlhfbook.com", url: "https://rlhfbook.com/", note: "The community textbook on RLHF. Used as a secondary reference across the module." },
+]} />

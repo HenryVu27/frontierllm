@@ -1,0 +1,443 @@
+---
+slug: 03h-tool-use-and-agents
+title: Agentic post-training — tool-call SFT and agentic RL
+description: ReAct, Toolformer, function-calling SFT, Computer Use, SWE-RL, and the 2024-2026 agentic-RL recipes.
+order: 35
+chapter: 35
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 28
+depends_on: [03a-sft, 03f-reasoning-rl]
+provides: [tool-call-sft, react, function-calling, computer-use, swe-rl, agentic-rl]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+The chapters on [supervised fine-tuning](/textbook/03a-sft) and [reasoning RL](/textbook/03f-reasoning-rl) established how to train a model to *think*. This chapter covers how to train a model to *act* — to emit calls to tools, read results back as observations, and assemble long-horizon multi-step plans.
+
+The conceptual machinery carries over exactly: just as reasoning RL uses a verifiable reward to supervise a chain-of-thought trajectory, agentic RL uses a verifiable reward to supervise an action trajectory. A code execution sandbox returns a test-pass or test-fail; a browser-automation harness returns the rendered page or an error; a filesystem inspector returns file contents or a permission denied. From the model's perspective, these observations are just context, same as the output of a calculator in a ReAct trace.
+
+The chapter assumes the reader has finished [SFT](/textbook/03a-sft) and [Reasoning RL](/textbook/03f-reasoning-rl), because agentic post-training sits at the junction of both. The architecture, optimizer, and training stability material comes from [Pretraining](/textbook/01-pretraining); the fundamentals of loss-masking and multi-turn supervision come from [SFT](/textbook/03a-sft); the reward design and group-reward policies come from [Reasoning RL](/textbook/03f-reasoning-rl). This chapter is where those pieces compose into a model that *both* reasons and acts.
+
+<Callout variant="note" title="Calibration date">
+Content calibrated to frontier-model practice as of May 14, 2026. Exact numerical results (SWE-RL reward definitions, Computer Use benchmarks, ReAct gains) are quoted verbatim from published sources. Where frontier labs keep recipes proprietary (the agentic-RL stack in Claude Opus 4.5, the training data for CUA), this chapter states that explicitly and does not speculate.
+</Callout>
+
+---
+
+## Tools are extra tokens {#tools-as-tokens}
+
+The single most useful mental model for agentic training is that **tool use is not a separate cognitive faculty — it is autoregressive token generation over an extended vocabulary**. When a model emits `search("hot pot recipe")`, it is generating text. An external harness intercepts that text, runs the search, and splices the result back into the context window as if the model had generated it. From the model's statistical perspective, the tool call is just a stretch of tokens followed by a "free" continuation (the tool output) that the model did not have to generate itself.
+
+This framing collapses three apparently different problems into one:
+
+- **Tool calling**: emit `search("hot pot recipe")` then read the result.
+- **Function calling**: emit a JSON object with a fixed schema.
+- **Agentic action**: emit `click(x=312, y=874)` and read a new screenshot.
+
+All three are identical operations: the model emits a structured suffix, a deterministic interpreter runs it, and the interpreter's output is appended to the context. The training problem is identical: produce demonstration traces, fine-tune on next-token prediction over those traces with appropriate loss masking (mask the tokens the *environment* produced; train on the tokens the *model* produced), and optionally apply RL with an outcome reward at the end of the trace.
+
+Frontier labs reinforce this framing with **special tokens** that mark tool boundaries. OpenAI's harmony response format uses `<|call|>` to terminate tool calls and `<|return|>` for final assistant turns. Anthropic's Claude uses `<tool_use>` and `<tool_result>` tags. Gemini 2.5 uses `<tool_code>` and `<tool_output>` markers. These are not cosmetic. They let the trainer mask losses precisely at boundaries, prevent the model from "completing" a tool's output (which would hallucinate results), and give the inference harness a cheap stop signal.
+
+### Loss masking on tool traces {#tool-traces}
+
+Given a concrete SFT trace:
+
+```
+<system>You can call search()...</system>
+<user>What's the population of Lyon?</user>
+<assistant>I'll look it up.
+<tool_use>search("population of Lyon")</tool_use></assistant>
+<tool_result>522,250 (2020 census)</tool_result>
+<assistant>Lyon has ~522,000 inhabitants per the 2020 census.</assistant>
+```
+
+The training loss is applied to **only the assistant-authored tokens**. The reasoning text inside `<assistant>`, the tool call expression inside `<tool_use>`, and the final answer all contribute to the loss. The `<tool_result>` content is forced into context but contributes zero loss. This is the same loss-masking pattern as instruction SFT — mask system + user; train on the assistant — extended to multi-turn structure where tool-result blocks occupy the "input" side.
+
+A worked example makes this concrete. Imagine a 50-step SWE (software engineering) trace that produces a patch. The total token count is:
+
+$$T_{\text{total}} = T_{\text{reasoning}} + T_{\text{actions}} + T_{\text{observations}}$$
+
+where $T_{\text{observations}}$ grows with the number of file reads, diffs, and test failures the model encounters. The loss is:
+
+$$\mathcal{L} = \frac{1}{T_{\text{reasoning}} + T_{\text{actions}}} \sum_{i \in \text{reasoning} \cup \text{actions}} H(p_i, y_i)$$
+
+where $H$ is cross-entropy and the sum runs over model-authored tokens only. The observation tokens are masked: they do not contribute to the gradient. This design choice is critical because observations are often deterministic (file contents do not vary by hyperparameter), and training on them would waste gradient signal on tokens the model cannot control.
+
+---
+
+## Tool-call SFT: from Toolformer to ToolBench {#tool-sft}
+
+### Toolformer: self-supervised tool discovery (Schick et al., 2023)
+
+Toolformer is the canonical "model teaches itself tools" paper and established the self-supervised recipe that every later work riffs on. The setup: a GPT-J 6.7B base model, a handful of demonstration prompts per tool (calculator, Wikipedia QA, two search engines, calendar, translator), and a bootstrap loop:
+
+1. **Sample**: prompt the model with demonstrations plus a candidate position in an unlabelled corpus; ask it to emit a tool call.
+2. **Execute**: run the tool, collect the result.
+3. **Filter**: keep the call if and only if inserting `<call>...</call><result>...</result>` into the original text strictly *reduces* the cross-entropy of the next-token prediction by more than a threshold $\tau$. Calls that do not reduce loss are discarded.
+4. **Fine-tune**: standard causal LM fine-tuning on the surviving annotated corpus.
+
+The loss-reduction criterion is the clever bit. It is a fully self-supervised, model-internal signal that distinguishes "useful tool call here" from "noise" without human annotation. After fine-tuning on the bootstrapped corpus, Toolformer 6.7B outperformed GPT-3 175B on zero-shot benchmarks for calculation, factual recall, and translation, while maintaining baseline LM perplexity. This established a recipe: let a base model self-generate candidate tool traces, filter them automatically, and fine-tune on the survivors.
+
+### Gorilla: retrieval-augmented tool SFT (Patil et al., 2023)
+
+Gorilla attacked the "API-call accuracy" problem. The setup: LLaMA 7B base, ~1,645 model-loading APIs scraped from HuggingFace, TorchHub, and TensorFlow Hub. The methodological move: **retrieval-aware training**. During fine-tuning, each example is augmented with a retrieved chunk of relevant API documentation. The model learns to ground its generated call in the docs that will be available at inference time, rather than relying on memorized priors.
+
+Result: Gorilla writes API calls with higher accuracy than GPT-4 on APIBench, with substantially less hallucination of nonexistent functions. The lesson exported: **train with retrieval at SFT time, not just at inference**, so the model learns to attend to provided documentation.
+
+### ToolBench / ToolLLaMA: scale to 16K APIs (Qin et al., 2023)
+
+ToolBench scales tool SFT to the size required for genuinely general tool use. Three numbers:
+
+- **16,464** real REST APIs scraped from RapidAPI Hub, across 49 categories.
+- **126,486** instruction–solution-path pairs synthesised by ChatGPT.
+- Solution paths use a **Thought/Action/Observation** triplet structure — the same skeleton as ReAct (see [§#react](#react)).
+
+The novel ingredient is **DFSDT** (Depth-First Search Decision Tree). When ChatGPT generates a solution path for a complex multi-tool instruction, it does not produce a single linear trace. Instead, it branches on tool-call failures, backtracks, and tries alternatives. DFSDT-generated traces are much more robust than chain-style traces because they include explicit recovery from API errors.
+
+ToolLLaMA, a LLaMA 7B model fine-tuned on these traces, achieves pass-rates on unseen APIs comparable to ChatGPT, despite being two orders of magnitude smaller. ToolBench is the most-cited "industrial-scale tool SFT" dataset of the 2024–2026 wave; its DFSDT recipe is recognisably present in agentic-RL data pipelines (see [§#swe-rl](#swe-rl)).
+
+### The three-part recipe that emerged
+
+By end of 2023, the open-source community crystallised a three-part recipe that every frontier lab now uses internally:
+
+1. **Self-supervised annotation** (Toolformer's loss-reduction filter).
+2. **Retrieval-augmented training** so the model learns to read API docs in-context (Gorilla).
+3. **Branching traces with error recovery** (ToolBench's DFSDT).
+
+These are not mutually exclusive — they compose. The Claude / GPT / Gemini tool-SFT mixes almost certainly use all three. The remaining questions are formatting details (what special tokens mark boundaries), long-horizon handling, reward design, and loop prevention.
+
+<Sources>
+- Schick et al. (2023). "Toolformer: Language Models Can Teach Themselves to Use Tools." NeurIPS 2023. https://arxiv.org/abs/2302.04761
+- Patil et al. (2023). "Gorilla: Large Language Model Connected with Massive APIs." NeurIPS 2024. https://arxiv.org/abs/2305.15334
+- Qin et al. (2023). "ToolLLM: Facilitating Large Language Models to Master 16000+ Real-world APIs." ICLR 2024 spotlight. https://arxiv.org/abs/2307.16789
+</Sources>
+
+---
+
+## ReAct: reasoning interleaved with action {#react}
+
+### The mechanism
+
+ReAct (Yao et al., 2022) is the most influential prompt-format paper in tool-use literature. The idea is one sentence: *interleave* free-form reasoning (Thought) with discrete actions (Action), reading observations back as plain text. A trace looks like:
+
+```
+Thought 1: I need to find the population of Lyon. I'll search Wikipedia.
+Action 1: Search[Lyon, France]
+Observation 1: Lyon is the third-largest city in France...
+Thought 2: The article mentions 522,250 in the 2020 census.
+Action 2: Finish[522,250]
+```
+
+The critical ablation: pure chain-of-thought (Thought only, no Action) and pure action sequences (Action only, no Thought) are both substantially worse than the interleaved trace. Reasoning steps let the model think about tool output before deciding the next action; actions let the model offload retrieval and calculation to deterministic tools.
+
+**Reported gains**: +34 absolute success on ALFWorld (a text-adventure benchmark for embodied agents) and +10 absolute success on WebShop, versus imitation-learning and RL baselines, using only one or two in-context demonstrations.
+
+### ReAct as canonical SFT format
+
+ReAct was originally a prompting paper, but its lasting contribution is that the Thought/Action/Observation skeleton became the default SFT trace format across the field. ToolBench solution paths are ReAct traces. Claude system prompts render into ReAct-shaped traces internally. OpenAI's o-series reasoning tokens (`<reasoning>...</reasoning>`) plus tool calls form a ReAct-shaped trace. When this chapter refers to "tool-SFT data" without qualification, it means ReAct traces.
+
+### Limitations and syntheses
+
+ReAct's weaknesses motivated follow-ups:
+
+- **Loops**: uncertain models re-search the same query indefinitely. Reflexion and Tree-of-Thoughts added explicit self-critique and branching.
+- **Latency**: a long Thought step before every Action wastes tokens. Newer recipes (e.g., o4-mini's "compact" reasoning) compress reasoning between actions.
+- **Brittleness to failure**: the original ReAct prompt did not specify reaction to tool errors. ToolBench's DFSDT fixed this by training on error-recovery traces.
+
+By 2026 the synthesis is clear: ReAct provides the **format**, ToolBench provides the **scale**, and SWE-RL (see [§#swe-rl](#swe-rl)) provides the **reward** that turns format-plus-scale into a deployable agent.
+
+<Sources>
+- Yao et al. (2022). "ReAct: Synergizing Reasoning and Acting in Language Models." ICLR 2023. https://arxiv.org/abs/2210.03629
+- Shinn et al. (2023). "Reflexion: Language Agents with Verbal Reinforcement Learning." NeurIPS 2023. https://arxiv.org/abs/2303.11366
+- Yao et al. (2023). "Tree of Thoughts: Deliberate Problem Solving with Large Language Models." NeurIPS 2023. https://arxiv.org/abs/2305.10601
+</Sources>
+
+---
+
+## Function-calling fine-tuning: the API contract {#function-calling}
+
+### The OpenAI interface
+
+When OpenAI shipped function calling in June 2023, it defined a developer-facing contract that the rest of the industry rapidly adopted. The contract has three parts:
+
+1. **Tool declaration**: the developer passes a `tools` list, each with `name`, `description`, and a JSON Schema for `parameters`.
+2. **Tool selection**: the model returns either a regular `content` message *or* a `tool_calls` list, each with `name` and stringified JSON `arguments`.
+3. **Tool result injection**: the developer appends a `"tool"` role message, matching the call ID, with result content. The model continues.
+
+`tool_choice` lets the developer force a tool call, forbid calls, or let the model decide. Parallel tool calling (multiple `tool_calls` in one response) batches independent lookups.
+
+### Training details OpenAI has disclosed
+
+- **Format tokens**: the harmony format wraps tool-call boundaries in `<|call|>` (terminator) and `<|return|>` (final turns). These are reserved tokens in the `o200k_harmony` tokenizer.
+- **Constrained decoding**: when `response_format` or a tool's `parameters` schema is supplied with `strict: true`, OpenAI's serving stack switches to grammar-constrained decoding (a CFG mirroring the JSON schema). This is decode-time structured generation, not SFT-time, but makes outputs reliably parseable.
+- **Mixed-objective SFT**: the model trains on a mix of plain assistant turns, tool-call turns, and "tool-call-then-reflect" turns, learning to choose between `content` and `tool_calls` based on system prompt and query. The Azure OpenAI fine-tuning guide documents the JSONL format developers use downstream (one JSON-per-line, `messages: [...]` with `tool_calls` entries marked as assistant outputs).
+
+### Why function calling is not a separate problem
+
+Returning to [§#tools-as-tokens](#tools-as-tokens): function calls are tool calls with strict JSON schema. The SFT recipe is unchanged — collect traces, mask tool-result tokens, train autoregressively on model-authored tokens. The contract is just the convention by which the harness intercepts the model's output and routes it to the function. Every frontier lab ships an equivalent: Anthropic's `tool_use` content blocks, Google's `function_call` parts on Gemini's `Content` proto, Mistral's `tool_calls` array. The underlying SFT problem is the same.
+
+<Sources>
+- OpenAI (2023). "Function calling and other API updates." https://openai.com/index/function-calling-and-other-api-updates/
+- OpenAI (2024). "Introducing Structured Outputs in the API." https://openai.com/index/introducing-structured-outputs-in-the-api/
+- OpenAI Developer Docs (2026). "Function calling guide." https://developers.openai.com/api/docs/guides/function-calling
+- Microsoft Learn (2025). "Fine-tuning function calls with Azure OpenAI." https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/fine-tuning-functions
+</Sources>
+
+---
+
+## Multi-step agentic SFT: long tool traces {#multi-step-sft}
+
+### What changes at long horizons
+
+A single tool call (calculator → answer) is operationally trivial. A 50-step trace (read repo → search files → propose patch → run tests → read failure → revise patch → re-run tests → succeed) is qualitatively different in three ways:
+
+**Context length.** A SWE-bench trajectory routinely exceeds 50 K tokens of accumulated tool output. This is why frontier agentic models train on 200 K+ context windows — agents *need* the room.
+
+**Credit assignment.** A 50-step trace with binary outcome reward provides one bit of supervision over thousands of action tokens. Either every action gets uniform advantage, or the trainer attempts to localise blame. This tension motivates process-reward models (see [§#swe-rl](#swe-rl)).
+
+**Compounding error.** Small per-step error rates compound multiplicatively. A 90% per-step accuracy gives $0.9^{50} \approx 0.5\%$ end-to-end success. Long-horizon agents need per-step accuracy at the four-nines level to be useful, which is why pure SFT plateaus and RL takes over.
+
+### The long-trace SFT recipe
+
+The standard recipe in 2025–2026:
+
+1. **Generate candidates** with a strong teacher model (typically the lab's previous frontier model; e.g., use Claude 3.7 Sonnet to generate traces for fine-tuning Claude 4 Sonnet's first SFT pass).
+2. **Filter by outcome**: only keep trajectories where the final task is verifiably solved (unit tests pass, target page reached, file matches expected diff). This rejection-sampled SFT is sometimes called "STaR" (self-taught reasoner), applied to agent traces.
+3. **Quality-control filter**: discard trajectories with redundant actions, infinite loops, or absurdly long traces — these teach bad habits.
+4. **Mask losses correctly**: every observation token (`<tool_result>...</tool_result>`) is masked; every assistant-authored token (thought, action) contributes.
+
+A benchmark for this approach is Vending-Bench, a long-horizon agentic benchmark used by Anthropic. Claude Opus 4.5 scored 29% higher than Claude Sonnet 4.5 on it — the kind of gap that comes from RL on top of SFT rather than SFT alone (Anthropic, 2025).
+
+### Code execution as special case
+
+Code execution is tool use where the tool is a Python kernel and the output is stdout/stderr/return value. Two operational details:
+
+- **Sandbox isolation**: labs run the kernel in a container with network and filesystem restrictions, time and memory limits. Training traces record the *result*, not raw kernel state.
+- **Determinism**: random seeds are fixed inside the sandbox so SFT traces are reproducible.
+
+Gemini 2.5's native code-execution tool allows up to five sequential invocations per turn, each capped at 30 seconds, in an environment pre-loaded with NumPy, pandas, and matplotlib. This is the most generous spec on any frontier API and reflects Google's bet that long, interleaved code-execution traces are the most data-efficient way to teach quantitative reasoning.
+
+<Sources>
+- Zelikman et al. (2022). "STaR: Bootstrapping Reasoning With Reasoning." NeurIPS 2022. https://arxiv.org/abs/2203.14465
+- Anthropic (2025). "Introducing Claude Opus 4.5." November 2025. https://www.anthropic.com/news/claude-opus-4-5
+- Google Developers Blog (2025). "Gemini 2.0 Deep Dive: Code Execution." https://developers.googleblog.com/gemini-20-deep-dive-code-execution/
+</Sources>
+
+---
+
+## Computer use and browser use: visual agents {#computer-use}
+
+### Anthropic Computer Use (October 2024)
+
+Anthropic launched Computer Use as a public beta on Claude 3.5 Sonnet (new) on October 22, 2024. The action space:
+
+- `screenshot()` — observation; returns a PNG of the current display.
+- `mouse_move(x, y)`, `left_click()`, `right_click()`, `middle_click()`, `double_click()`, `left_click_drag(...)`.
+- `key("Return")`, `type("hello")` — keyboard primitives.
+- `cursor_position()` — reports current coordinates.
+
+The model receives a screenshot as image content (vision-multimodal context, not text), reasons about what to do, and emits a tool call with coordinates and action.
+
+**Benchmark results on OSWorld.** OSWorld (Xie et al., 2024) contains 369 real-world computer tasks across Linux applications. On launch, Claude 3.5 Sonnet (new) scored **14.9%** on the screenshot-only subset, rising to **22.0%** with additional reasoning steps. Human ceiling: 72.4%.
+
+Anthropic has not disclosed the SFT recipe beyond noting training on recorded human-curated screenshot+action traces, plus filtered model-generated traces. The relatively low absolute scores reflect the difficulty of pixel-space reasoning — visual GUIs are harder than textual tools because the model must reason about pixel layout.
+
+### OpenAI Operator / Computer-Using Agent (January 2025)
+
+OpenAI shipped Operator on January 23, 2025, powered by a new model called CUA (Computer-Using Agent). CUA combines GPT-4o's vision with **reinforcement learning on browser tasks**: rollouts on actual web pages, reward from automated task verifiers.
+
+**Reported results at launch**:
+
+- **OSWorld**: 38.1% (vs. 22.0% Anthropic SOTA — a ~73% relative gain).
+- **WebArena**: 58.1% (vs. 36.2% prior SOTA).
+- **WebVoyager**: 87%, statistically indistinguishable from human performance on live websites.
+
+The WebVoyager number is striking — the first agent to reach human parity on a live-website benchmark, demonstrating browser-use is essentially solved for routine consumer tasks (shopping, booking, form-filling) as of mid-2025. The OSWorld gap to human ceiling (38% vs 72%) shows the long tail of desktop applications remains substantially harder.
+
+OpenAI disclosed the training recipe: large-scale RL on real browser sessions and synthetic curricula, with reward from page-state verifiers (e.g., "is the final URL the user's order confirmation page?"). Exact data and reward shaping are proprietary.
+
+### The frontier lesson
+
+The frontier-2026 lesson from computer-use is that **the action space matters more than the model**. A vision-language model that handles pixel space poorly will fail regardless. Successful recipes share:
+
+- A **coarse action vocabulary** (click, type, scroll, screenshot) rather than fine motor primitives.
+- An **accessibility-tree fallback** (DOM nodes or app metadata) for tasks where screenshot-only reasoning is brittle.
+- **Aggressive RL on top of imitation SFT** — pure imitation hits a ceiling around Anthropic's launch numbers; RL unlocks Operator-class results.
+
+This mirrors the coding-agent lesson: SFT teaches the format, RL teaches the policy.
+
+<Sources>
+- Anthropic (2024). "Introducing computer use, a new Claude 3.5 Sonnet, and Claude 3.5 Haiku." October 22, 2024. https://www.anthropic.com/news/3-5-models-and-computer-use
+- Xie et al. (2024). "OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks in Real Computer Environments." NeurIPS 2024. https://arxiv.org/abs/2404.07972
+- OpenAI (2025). "Computer-Using Agent." January 23, 2025. https://openai.com/index/computer-using-agent/
+- MIT Technology Review (2025). "OpenAI launches Operator." https://www.technologyreview.com/2025/01/23/1110484/openai-launches-operator-an-agent-that-can-use-a-computer-for-you/
+</Sources>
+
+---
+
+## Agentic RL: SWE-RL and the 2025–2026 recipe {#swe-rl}
+
+### SWE-bench: the canonical benchmark
+
+SWE-bench (Jimenez et al., 2023) is the benchmark that gave agentic coding its standard. The setup: 2,294 real GitHub issues from 12 popular Python repositories, each paired with the actual pull request that fixed it. To "solve" an issue, an agent must produce a patch that passes the *full* test suite added with the original fix.
+
+Original baselines were sobering: Claude 2 solved 1.96%, GPT-4 likewise single-digit. SWE-bench Verified (human-curated 500-instance subset with sound tests) became the de-facto standard.
+
+The Claude 4 / Claude Sonnet 4.5 / Claude Opus 4.5 / GPT-5 / Gemini 3 generation routinely scores 70–80% on SWE-bench Verified as of May 2026 — a jump from sub-5% in late 2023, driven almost entirely by agentic post-training advances rather than base-model improvements.
+
+### SWE-RL: the public recipe (Wei et al., February 2025)
+
+SWE-RL is the cleanest publicly documented agentic-RL recipe for coding agents and the template open-source efforts copy. The pipeline:
+
+**Data**. 273,000 PR seeds mined from public GitHub. Each seed is a `(issue, code_context, oracle_patch)` triple, filtered for bug-fix labels and Python-file changes.
+
+**Base model**. Llama-3.3-70B-Instruct.
+
+**Policy rollout**. The model produces a chain-of-thought followed by a `search/replace`-format patch.
+
+**Reward function**. 
+- If the output is malformed (wrong format), $R = -1$.
+- Otherwise, $R = \texttt{difflib.SequenceMatcher.ratio}(\text{predicted\_patch}, \text{oracle\_patch}) \in [0, 1]$.
+
+This is a **continuous similarity reward** rather than exact-match, which is essential because per-rollout success probability is small; partial credit gives non-zero gradient on near-misses.
+
+**Optimization**. GRPO (Group Relative Policy Optimization, Shao et al., 2024) — the same algorithm DeepSeek used for R1's reasoning RL, repurposed for code. Group size $G = 16$ rollouts per problem, 32 problems per batch, global batch 512.
+
+**Compute**. 1,600 optimization steps on **512 H100 GPUs** for approximately **32 wall-clock hours**.
+
+**Result**: Llama3-SWE-RL-70B scores **41.0%** on SWE-bench Verified — the best &lt;100B score reported at the time, comparable to GPT-4o.
+
+### Outcome reward vs. process reward
+
+SWE-RL uses a *terminal* reward — one number per trajectory. The credit-assignment problem is real: a 50-step rollout that succeeds gives uniform positive advantage to every action, including unhelpful ones.
+
+Two responses emerged in 2025–2026:
+
+**Process Reward Models (PRMs).** Train a separate verifier on `(trajectory_prefix, was_eventually_successful)` pairs and use it to score every intermediate step. AgentPRM (Choudhury et al., 2025) is the canonical agentic adaptation: TD-style estimation plus GAE to score each step's contribution to eventual success. Cost: extra reward model and annotation. Gain: faster credit assignment.
+
+**Progressive reward shaping.** A curriculum that first rewards "the tool call parses", then "the tool call is semantically reasonable", then "the trajectory succeeds". Much easier to engineer than a full PRM and reportedly standard at frontier labs.
+
+Tree-GRPO (Liu et al., Sep 2025) organises rollouts into trees rather than independent samples, allowing step-level preferences derived from outcome-level rewards without explicit PRMs. Two trajectories sharing a prefix differ only in later steps, so reward differences are attributable to those steps.
+
+### The general agentic-RL recipe
+
+Synthesising SWE-RL, AgentPRM, Tree-GRPO, and the disclosed-but-undocumented recipes behind Claude Opus 4.5 / GPT-5 / Gemini 3:
+
+1. **Bootstrap SFT** on filtered ReAct-format trajectories ([§#tool-sft](#tool-sft) and [§#react](#react)).
+2. **RL with verifiable terminal reward** on environments where automated verification is cheap:
+   - Code: unit tests pass.
+   - Math: answer matches boxed solution.
+   - Browser: target page state matches checker.
+   - Computer-use: filesystem or app state matches spec.
+3. **GRPO or a near-relative** as optimizer. PPO is also used; choice is engineering taste.
+4. **Reward shaping** at the format level (parse-validity, output-length sanity) layered on terminal task reward.
+5. **Curriculum**: start with short-horizon environments, mix in long-horizon as model stabilizes.
+
+This is the agentic generalisation of the reasoning-RL recipe from [Reasoning RL](/textbook/03f-reasoning-rl). That chapter trains the model to think; this trains it to act. Same algorithms; different environments.
+
+<Sources>
+- Jimenez et al. (2023). "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?" ICLR 2024. https://arxiv.org/abs/2310.06770
+- Wei et al. (2025). "SWE-RL: Advancing LLM Reasoning via Reinforcement Learning on Open Software Evolution." NeurIPS 2025. https://arxiv.org/abs/2502.18449
+- Shao et al. (2024). "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." https://arxiv.org/abs/2402.03300
+- Choudhury et al. (2025). "AgentPRM: Process Reward Models for LLM Agents via Step-Wise Promise and Progress." https://arxiv.org/abs/2511.08325
+- Liu et al. (2025). "Tree-GRPO: Tree Search for LLM Agent Reinforcement Learning." https://arxiv.org/abs/2509.21240
+</Sources>
+
+---
+
+## Frontier practice as of May 2026 {#frontier-practice}
+
+### Claude (Anthropic)
+
+Anthropic's posture is the most agent-forward of the frontier labs.
+
+**Claude Opus 4.5** (November 2025) leads on SWE-bench Verified and SWE-bench Multilingual (7-of-8 languages), posting the largest gain on Vending-Bench. At medium-effort setting it matches Claude Sonnet 4.5 with 76% fewer output tokens — a token-efficiency improvement attributable to better learned tool-use policies.
+
+**Claude Opus 4.7** (May 2026) extends the lead, with state-of-the-art on agentic-reasoning benchmarks against GPT-5.4 and Gemini 3.1 Pro.
+
+**Computer Use** is now in general availability. Action space and harness are unchanged from October 2024; underlying model is substantially stronger.
+
+**MCP (Model Context Protocol)**, launched November 25, 2024, is the open standard Anthropic introduced to factor "what the model can call" out of training entirely. MCP defines a client–server protocol over JSON-RPC where servers expose tools (callable), resources (readable), and prompts (templates). Clients (Claude Desktop, Cursor, Zed, Sourcegraph, Replit, Codeium) connect to servers. Strategic consequence: "add a tool" becomes a deploy-time integration, not a fine-tuning event. Training-time consequence: frontier models are SFT'd on traces over an open-ended MCP tool space rather than fixed function lists.
+
+Anthropic has published alignment notes that the *first* Claude 4 generation surfaced agentic-misalignment issues earlier chat-RLHF had not caught, and subsequent versions added explicit safety-RL with tool-augmented harmlessness environments. This is a textbook example of why agentic post-training is its own alignment problem.
+
+### OpenAI
+
+**GPT-4.1 / GPT-4o** function calling is the API contract every lab implements compatibility with.
+
+**o3 and o4-mini** (April 16, 2025) are the first OpenAI models with full tool-use during reasoning: web browsing, Python execution, image and file analysis, image generation, canvas, automations, memory. The internal scratchpad ("private chain-of-thought") and tool-call surface are unified — the model can browse and execute code *between* reasoning steps without breaking the thinking budget.
+
+**CUA / Operator** is the dedicated computer-use model; its training stack is the most disclosed example of large-scale RL on browser tasks.
+
+The **harmony response format** (`<|call|>`, `<|return|>`, etc.) standardises tool boundaries across o-series and gpt-oss.
+
+### Google DeepMind
+
+**Gemini 2.5** and **Gemini 3** ship native tool use, with Google Search, code execution, and arbitrary function calling as first-class API capabilities.
+
+The **code-execution sandbox** is the most generous in the industry (NumPy / pandas / matplotlib pre-loaded, up to 5 invocations per turn, 30 s each).
+
+Gemini's agent stack (Project Astra, Agent Builder) emphasises long-running multimodal agents over the short turn-based agents of OpenAI/Anthropic public APIs.
+
+### The convergent picture
+
+Despite different surface APIs, the three frontier labs converged on a strikingly similar agentic stack by May 2026:
+
+1. Vast pre-training including code, web data, and synthetic tool-trace data.
+2. Tool-SFT on filtered ReAct-style traces, with strong loss masking on tool-result tokens.
+3. Function-calling SFT with constrained decoding at serving time.
+4. Long-horizon multi-step SFT for code/browser/computer-use environments.
+5. Large-scale agentic RL (GRPO or near-relative) with verifiable terminal rewards on coding, browsing, and OS-control tasks.
+6. Alignment-RL with tool-augmented harmlessness environments to address agentic-misalignment failure modes.
+
+This recipe is the agentic generalisation of the [Reasoning RL](/textbook/03f-reasoning-rl) recipe. The mathematical content is mostly in [SFT](/textbook/03a-sft) (the SFT loss) and [Reasoning RL](/textbook/03f-reasoning-rl) (GRPO and reward design). This chapter is where those ingredients combine into a model that *acts* on the world.
+
+<Sources>
+- Anthropic (2025). "Introducing Claude Opus 4.5." November 2025. https://www.anthropic.com/news/claude-opus-4-5
+- Anthropic (2026). "Introducing Claude Opus 4.7." https://www.anthropic.com/news/claude-opus-4-7
+- Anthropic (2024). "Introducing the Model Context Protocol." November 25, 2024. https://www.anthropic.com/news/model-context-protocol
+- Anthropic Alignment Science (2026). "Teaching Claude Why." https://alignment.anthropic.com/2026/teaching-claude-why/
+- OpenAI (2025). "Introducing OpenAI o3 and o4-mini." April 16, 2025. https://openai.com/index/introducing-o3-and-o4-mini/
+- Google DeepMind (2025). "Gemini 2.5 Pro model card." https://deepmind.google/en/models/gemini/pro/
+- Google AI for Developers (2025). "Using Tools with Gemini API." https://ai.google.dev/gemini-api/docs/tools
+</Sources>
+
+---
+
+## Open questions {#open-questions}
+
+1. **SFT vs RL contribution to frontier agentic capability.** Public literature (SWE-RL, AgentPRM) suggests RL is essential for the last 20–30 absolute points of benchmark performance. Proprietary frontier may differ. The chapter avoids overstating without evidence.
+
+2. **PRM vs. shaped outcome reward.** As of May 2026 this is not settled at frontier scale. Progressive reward shaping is reportedly standard; explicit PRMs are less common. This remains an open engineering question.
+
+3. **MCP's training-time impact.** MCP is recent enough that its impact on SFT data is still being worked out. Active research area.
+
+4. **Computer-use safety.** Anthropic's published alignment notes are the most explicit public account of agentic-misalignment in tool-use contexts. Safety RL with tool-augmented harmlessness is now first-class alignment concern.
+
+---
+
+## Summary {#summary}
+
+Agentic post-training trains a model to emit actions over an extended vocabulary, read observations back, and assemble long-horizon multi-step plans. The key insight is that **tools are just extra tokens** — the model generates text, an external harness runs it, and the output splices back into context. This framing unifies tool calling, function calling, and action sequences into a single training problem.
+
+The field converged by 2026 on a three-layer stack:
+
+- **Tool-SFT**: supervised fine-tuning on ReAct-format traces (Thought/Action/Observation), bootstrapped with loss-reduction filtering (Toolformer), retrieval-augmentation (Gorilla), and error-recovery branching (ToolBench DFSDT). Frontier labs use all three ingredients.
+
+- **Long-horizon SFT**: filtering candidate trajectories by verifiable outcome (code tests pass, page state matches spec), quality-control filtering for loops and redundancy, and correct loss masking (mask observations, train on actions).
+
+- **Agentic RL**: GRPO-based optimization over rollouts, with verifiable terminal rewards and progressive reward shaping. SWE-RL demonstrated this on code: 273K GitHub PRs, 512 H100s, 32 hours, produced Llama3-70B scoring 41% on SWE-bench Verified. CUA showed browser-use RL scaled: 38% on OSWorld, 87% on WebVoyager. Claude Opus 4.5 and Gemini 3 now lead multi-domain agentic benchmarks.
+
+Computer-use agents (visual pixel-space action) are downstream of browser-use. The frontier lesson: **action space matters more than model**. OSWorld (real desktop tasks) remains harder than WebVoyager (web tasks) because pixel reasoning is harder than DOM reasoning. Pure imitation hits a ceiling around 22%; RL unlocks the 38% frontier.
+
+Anthropic, OpenAI, and Google deployed identical agentic stacks by May 2026 despite different APIs, differing mainly in compute budget for RL. The recipe — SFT-then-RL, with the verifiable reward as the lynchpin — is now the standard for training agents at scale.
+
+---
+
+## Dependencies and forward references {#summary}
+
+**Backward**: [SFT](/textbook/03a-sft) establishes loss-masking and multi-turn supervision. [Reasoning RL](/textbook/03f-reasoning-rl) establishes GRPO, verifiable rewards, and RL on reasoning trajectories.
+
+**Forward**: Module 04 (Evaluation and Benchmarks) documents SWE-bench, OSWorld, WebArena, WebVoyager, Vending-Bench construction and statistical properties. Module 06 (Alignment) develops agentic-misalignment as a first-class safety concern and harmlessness-RL with tool-use environments.

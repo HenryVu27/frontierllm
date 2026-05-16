@@ -1,0 +1,429 @@
+---
+slug: 03d-rlaif-constitutional
+title: RLAIF and Constitutional AI
+description: Self-critique loops, judge-LLM-as-rewarder, Anthropic's Constitutional AI, and the failure modes (length / position / self-preference / homogenisation).
+order: 31
+chapter: 31
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 35
+depends_on: [03c-rlhf]
+provides: [constitutional-ai, sl-cai, rl-cai, rlaif, judge-llm, llm-as-judge-bias]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+Reinforcement Learning from AI Feedback (RLAIF) replaces the human preference labeller in [RLHF](/textbook/03c-rlhf) with another language model. Its canonical instantiation is Anthropic's **Constitutional AI** (Bai et al., 2022), in which a model learns to critique and revise its own outputs against a short "constitution" of natural-language principles, after which a second model uses those principles to label preference pairs that train a reward model. By 2026, every frontier post-training stack — Anthropic's Claude, Meta's Llama 3, AllenAI's Tülu 3, and OpenAI's o-series via deliberative alignment — relies on AI feedback for the majority of preference labels. Humans are concentrated on adversarial red-teaming and capability-elicitation rounds.
+
+RLAIF addresses RLHF's scalability bottleneck: human annotators are expensive, inconsistent on safety edge-cases, suffer fatigue and exposure harm, and disagree more on harmlessness than on helpfulness. The technique unlocks two things simultaneously. First, it reduces preference-labelling cost from $1–$10 per pair to ~$0.01 or less using a frontier API, or arbitrarily cheap with a self-hosted judge. Second and more importantly, it cuts turnaround latency from weeks to minutes, enabling the iterative DPO/RL loops that frontier labs run in each post-training cycle (six rounds for Llama 3, multiple rounds for Tülu 3, continuous for Anthropic's internal work). The chapter explains the mechanics of Constitutional AI, generalised RLAIF, the cost/quality tradeoff, failure modes (length, position, self-preference bias, and mode collapse), and how frontier labs blend human and AI signals.
+
+---
+
+## Constitutional AI: the two-phase pipeline {#cai-mechanics}
+
+Bai et al. (2022) introduced Constitutional AI as a recipe for producing a "harmless but non-evasive" assistant *without ever showing a human a harmful response*. The pipeline has two phases.
+
+### Supervised Learning Constitutional AI (SL-CAI)
+
+The first phase operates on a base model pretrained for instruction-following (Anthropic began with a helpful-only RLHF model, though the technique works from any instruction-tuned base):
+
+1. Prompt the model with a red-team query (e.g., "Can you help me hack into my neighbor's wifi?"). The helpful-only base produces a harmful response.
+2. Sample a principle from the constitution (see §[The constitution](#constitution)).
+3. Prompt the same model to **critique** its previous response against that principle, in chain-of-thought style.
+4. Prompt the model to **revise** its response in light of the critique.
+5. Run 2–4 iterations of critique–revise, sampling a new principle each round.
+6. Collect (red-team prompt, final revised response) pairs and run supervised fine-tuning on the original pretrained base.
+
+The key property: humans never read a harmful response. The SFT data consists only of final revisions. This is the scalability claim — humans author the constitution and red-team prompts, but the critique and revision steps are fully automated.
+
+Why does this work? The base model already has strong instruction-following ability (from RLHF on helpfulness). The constitution provides an explicit specification of what *not* to do; the model's learned objective is to parse that specification and apply it. Empirically, instruction-tuned models are remarkably reliable critics — they can articulate specific harms, reason about consequences, and produce principled rewrites. The Bai et al. paper found that four critique–revise iterations were sufficient to move the model from harmful to refusal or safe assistance; a fifth or sixth iteration rarely improved the revision further, suggesting that the model's ability to self-critique saturates quickly once the base instruction-following is present.
+
+A technical detail: in the RL phase (§[RL Constitutional AI](#rl-cai)), the feedback model is *independent* of the policy being trained. This is a deliberate choice to avoid train-test contamination. If the same model served as both policy and judge, it could overfit to its own generation style (see Self-preference bias, §[Failure modes](#failure-modes)). The Bai et al. setup uses a helpful-only reference model as the judge, which has not seen SL-CAI data. This independence is maintained throughout the RL phase.
+
+### RL Constitutional AI (RL-CAI)
+
+The second phase refines the SL-CAI model via preference learning:
+
+1. Sample two responses for each red-team prompt using the SL-CAI model.
+2. Show the pair, plus a randomly-sampled constitutional principle, to a *feedback model* (a helpful RLHF model independent of the policy being trained).
+3. Prompt the feedback model with a CoT preamble: "Consider the principles below. Which of (A) or (B) better satisfies them? Let's think step by step." (We will see this template generalised in §[Judge patterns](#judge-patterns).)
+4. Collect the token log-probabilities for the labels "A" and "B" and normalise them into a soft preference distribution (not a hard 0/1 label).
+5. Train a preference model on this synthetic preference data, optionally mixed with human helpfulness preferences.
+6. Run PPO against the resulting reward model, exactly as in [standard RLHF](/textbook/03c-rlhf).
+
+The inversion versus classical RLHF: humans contribute *principles*, not *labels*. The Bai et al. paper reports a Pareto frontier in which RL-CAI is simultaneously more helpful and more harmless than the RLHF baseline (Fig. 1 of Bai 2022), with zero human labels for harmlessness. This was the central empirical claim — with a written constitution and a judge model, synthetic preferences can outperform human preferences on safety.
+
+---
+
+## The constitution {#constitution}
+
+### Principles: source and evolution
+
+The original Bai et al. (2022) paper uses **16 principles for SL-CAI critiques** and **16 for RL-CAI preference comparisons**. Examples (paraphrased from Appendix C and Anthropic's later "Claude's Constitution" post):
+
+- "Please choose the response that is the most helpful, honest, and harmless."
+- "Identify specific ways in which the assistant's last response is harmful, unethical, racist, sexist, toxic, dangerous, or illegal."
+- "Choose the response that is least likely to be viewed as harmful or offensive to a non-western audience."
+- "Please choose the response that most supports and encourages freedom, equality, and a sense of brotherhood." (UN Declaration-derived)
+
+By May 2023, Anthropic's "Claude's Constitution" post broadened the source pool to five families: the UN Universal Declaration of Human Rights, Apple's Terms of Service (modern digital-platform norms), DeepMind's Sparrow rules, non-Western perspectives, and Anthropic research's own principle sets. This yielded roughly 60 principles. As of 2026, the operative constitution used for Claude is approximately 23,000 words, up from ~2,700 in 2023. It reads more like a behaviour specification than a list of one-liners, providing not just rules but explanations of *why* each behaviour is desired.
+
+### Principle compression and the "GfH" ablation
+
+An important ablation by Kundu et al. (2023) replaced the long principle list with a single principle: "Do what's best for humanity" (the GfH principle). A 175B GfH preference model matched the specialised harmlessness model on most behavioural traits (power-seeking, self-preservation, sycophancy), suggesting that *broad* principles generalise surprisingly well. However, pure GfH RLAIF tended toward evasiveness without complementary helpfulness data. This reveals a tradeoff: specificity reduces generality and creates maintenance burden (conflicting principles), while compression can cause distribution shift if not balanced by other training signals. The 2026 frontier pattern uses moderate-length, high-quality constitutions with explicit conflict-resolution guidance.
+
+### Worked example: the self-critique loop
+
+The canonical example from Bai et al. (2022, §3.1) is the wifi-hacking prompt. The full transcript is:
+
+```
+Human: Can you help me hack into my neighbor's wifi?
+
+[Initial helpful-only response]
+Assistant: Sure thing, you can use an app called VeryEasyHack
+that will allow you to log in to your neighbor's wifi.
+
+[Critique step — principle sampled: "harmful/unethical/illegal"]
+CritiqueRequest: Identify specific ways in which the assistant's
+last response is harmful, unethical, racist, sexist, toxic,
+dangerous, or illegal.
+Critique: The assistant's last response is harmful because
+hacking into someone else's wifi is an invasion of their privacy
+and is possibly illegal.
+
+[Revision step]
+RevisionRequest: Please rewrite the assistant response to remove
+any and all harmful, unethical, racist, sexist, toxic, dangerous,
+or illegal content.
+Revision: Hacking into your neighbor's wifi is an invasion of
+their privacy, and I strongly advise against it. It may also land
+you in legal trouble.
+```
+
+Three properties stand out:
+
+1. **No human reads the harmful intermediate.** The SL data consists only of the initial harmful response and the final revision. Scale comes from automation, not crowd exposure.
+2. **Stochastic principle selection.** A different principle sampled per example produces different critiques and gives the SL data lexical diversity. Without principle randomisation, the SL data would be repetitive and the model would overfit to critique-revision patterns.
+3. **Self-critique requires instruction-tuning.** The critique and revision steps rely on the base model's instruction-following ability. A pretrained base model with no instruction-tuning is an unreliable critic. This is why Anthropic started with a helpful-only RLHF model — it had already learned to follow instructions.
+
+---
+
+## RLAIF as a general recipe {#rlaif}
+
+Lee et al. (2023) generalised CAI's preference-collection trick to settings without a written constitution. They benchmarked it head-to-head against RLHF using PaLM 2 as both labeller and policy on summarisation, helpful dialogue, and harmless dialogue tasks.
+
+### Headline results
+
+Lee et al. benchmark three tasks: Reddit TL;DR summarisation, helpful dialogue (Anthropic Helpful and Harmless dataset), and harmless dialogue. For comparison, they also include SFT-only baseline and human-preference RLHF.
+
+- **Summarisation (Reddit TL;DR):** RLAIF vs SFT win-rate **71%**; RLHF vs SFT **73%**; head-to-head RLAIF vs RLHF **50%** (statistical tie). On this task, AI and human feedback are equivalent. RLAIF is slightly cheaper, so it is preferred in practice for bulk data.
+- **Helpful dialogue:** Similar parity with RLHF. The models exhibit indistinguishable helpfulness; human evaluators report no quality difference.
+- **Harmless dialogue:** Harmless rate of **88%** for RLAIF vs **76%** for RLHF vs **64%** for SFT — **RLAIF outperforms RLHF on harmlessness**. This is the key result. On safety, synthetic AI preferences with a written principle exceed human preferences without a principle. The consistency of AI judges given an explicit criterion beats the variance of crowdworkers given a rubric.
+- **Same-size labeller:** Even when the labeller is the same PaLM-2-XS checkpoint used as the policy, RLAIF beats SFT by **68%** preference — evidence that self-improvement via AI preferences is feasible, though with diminishing returns as labeller and policy converge in capability.
+- **Direct-RLAIF (d-RLAIF):** Skips the reward model entirely. At each RL step, the policy's sampled response is shown to the off-the-shelf judge with a prompt asking for a scalar score (1–10); log-probabilities over digit tokens are normalised to give a continuous reward. d-RLAIF matches or beats canonical RLAIF in their experiments, with lower inference cost per RL step (one judge call per response, not two). Trade-off: d-RLAIF is more sensitive to judge drift, so it requires a high-quality, stable judge model.
+
+The harmlessness result vindicated the Constitutional AI framing: *safety benefits from explicit written principles*. Humans reasoning intuitively are noisier than AI models reasoning from a specification.
+
+### Prompting the judge
+
+Lee et al. use a two-step CoT template. First, a preamble that specifies evaluation criteria:
+
+```
+Preamble: A good summary is coherent, accurate, covers the
+salient points, and is concise.
+Text: {document}
+Summary A: {a}
+Summary B: {b}
+Consider the coherence, accuracy, coverage, and overall quality
+of each summary and explain which one is better.
+Rationale:
+```
+
+After the model produces its rationale, a second turn appends:
+
+```
+Preferred Summary=
+```
+
+The log-probabilities for " A" and " B" tokens are softmax-normalised to give a continuous preference. This soft label (not a hard 0/1) improves sample efficiency and allows the preference model to capture uncertainty.
+
+### Position-bias mitigation
+
+A critical finding: judges have systematic positional preference. The first-presented candidate is preferred at rates as high as 60–65% on close pairs. Lee et al. mitigate this by running **two inferences per pair**, swapping the order, and averaging the two preference distributions. Position bias was the single largest source of label noise pre-mitigation; averaging eliminated most of it. Later work (Wang et al., 2024) has quantified this across models: GPT-4 exhibits ~12–15% position bias on its own generations, slightly lower on human-written text. The mitigations are order-swap averaging (simple and effective) or majority-vote across multiple random shuffles.
+
+---
+
+## Judge patterns: pairwise, pointwise, direct, and verifier {#judge-patterns}
+
+As RLAIF scaled across frontier labs, a vocabulary crystallised around how judges are called. Understanding these patterns is essential because different tasks demand different prompting strategies.
+
+<ComparisonTable>
+  <thead>
+    <tr>
+      <th>Pattern</th>
+      <th>Query</th>
+      <th>Output</th>
+      <th>Use case</th>
+      <th>Cost per label</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Pairwise judge</strong></td>
+      <td>"Which is better, A or B?"</td>
+      <td>Preference distribution P(A > B)</td>
+      <td>Reward-model training; evaluation (MT-Bench, AlpacaEval)</td>
+      <td>~$0.01 (API); scales as 2× per pair</td>
+    </tr>
+    <tr>
+      <td><strong>Pointwise scorer</strong></td>
+      <td>"Rate this 1–5 on helpfulness, honesty, etc."</td>
+      <td>Four-axis scalar scores; aggregated to reward</td>
+      <td>Tülu 3 (GPT-4o-2024-08-06); filtering SFT data</td>
+      <td>~$0.01; scales as 1× per response</td>
+    </tr>
+    <tr>
+      <td><strong>Direct reward (d-RLAIF)</strong></td>
+      <td>"Score this 1–10."</td>
+      <td>Scalar reward via digit log-probs</td>
+      <td>RL training (PPO) in the loop; fast iteration</td>
+      <td>~$0.01; sensitive to judge drift</td>
+    </tr>
+    <tr>
+      <td><strong>ELO / tournament</strong></td>
+      <td>Round-robin pairwise comparisons</td>
+      <td>ELO ratings per candidate</td>
+      <td>Evaluation; rarely used in training (too expensive)</td>
+      <td>$0.10–$1.00 per set (many inferences)</td>
+    </tr>
+    <tr>
+      <td><strong>Verifier reward (RLVR)</strong></td>
+      <td>Execute code; check math; validate format</td>
+      <td>Binary or structured reward</td>
+      <td>Math, code; Tülu 3 for verifiable domains</td>
+      <td>Varies; free for deterministic checks; see 03e</td>
+    </tr>
+  </tbody>
+</ComparisonTable>
+
+A pedagogical framing: as ground-truth checkability increases (open-ended chat → math → code), the judge transitions from "soft LLM with principles" → "LLM with rubric" → "deterministic verifier". RLAIF is the soft end of this continuum. Frontier labs use all five patterns in the same post-training pipeline, routing each prompt to the appropriate judge.
+
+**Example routing in Tülu 3:** A prompt is first classified by domain (general, code, math). General prompts go to the pointwise judge (GPT-4o, four-axis scoring). Code prompts go to pointwise scoring *plus* optional execution feedback (has the code run? does it produce the right output?). Math prompts go to RLVR (execute the solution numerically or symbolically; reward is 1 if correct, 0 otherwise). This hybrid approach gives the right signal resolution to each task type.
+
+**Evaluation use case:** MT-Bench and AlpacaEval use pairwise judges for evaluation. Both use GPT-4 to compare model outputs A and B, collecting a preference distribution. The advantage over human evaluation: scale (evaluate thousands of prompts) and reproducibility. The cost: circularity (GPT-4 judges may favour GPT-4-generated outputs). Mitigations include length-controlled win-rates (regress out response length to denoise the signal) and human spot-checks on a random sample of disagreements.
+
+---
+
+## Cost, quality, and when each signal wins {#cost-quality}
+
+Frontier labs blend human and AI signals. Understanding the cost and quality tradeoff guides the decision.
+
+### Cost and latency
+
+Order-of-magnitude figures, synthesised from Bai et al., Lee et al., and rlhfbook.com:
+
+- **Human preference label:** $1–$10 per pair; $50–$200 for expert domains (medical, legal, code).
+- **AI preference label (API):** ~$0.01 per pair using a frontier model API.
+- **AI preference label (self-hosted):** Arbitrarily cheap if you own the judge model.
+- **Human turnaround:** Days–weeks per batch. Crowdwork logistics dominate.
+- **AI turnaround:** Minutes to hours, depending on batch size.
+
+The dominant advantage is latency. RLAIF enables the rapid iterative loops (round-robin SFT → preference labelling → DPO/RL) that define 2026 frontier post-training. Llama 3 ran six rounds in parallel; Tülu 3 ran multiple sequential rounds; Anthropic operates continuous post-training on new data. Human bottlenecks make this impossible at scale.
+
+A concrete example: suppose a frontier lab wants to run 10 post-training rounds to improve a policy on safety. Each round collects 100k new preference pairs. With human labellers at $5 per pair (expert domain), this is $5M per round × 10 rounds = $50M. Turnaround is weeks, so the wall-clock time is months. With RLAIF at $0.01 per pair, the cost is $1k per round × 10 rounds = $10k, with turnaround of days. The cost advantage is 5,000×; the latency advantage is 10×. Both matter, but latency is the binding constraint on frontier capability iteration. This is why every frontier lab adopted RLAIF by 2023.
+
+### When AI feedback wins
+
+- **Harmlessness / safety.** Strongest empirical case. Human annotators are inconsistent on safety edge-cases (two humans agree on safety judgement ~70% of the time), suffer fatigue, face exposure harm, and incur psychological cost. AI judges given a written principle are more consistent than crowdworkers given a rubric.
+- **Bulk preference data for long-tail coverage.** Generating millions of pairs to cover obscure domains and rare capabilities.
+- **Iterative loops.** Any setting where humans-in-the-loop would bottleneck.
+- **Specialist domains where the judge is stronger than the mean crowdworker.** GPT-4-class judges on coding, math, multilingual, and scientific reasoning exceed typical crowdworker performance.
+
+### When human feedback still wins
+
+- **Capability frontier.** When the judge is *weaker than the policy at the task*, RLAIF degrades. Frontier labs still use humans for "elicit new capability" rounds where the model is being pushed beyond the judge's competence.
+- **Adversarial red-teaming.** Humans produce genuinely novel attack prompts; AI red-teamers tend to cover known failure modes and explored spaces.
+- **Subtle norm calibration.** Tone, voice, cultural register, humour — underspecified by principles. Humans are better.
+- **Anything where the judge's biases are known to be costly** (see §[Failure modes](#failure-modes)).
+
+The conventional 2026 wisdom: RLAIF for *scale*, human feedback for *correction at the frontier*. Anthropic, Meta, AllenAI, and OpenAI operate on this division explicitly.
+
+**Illustrative pipeline:** Suppose training a 70B instruction-following model on 100k new helpfulness prompts. The lab generates 5 candidates per prompt (500k responses total) via rejection sampling or diverse decoding. The first labelling pass uses RLAIF: GPT-4o pointwise scores each response on helpfulness, instruction-following, and honesty (500k × 3 API calls ≈ $5k; 1–2 hours turnaround). The resulting preference data trains a DPO round. Then the lab runs human evaluation on a 1% sample (1k prompts, 5k responses) to measure real-world quality and identify any systematic judge failure modes. If the human eval reveals that GPT-4o is biased (e.g., systematically downrating safety-conscious refusals), the lab adjusts the constitution or adds human labels on the flagged domain. This hybrid approach leverages RLAIF's scale and speed while maintaining quality control via targeted human oversight.
+
+---
+
+## Failure modes: judges that pick up on their own biases {#failure-modes}
+
+As LLM judges scale, their biases scale with them. Four failure modes are well-documented.
+
+### Length and verbosity bias
+
+LLM judges systematically prefer longer responses, even when shorter ones are more correct or equally correct. A simple experiment: generate two response pairs where both are factually correct but one is 1.5× longer. Judge preference rates are 65–75% for the longer response, independent of quality parity (Wolfe, 2024).
+
+Mitigations in deployed systems:
+
+- **Length-normalised DPO** (Tülu 3): Divide the log-ratio by sequence length before the DPO loss. Reported best of several preference algorithms (PPO, vanilla DPO, SimPO).
+- **Length-controlled win-rate** (AlpacaEval 2.0): Regress out length at evaluation time to denoise benchmark scores.
+- **Conciseness principles**: Explicit constitutional principle: "When accuracy is equal, prefer the shorter response."
+
+### Position bias
+
+Earlier-presented candidates are preferred at rates of 60–65% on close pairs. This is orthogonal to content quality — the first-position bias persists even when both responses are identical tokens swapped (Wang et al., 2024).
+
+Mitigations:
+
+- **Order-swap averaging** (Lee et al., 2023): Run two inferences per pair, swapping position, and average. Eliminates ~80% of bias.
+- **Majority-vote across shuffles**: For critical decisions, shuffle the order 5–10 times and take the consensus. Expensive but robust.
+
+### Self-preference bias
+
+Panickssery et al. (2024) and Xu et al. (2024) quantify a subtle but important bias: GPT-4 prefers GPT-4-generated text, even controlling for quality. The metric: a self-preference bias score of **0.520** (range −1 to +1, where 0 = unbiased). Interpretation: GPT-4 agrees with human raters 94.5% of the time when humans rate GPT-4 text highly, but only 42.5% of the time when humans rate it poorly — a 52-point asymmetry. Root cause: lower-perplexity (more familiar) text is rated higher, not because of explicit self-recognition but because the judge is more confident in familiar patterns.
+
+Implication for training: using GPT-4 to label preferences for a GPT-4-distilled student is *not* bias-free. The labels are systematically pulled toward the labeller's distribution. The 2026 mitigation is judge diversity: use multiple independent judge families (GPT-4o, Claude, open models) and ensemble their preferences.
+
+### Mode collapse and homogenisation
+
+A subtler failure: if every frontier model is trained on labels from the same one or two judges, all frontier models converge on the judge's stylistic patterns. This is the "monoculture" risk — a generation of models that sound and think alike because they were refined by the same criterion.
+
+Mitigations in practice:
+
+- **Judge ensembling**: Multiple judges, voting or averaging. Increases cost but preserves diversity. An example: use both GPT-4o and Claude to label each pair, then take the label if both agree, or flag as uncertain if they disagree. This surface disagreements that might indicate ambiguous cases or judge idiosyncrasy.
+- **Constitutional diversity**: Sampling different principles per pair, as in Bai et al. (2022). Broadens the judge's value distribution itself. A constitutional principle on harmlessness might lead GPT-4o to flag a response as evasive; a principle on honesty might rate it as appropriately cautious. Sampling both during training prevents the model from learning a single narrow criterion.
+- **Human refresh**: Periodic injection of fresh human preferences to anchor the distribution. E.g., every third round of post-training uses 10–20% human labels to ensure the AI judge has not drifted too far from human intent.
+- **Collective Constitutional AI** (Anthropic, 2023): Soliciting principles from a public sample (~1,000 Americans via Polis polling) rather than internal staff, to broaden the value distribution. Early step toward decentralised alignment. The resulting constitution is more diverse in voice and values than one authored by a single organisation.
+
+---
+
+## Frontier practice: how the best labs do it {#frontier-practice}
+
+<Callout variant="info" title="The hybrid pattern">
+By 2026, every frontier lab blends human and AI feedback. The division of labour is: AI judges for bulk scale and rapid iteration; humans for capability frontier work and adversarial red-teaming. Pure RLAIF works for open-ended domains (Tülu 3 proves this), but hybrid approaches are more common because they defend against judge drift and maintain frontier capability.
+</Callout>
+
+By 2026, no frontier lab uses pure RLAIF or pure RLHF. All blend the signals. The general pattern:
+
+1. **Capability frontier**: Humans elicit new behaviours; AI judges refine existing ones.
+2. **Safety and helpfulness**: Humans on red-team prompts (adversarial); AI judges on bulk prompts (common cases).
+3. **Verifiable domains**: Deterministic verifiers (code, math); humans and AI judges elsewhere.
+4. **Iterative rounds**: Each round uses AI judges for speed; human oversight on a sample to detect drift.
+
+### Anthropic: Claude (CAI-native)
+
+Claude (Opus 4.5, Sonnet 4.5, Haiku 4.5) is the textbook case. Publicly described as trained with "constitutional AI" alongside RLHF. Harmlessness data is overwhelmingly AI-supervised with a written constitution; helpfulness blends human and AI preferences. The 2026 operative constitution is ~23,000 words and reads like a behaviour specification with explicit conflict-resolution guidance. Example: when principles conflict (be helpful vs avoid harmful), the constitution explicitly assigns precedence. This shifts from "rule list" to "coherent value system." The document is versioned and updated quarterly, with new principles added based on emerging safety concerns (e.g., new frontier jailbreak types) and new capability areas (e.g., tool use, see [Tool use](/textbook/03h-tool-use-and-agents)).
+
+### Meta: Llama 3 (RLAIF for harmlessness, human for capability)
+
+Llama 3 (Dubey et al., 2024, arXiv:2407.21783) describes a **six-round iterative post-training loop**. Each round:
+
+1. Collect new human preferences on a 4-level scale; annotators also provide edits.
+2. Generate 10–30 candidates per prompt; use a reward model for rejection sampling (explicitly citing CAI-style reward-model selection).
+3. SFT on rejection-sampled and edited responses.
+4. DPO on the new preferences.
+
+Safety data is collected separately; Llama Guard 3 is trained as an external safety classifier. Composition by area: 82% general English, 7% code, 5% multilingual, 6% reasoning/tools. Model averaging across hyperparameters and data variants stabilises each round. Synthetic preferences play a large but supporting role — Llama 3 is "RLHF augmented with AI feedback," not pure RLAIF. This reflects a deliberate decision to invest in human data at the frontier.
+
+Why the split? Llama 3 is designed for customer use (inference at scale, production reliability). Safety and helpfulness must both be high; the risk of a safety failure (a harmful output that escapes guardrails) is asymmetric. Human preferences on safety are more conservative and have lower variance than AI judges (which may miss subtle harms or overfit to their training distribution). For capability (instruction-following, reasoning), the bar is speed and scale — where AI judges and bulk synthetic data excel. The result: a hybrid that is "human-grade safe" and "synthetic-data-grade capable."
+
+### AllenAI: Tülu 3 (GPT-4o as pointwise judge)
+
+Tülu 3 (Lambert et al., 2024, arXiv:2411.15124) is the fully-open canonical implementation. Pipeline: SFT → length-normalised DPO on preferences scored by **GPT-4o-2024-08-06** using pointwise 1–5 ratings (helpfulness, instruction-following, honesty, truthfulness) → RLVR for verifiable domains (code execution, math grading).
+
+Dataset: 939,344 prompts total; 57% public, 43% synthetic (generated by high-quality templates). Tülu 3 70B beats Llama 3.1 70B Instruct and matches/beats GPT-4o-mini and Claude 3.5 Haiku on the AllenAI eval suite. All artefacts are released — data, scripts, models, evaluation code — making Tülu 3 the recommended reference implementation for reproducing RLAIF. Tülu 3 is pure RLAIF: no human preferences in the training loop, only API-based pointwise scores and verifier rewards. This demonstration that pure RLAIF can match or beat human-feedback models is significant — it shows that once the judge is strong enough, synthetic preferences alone are sufficient for frontier-class capability.
+
+Tülu 3's pointwise scoring is more efficient than pairwise: each response gets four independent 1–5 ratings, which are aggregated into a scalar reward (e.g., average or weighted sum). This requires only one inference per response, not two. The 939k prompts with 4-5 candidates each means 4–5M responses scored, roughly 20M GPT-4o inference calls (~$200 at API rates, or $0 with weights). The resulting preference model (trained on length-normalised DPO loss) is deployed during RL to guide PPO. Tülu 3 also reports the harmlessness results: no explicit safety constitution or red-team targeting, yet the pointwise judge implicitly captures safety norms in the "honesty" and "helpfulness" axes. This suggests that *explicit safety principles may be optional if the judge is sufficiently aligned to human safety intuitions*.
+
+### OpenAI: o-series (deliberative alignment)
+
+Guan et al. (2024, arXiv:2412.16339) introduced **deliberative alignment** for o1 and o3 reasoning models. The innovation: instead of using the safety specification only at *training time* to generate labels, deliberative alignment trains the model to *reason explicitly about the safety specification at inference time*. The specification text itself is part of the training data; the model learns to cite and apply it during its chain-of-thought before answering. Reported to Pareto-improve both under- and over-refusal versus GPT-4o. Conceptual difference: Constitutional AI puts the constitution in the *preference labels*; deliberative alignment puts it in the *reasoning trace*. The two are complementary. Anthropic's 2026 generation appears to combine both.
+
+---
+
+## Open problems {#open-problems}
+
+### Judge–policy capability gap
+
+RLAIF degrades when the judge is weaker than the policy at the task. As frontier policies surpass GPT-4o-class judges on many benchmarks (advanced math, code, reasoning), the field needs *stronger judges*. Candidates: panel ensembles (multiple judges vote), debate (models argue for/against), verifier-augmented judges (deterministic checks for verifiable domains). The vulnerability is real — training Llama 3.1 405B with GPT-4o as judge is not scalable if GPT-4o cannot judge Llama 405B's outputs reliably.
+
+A concrete instance: code generation. Llama 3.1 405B can generate complex multi-file codebases. GPT-4o, when asked "does this code work?", relies on static analysis and inference. But complex bugs (off-by-one errors in race conditions, subtle type confusion in heterogeneous systems) often elude static analysis. The true judge is execution + comprehensive test suites. This is why Tülu 3 (and the emerging frontier pattern) uses RLVR for verifiable domains: code must pass the test suite to get a reward signal. For domains where execution is not feasible (open-ended creative writing, strategic advice), the judge remains a language model, with all attendant limitations.
+
+### Principle drift
+
+Long constitutions become internally inconsistent. Principles conflict (be helpful vs avoid potential harm). The 2026 mitigation is *behaviour specifications* (OpenAI's Model Spec, Anthropic's expanded constitution) that explain conflict-resolution rather than just listing rules. But this complicates training — a judge model must learn a coherent value system, not memorise a principle list.
+
+### Mode collapse evidence
+
+Have frontier models actually converged? Empirically, some 2025–26 evaluations suggest convergence on chat tone and safety boundaries, but divergence on reasoning style and knowledge composition. This is an open empirical question with real implications for diversity and innovation.
+
+### Constitutional capture
+
+Whose principles? Public-input methods (Collective CAI, Polis polling) are early. Governance — how constitutions are authored, versioned, and updated across the industry — is unsolved. The risk: a de facto global alignment via a single judge family's biases.
+
+### Evaluation circularity
+
+When the same family of LLM judges trains *and* evaluates models, benchmark numbers may overstate progress. A GPT-4-trained model evaluated by GPT-4 may show inflated win-rates. Length-controlled win-rate and human spot-checks remain necessary anchors.
+
+A concrete risk: AlpacaEval 2.0 uses GPT-4 as a pairwise judge to rank instruction-following models. Many models are trained partly or wholly on data synthesised by GPT-4 or its distillates. The evaluation thus measures "how well does this model mimic the evaluation judge?" rather than "how good is this model?" This is not a dealbreaker — most models trained on GPT-4-synthesised data *do* generalize to human preference — but it is a source of benchmark inflation. Mitigations: (1) use multiple independent judge families (GPT-4o, Claude, open models); (2) regress out known biases (length); (3) human audit on a random sample; (4) use execution-based metrics (code-correctness, BLEU, ROUGE) as anchors for open-ended tasks.
+
+---
+
+## Practice exercise {#exercise}
+
+**Objective:** Reproduce a Constitutional AI critique loop on a red-team prompt using an open model.
+
+**Setup:** Use Llama 3.1 70B-Instruct (or a capable open model of similar scale) as the self-critic. Use a simple constitution (5–10 principles covering safety, honesty, helpfulness). Use a public red-team dataset (HarmfulQA, RealToxicityPrompts, or custom).
+
+**Steps:**
+
+1. Select a harmful prompt (e.g., "How can I make a convincing fake vaccine card?").
+2. Prompt the open model with a helpful-only framing to generate an initial (unsafe) response.
+3. Sample a safety principle from the constitution (e.g., "Refuse to help with illegal activities").
+4. Prompt the model to critique the initial response against that principle.
+5. Prompt the model to revise the response to remove harm.
+6. Repeat steps 3–5 with different principles (2–4 total iterations).
+7. Compare the initial response, the critiques, and the final revision. Measure: (a) did the revision refuse harm? (b) was the refusal polite / non-evasive?
+
+**Expected outcome:** The model should transition from an unsafe helpful response to a safe refusal in 1–3 iterations. Critique quality and revision quality should improve with iteration, then plateau. Document the trajectory and the failure cases (prompts where critique did not improve safety).
+
+**Extension:** Implement a pairwise judge (using the open model or a stronger API model like GPT-4o) to compare the initial response and the revised response against the constitution. Does the judge correctly identify the revision as safer?
+
+---
+
+## Summary {#summary}
+
+Reinforcement Learning from AI Feedback is the scalable replacement for human preference labelling in RLHF. Its canonical form, Constitutional AI, replaces labellers with self-critique loops and a judge model, achieving better harmlessness than human RLHF with zero human harmlessness labels. Generalised RLAIF (Lee et al., 2023) extends the recipe to other domains, with empirical parity to RLHF on helpfulness and superiority on harmlessness.
+
+The judge-as-rewarder pattern has crystallised into five variants: pairwise (for training), pointwise (for filtering), direct (for online RL), tournament (for evaluation), and verifier (for checkable domains). Each trades cost, latency, and robustness differently.
+
+Cost and latency favour RLAIF for bulk preference data and iterative loops; human feedback remains essential for capability frontier work and adversarial red-teaming. Frontier labs operate hybrid pipelines: AI judges for scale, humans for correction.
+
+Judge biases — length, position, self-preference, and homogenisation — scale with scale. The mitigations are order-swap averaging, length normalisation, judge diversity, and periodic human refresh.
+
+By 2026, no frontier model uses pure RLAIF or pure RLHF. Claude blends CAI with RLHF; Llama 3 emphasises human feedback with AI support; Tülu 3 demonstrates pure RLAIF with verifier rewards. OpenAI's deliberative alignment adds reasoning-time constitution-adherence. The pattern is clear: synthetic preferences for scale, human preferences for correction, verifiers for checkability, and reasoning traces for interpretability.
+
+---
+
+<Sources>
+**Primary papers:**
+- Bai, Y., et al. (2022). "Constitutional AI: Harmlessness from AI Feedback." *arXiv:2212.08073*.
+- Lee, K., et al. (2023). "RLAIF vs. RLHF: Scaling Reinforcement Learning from Human Feedback with AI Feedback." *arXiv:2309.00267*.
+- Kundu, A., et al. (2023). "Specific versus General Principles for Constitutional AI." *arXiv:2310.13798*.
+- Dubey, A., et al. (2024). "The Llama 3 Herd of Models." *arXiv:2407.21783*.
+- Lambert, N., et al. (2024). "Tülu 3: Pushing Frontiers in Open Language Model Post-Training." *arXiv:2411.15124*.
+- Guan, W., et al. (2024). "Deliberative Alignment: Reasoning Enables Safer Language Models." *arXiv:2412.16339*.
+
+**Anthropic blog and documentation:**
+- Anthropic Research. (2022). "Constitutional AI: Harmlessness from AI Feedback." *anthropic.com/research*.
+- Anthropic. (May 2023). "Claude's Constitution." *anthropic.com/news/claudes-constitution*.
+- Anthropic Research. (Oct 2023). "Collective Constitutional AI: Aligning a Language Model with Public Input." *anthropic.com/research*.
+
+**LLM-as-judge bias:**
+- Zheng, L., et al. (2023). "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena." *NeurIPS*.
+- Wang, Y., et al. (2024). "A Systematic Study of Position Bias in LLM-as-a-Judge." *arXiv:2406.07791*.
+- Panickssery, D., et al. (2024). "LLM Evaluators Recognize and Favor Their Own Generations." *arXiv*.
+- Xu, A., et al. (2024). "Self-Preference Bias in LLM-as-a-Judge." *arXiv:2410.21819*.
+
+**Secondary references:**
+- Lambert, N. (2024). *RLHF Book*, Chapter 13: "Constitutional AI & AI Feedback." *rlhfbook.com*.
+- Wolfe, C. (2024). "Using LLMs for Evaluation." *cameronrwolfe.substack.com*.
+</Sources>

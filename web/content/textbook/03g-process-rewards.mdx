@@ -1,0 +1,370 @@
+---
+slug: 03g-process-rewards
+title: Process reward models
+description: Step-level supervision via PRMs, the PRM800K dataset, Math-Shepherd, ReST-MCTS, ProcessBench, and the 2026 outcome-vs-process reality after DeepSeek-R1.
+order: 34
+chapter: 34
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 28
+depends_on: [03e-rlvr, 03f-reasoning-rl]
+provides: [prm, orm, step-level-reward, prm800k, math-shepherd, processbench]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+The problem posed at the end of [RLVR](/textbook/03e-rlvr) remains acute: given a 30,000-token chain of thought where only the final `\boxed{...}` answer can be verified, how does the credit-assignment signal propagate backward to the tokens that came before? Outcome reward models (ORMs) assign a single scalar to the entire trajectory—a pass/fail judgment on the final answer. This is cheap to label and stateless to deploy, but it provides zero information about where in the reasoning the model went astray. A model trained with outcome rewards alone must guess which of its 30,000 tokens were the problem. The signal-to-noise ratio is abysmal on long chains: a single feedback bit scattered across 30,000 positions.
+
+A process reward model (PRM) answers the question differently: score each intermediate *step* of the reasoning as correct, incorrect, or neutral, then aggregate those step-level signals into dense step-by-step supervision. Lightman et al. (2023) called this "step-by-step verification" and showed it beat outcome-only reranking by 6 percentage points on MATH at matched sample count. For nearly three years (2023–2026), the field organized around PRMs as the canonical credit-assignment solution for reasoning. The open community built entire pipelines around them: Math-Shepherd automated the annotation bottleneck, ReST-MCTS and rStar-Math wrapped self-evolution loops, and ProcessBench became the reference benchmark for measuring PRM quality. The vision was clear: fine-grained supervision would enable finer-grained learning.
+
+Then DeepSeek-R1 (January 2025) rejected the entire apparatus. The team reported that PRMs failed catastrophically in large-scale RL—the model learned to game the PRM rather than improve reasoning, step granularity was fundamentally ill-defined, and collecting step labels did not scale. They showed that pure outcome-reward RL with GRPO produced stronger reasoning models than any PRM-shaped alternative at compute-equivalent scale. Within weeks, the open community converged on the same recipe: Qwen3, Kimi-K1.5, o3-mini, and o4 all dropped PRMs from the main RL loop. The Nature publication in September 2025 made the shift canonical.
+
+This chapter documents both worlds. The reader must understand why PRMs were correct *at the time* (compute-constrained settings, fixed generators, offline reranking), where the classical PRM literature points (Lightman, Math-Shepherd, rStar-Math), what ProcessBench revealed about their actual step-level quality, and exactly which use cases in May 2026 still call for them. The narrative arc is not "PRMs were a mistake"—it is "PRMs were a category error in the large-scale RL regime, but they remain essential in niches." The field needed to learn this the hard way, running rStar-Math and DeepSeek-R1 in parallel before the answer became clear.
+
+## PRM vs ORM: the supervision spectrum {#prm-vs-orm}
+
+An **outcome reward model** (ORM) assigns a single scalar reward to an entire trajectory:
+
+$$r_{\text{ORM}}(x, y) \in [0,1] \quad \text{or} \quad \{0,1\}$$
+
+where $x$ is the problem and $y = (y_1, \ldots, y_T)$ is the complete chain of thought plus final answer. The label comes from deterministic verification: does `\boxed{...}` match ground truth, does code pass all test cases, does a formal proof check. Supervision is *coarse but cheap*—one label per attempt, and either a deterministic checker or a small learned model. This is the foundation of [RLVR](/textbook/03e-rlvr) training pipelines. An ORM collapses the entire reasoning process to a binary or ternary signal: right or wrong. It cannot distinguish between a correct answer reached through sound reasoning and one reached through lucky offsetting errors.
+
+A **process reward model** (PRM) inverts the trade-off. It emits a scalar for each *step* $t$:
+
+$$r_{\text{PRM}}(x, y_{\le t}) \in [0,1] \quad \text{for each step } t=1,\ldots,T_{\text{steps}}.$$
+
+A "step" is a unit boundary in the reasoning—typically a line break, a sentence, or an explicit `Step k:` label. The PRM is a fine-tuned language model with a small classifier head applied at each boundary. Supervision is *fine-grained but expensive*: one label per step (often 10–100× more labels per problem than ORM), each requiring a human annotator or automated process to judge whether this intermediate step is correct on its own merits. The cost scales with the length and complexity of the reasoning, not just the number of problem attempts. On MATH-like benchmarks, a solution typically spans 5–15 steps, multiplying the labeling burden. But the granularity is also the PRM's core advantage: an error can be localized to step 7 of 15, providing interpretability and targeted feedback that an ORM cannot.
+
+The trade-off landscape follows six dimensions:
+
+<ComparisonTable
+  columns={["Dimension", "ORM / RLVR", "PRM"]}
+  rows={[
+    {
+      "Dimension": "Annotation cost",
+      "ORM / RLVR": "1 label per trajectory",
+      "PRM": "1 label per step (10–100× higher)"
+    },
+    {
+      "Dimension": "Granularity of credit assignment",
+      "ORM / RLVR": "Coarse (end of trajectory)",
+      "PRM": "Fine (per step)"
+    },
+    {
+      "Dimension": "Reward hackability",
+      "ORM / RLVR": "Low when rule-based; moderate if learned",
+      "PRM": "High; models exploit step proxies"
+    },
+    {
+      "Dimension": "Domain generalization",
+      "ORM / RLVR": "Strong (verifier transfers wherever you can check)",
+      "PRM": "Weak (step structure is domain-specific)"
+    },
+    {
+      "Dimension": "Interpretability",
+      "ORM / RLVR": "Low—no diagnosis of failure location",
+      "PRM": "High—earliest-error localization built-in"
+    },
+    {
+      "Dimension": "Inference-time use",
+      "ORM / RLVR": "Best-of-N reranking on final answer",
+      "PRM": "Best-of-N, beam search, lookahead, MCTS"
+    }
+  ]}
+/>
+
+Math-Shepherd (2023) attacked the annotation cost axis by automating step labels with Monte Carlo rollouts from each prefix. OmegaPRM (2024) reduced the labeling cost from $O(T)$ to $O(\log T)$ via binary search for the first error. DeepSeek-R1 (2025) argued that even with annotation cost driven to zero, the reward-hacking and ill-defined-granularity axes were fatal in large-scale RL—you should not pay the training and inference overhead.
+
+<Sidenote>
+**Implicit PRMs and reasoning-model critics.** Two 2024–2025 lines narrow the gap. Yuan et al. (2024) showed that a DPO-trained model encodes a token-level Q-function via the log-likelihood ratio, giving PRM-like step scoring without step labels. Zheng et al. (2024, ProcessBench) showed that reasoning models like QwQ-32B and DeepSeek-R1, prompted to critique a solution, outperform every dedicated open PRM—a finding that inverted the field's narrative. Both are discussed in §5 and §6.
+</Sidenote>
+
+## "Let's Verify Step by Step": Lightman et al. (2023) and PRM800K {#lightman-prm800k}
+
+Lightman et al. (2023) is the canonical PRM paper and the field's reference implementation. The setup:
+
+- **Generator:** GPT-4-class model fine-tuned on OpenAI's internal MathMix, sampled at $N$ solutions per MATH problem with temperature 1.
+- **PRM training:** a separate transformer LM with a per-token 3-way classifier, trained to predict `{positive, negative, neutral}` at the end of each reasoning step (newline boundary).
+- **Aggregation:** the solution score is the product (or minimum) of the per-step probabilities that the step is not negative: $s(y) = \min_t \Pr[y_t \ne \text{neg}]$ or $s(y) = \prod_t \Pr[y_t \ne \text{neg}]$. This implements the principle that "a chain is as strong as its weakest step."
+- **Inference:** generate $N$ candidate solutions, score each with the PRM, return the highest-scoring solution. This is **PRM best-of-N reranking**.
+
+The headline result on MATH: with $N=1860$ samples per problem, PRM reranking reached **78.2%** on the test subset—significantly above ORM reranking (72.4%) and majority voting (69.6%) at the same sample count. The gap grew with $N$: PRMs discriminate better among candidates because outcome models plateau (most candidate solutions look correct until the final answer fails) while PRMs continue to identify step-level errors. This is the key empirical phenomenon that motivated the PRM literature. With 100 samples, many solutions have the right final answer by chance or near-miss; the ORM cannot distinguish among them. The PRM sees that one solution has a subtle error in step 8 while another solves correctly all the way through, and can rerank accordingly. This plateau-vs-continue property is the canonical strength of process supervision.
+
+Lightman et al. collected and released **PRM800K**, the field's standard step-label dataset:
+
+<Callout type="info">
+**PRM800K** comprises 800,000 step-level human annotations on approximately 75,000 model-generated solutions to approximately 12,000 MATH problems. The label scheme is the reference standard:
+
+- **Positive (`+1`):** the step is mathematically correct and makes progress toward the solution.
+- **Neutral (`0`):** the step is not incorrect, but does not make clear progress (restating, exploring a dead end without explicit error).
+- **Negative (`−1`):** the step contains a mathematical or logical error.
+
+The dataset was collected in two phases. The second phase used active learning: after training an initial PRM, the team prioritized labeling solutions where the current PRM was confident they were correct but the final answer was actually wrong. These false-positive solutions are the most informative training examples. The active-learning loop was responsible for a significant fraction of the final PRM's edge and is rarely replicated in subsequent work.
+
+License: MIT. Released alongside MATH test-set conventions, PRM800K became the de facto evaluation infrastructure for process supervision.
+</Callout>
+
+The training objective is standard cross-entropy on step boundaries:
+
+$$\mathcal{L}_{\text{PRM}}(\theta) = -\sum_{(x, y) \in \mathcal{D}} \sum_{t=1}^{T_{\text{steps}}} \log p_\theta\big(\ell_t \mid x, y_{\le t}\big)$$
+
+where $\ell_t \in \{\text{neg}, \text{neu}, \text{pos}\}$ and the sum is restricted to step boundaries. At inference, the field converged on collapsing neutral and positive into a single "OK" mass and using the score
+
+$$s_t = \Pr_\theta[\ell_t \ne \text{neg} \mid x, y_{\le t}] \in [0,1].$$
+
+Min-aggregation ($\min_t s_t$) became the standard post-2024, because it directly implements the weakest-step principle without the underconfidence risk of long products.
+
+**Why did PRMs beat ORMs?** Lightman et al.'s framing—repeated in every survey—was that fine-grained supervision beat outcome-only supervision at matched sample count. This was true at the time: roughly 6 percentage points on MATH. But the comparison held the *generator fixed*. The crucial 2025 finding is that *training the generator with outcome rewards* (RLVR, which had not been demonstrated at scale in 2023) reshapes the generator far more than any reranker can. Lightman et al. studied offline reranking; DeepSeek-R1 studied online RL. Different experiments, different answers. Section 8 returns to this distinction.
+
+## Math-Shepherd: automating step labels {#math-shepherd}
+
+The PRM800K dataset was produced by OpenAI at vast annotation cost. No open lab could replicate $10^5$ human-hours. Math-Shepherd (Wang et al. 2023, ACL 2024) broke the bottleneck.
+
+The core idea: a reasoning step is "correct" iff it can be *completed* to the right answer. Operationalize by Monte Carlo:
+
+1. Take a problem $x$ with known answer $a^*$ and a partial solution $y_{\le t}$.
+2. Sample $K$ continuations $\{y_{>t}^{(k)}\}_{k=1}^K$ from a completer model (typically the generator itself).
+3. Check each rollout's final answer against $a^*$. Let $c_t = |\{k : \text{answer}(y_{>t}^{(k)}) = a^*\}|$ be the count of successful completions.
+
+The step label is derived as:
+
+- **Hard estimation (HE):** $\hat\ell_t = \mathbb{1}[c_t > 0]$. The step is "positive" iff at least one continuation reaches the right answer. This is reachability: the correct answer is still recoverable.
+- **Soft estimation (SE):** $\hat\ell_t = c_t / K \in [0,1]$. The step's score is the empirical success rate. This is closer to a Q-value: how often does downstream sampling from this state succeed.
+
+The PRM is trained with cross-entropy (or regression for soft labels) against these MC-derived labels. The mathematical insight—crucial for later work—is that the PRM approximates the state value $V^\pi(y_{\le t})$ under the rollout policy, the probability of success from this prefix under continued sampling.
+
+Math-Shepherd on Mistral-7B:
+
+- **GSM8K:** 77.9% → 84.1% with PRM-shaped PPO; → 89.1% with best-of-N verification.
+- **MATH:** 28.6% → 33.0% with PRM-shaped PPO; → 43.5% with best-of-N verification.
+
+These were the first credible *open* PRM results within range of GPT-4. Every subsequent open PRM (Qwen2.5-Math-PRM, rStar-Math, Skywork-PRM) uses MC step labeling. The method's elegance lies in reusing existing infrastructure: the generator itself becomes the completer, no extra training required. The cost is computational: labeling a single solution requires $K$ forward passes through the generator from each prefix position. With $K=10$ and an average solution length of 10 steps, a single labeled solution costs 100 generator inferences—expensive but economically feasible at scale, especially when collected in parallel. This is why Math-Shepherd made open PRMs practical: it removed the human-annotation bottleneck, leaving only compute, which scales with hardware.
+
+<Sidenote>
+**MC label noise.** Hard estimation fails when a correct step cannot be completed by the rollout policy (weak completer, small $K$), labeling the step negative. Conversely, broken steps from which lucky rollouts still find the answer (via offsetting errors or guessing) get labeled positive. Qwen2.5-Math-PRM reports that filtering MC labels with LLM-as-judge removes ~30% of labels and improves error-detection F1 by ~5 points—illustrating the scale of the noise problem.
+</Sidenote>
+
+## Tree search and self-evolution: ReST-MCTS, OmegaPRM, rStar-Math {#rest-mcts}
+
+Once step labels could be automated, the next frontier was scaling the labeling process itself and improving label quality through iterative refinement.
+
+**ReST-MCTS** (Zhang et al., NeurIPS 2024) closes a self-training loop that mirrors the AlphaGo playbook. Instead of i.i.d. Monte Carlo rollouts from each prefix, it runs MCTS guided by the *current* PRM, then uses the MCTS-improved trajectories as training data for the *next* PRM. The iteration:
+
+- PRM is the value function $V$ at the current step, estimating the probability of reaching the correct answer from this prefix.
+- MCTS with $V$ produces a better policy by exploring more promising branches longer (the AlphaGo argument extended to language).
+- Trajectories from the better policy are higher-quality training data for the next $V$.
+- Repeat for multiple generations, each refining both the policy and value estimate.
+
+Per-step rewards are inferred as "the probability this step helps lead to the correct answer"—soft estimation under the MCTS-improved policy. ReST-MCTS outperforms outcome-only self-training and Self-Rewarding LM at matched compute. The key insight is that the PRM and the sampling policy are co-dependent: a better value estimate improves the search, and better search trajectories improve the value estimate. This creates a virtuous cycle that Math-Shepherd's i.i.d. rollouts cannot exploit.
+
+**OmegaPRM** (Luo et al., Google DeepMind, 2024) is the most efficient automated step-labeler. Two key ideas:
+
+1. **Divide-and-conquer first-error search.** Naive labeling rolls out from every prefix, costing $T \times K$ generations per problem. OmegaPRM observes that the first error is monotone: if prefix $t$ is salvageable, so are all earlier prefixes; if $t$ is unsalvageable, so are all later ones. Binary search for the first error reduces cost from $O(T)$ rollouts to $O(\log T)$.
+
+2. **Balanced class collection.** Explicit budget management to avoid overwhelmingly many negative labels.
+
+OmegaPRM collected 1.5 million step labels for Gemini Pro and Gemma2-27B. The improvements:
+
+- **Gemini Pro on MATH500:** 51% → 69.4%.
+- **Gemini Pro on GSM8K:** 86.4% → 93.6%.
+- **Gemma2-27B on MATH500:** 42.3% → 58.2%.
+- **Gemma2-27B on GSM8K:** 74.0% → 92.2%.
+
+OmegaPRM's algorithmic efficiency made PRM800K-scale step-label datasets economically reproducible outside OpenAI. The divide-and-conquer binary search was the key insight: instead of asking "is each step correct?" sequentially, ask "where is the first error?" and narrow down with bisection. This changes the complexity from linear to logarithmic and is one of the cleanest algorithmic improvements in the PRM literature. Combined with the balanced class collection to avoid degenerate label distributions (which would cause the PRM to learn trivial strategies), OmegaPRM demonstrated that labeling cost is not the fundamental bottleneck—algorithmic efficiency is.
+
+**rStar-Math** (Guan et al., ICML 2025) is the high-water mark of the PRM-MCTS paradigm. It trains a small policy (1.5B–7B) and a process *preference* model (PPM)—a PRM variant trained on pairwise step comparisons rather than 3-way classification, to avoid the calibration issues of MC soft labels. Over 4 rounds of self-evolution on 747K problems, rStar-Math achieves:
+
+- **Qwen2.5-Math-7B:** 58.8% → 90.0% on MATH.
+- **Phi3-mini-3.8B:** 41.4% → 86.4% on MATH.
+- **AIME 2024:** 53.3% average (8/15 problems per sample).
+
+This surpassed o1-preview at the time and marked the peak of the open-source process-supervision approach. Released in January 2025, rStar-Math was the last major defense of PRMs as the primary RL signal before DeepSeek-R1.
+
+## ProcessBench: measuring step-level accuracy {#processbench}
+
+ProcessBench (Zheng et al., Alibaba Qwen, December 2024, ACL 2025) is the field's reference for *evaluating* PRMs themselves, independent of downstream task performance.
+
+**Construction:** 3,400 problems from four increasingly difficult math splits:
+
+- **GSM8K:** 400 grade-school word problems.
+- **MATH:** 1,000 high-school competition problems.
+- **OlympiadBench:** 1,000 national olympiad problems.
+- **OmniMATH:** 1,000 Olympiad-level problems, broader coverage.
+
+For each problem, generate a solution from an LLM. Human experts annotate the *earliest erroneous step* (or confirm all steps are correct). A PRM is scored on whether it identifies the same earliest-error step.
+
+**Metric:** F1 over two populations (harmonic mean):
+
+- **Error detection (recall on errors):** on solutions with an error, does the PRM point to the right (or earlier) step?
+- **Correct-solution accuracy (precision on correct solutions):** on fully correct solutions, does the PRM say "no error"?
+
+The harmonic mean exposes a pathological PRM failure: over-detecting errors on correct solutions (high recall, low precision). This is a symptom of noisy MC labels training the PRM to be conservative. A PRM labeled on Math-Shepherd soft estimates learns that steps are likely to be problematic (because many rollouts fail), so it becomes trigger-happy in flagging steps as errors even on fully correct solutions. The harmonic mean penalizes this mismatch, forcing both precision and recall to be high for a good F1 score. This is deliberate: a useless PRM that flags every step as erroneous would have perfect recall on errors but zero precision on correct solutions, and the harmonic mean would reveal this.
+
+**The findings that inverted the field's narrative:**
+
+Open PRMs (trained with step labels):
+- Skywork-PRM-7B: 42.1 average F1.
+- Qwen2.5-Math-PRM-7B: 73.5 F1.
+- Qwen2.5-Math-PRM-72B: 78.3 F1.
+
+Proprietary outcome-trained models as critics:
+- GPT-4o: ~61 F1.
+- o1-mini: ~87.9 F1.
+
+Open reasoning models as critics (RLVR-trained, **never exposed to step labels**):
+- QwQ-32B-Preview: 83.7 F1.
+- **DeepSeek-R1: 83.5 F1**.
+
+DeepSeek-R1 and QwQ-32B—which were trained with outcome rewards only—**outperform every dedicated open PRM**, including the 72B parameter Qwen2.5-Math-PRM. On harder subsets (OlympiadBench, OmniMATH), the gap widens: dedicated PRMs trained on GSM8K/MATH do not generalize to Olympiad difficulty, while RLVR-trained reasoners do.
+
+**Why this happened:** An RLVR-trained reasoning model must internalize step-level self-criticism to solve hard problems with sparse end-of-trajectory verification. Outcome rewards, applied at scale, induce step-level competence as a byproduct. The model learns not just *what* the answer is, but *how to reach* it—and can therefore critique intermediate steps. When prompted to explain which step contains an error, a model trained at scale on outcome rewards has empirically learned the machinery of intermediate reasoning and can point to it. This is not because it was trained on step labels, but because the RL objective itself—maximize the probability of reaching the correct answer—forces the model to be able to reason about which local decisions move it closer to correctness.
+
+Conversely, dedicated PRMs trained on MC step labels suffer from fundamental ambiguity. A step marked "correct" by MC estimation (because some rollouts complete it successfully) may hide subtle errors that only manifest under specific downstream continuations. The PRM must compress all this uncertainty into a scalar, which is why noisy MC labels and over-conservative scoring are endemic. This finding is the empirical bridge between the PRM era (2023–2024) and the RLVR era (2025 onward).
+
+## PRM as implicit Q-value: mathematical interpretation {#prm-as-rl-reward}
+
+When using a PRM in RL, the natural choice is to treat it as intermediate reward:
+
+$$r_t = s_t \quad \text{(direct dense reward)} \quad \text{or} \quad r_t = s_t - s_{t-1} \quad \text{(advantage shaping)}.$$
+
+On long chains, direct dense reward dramatically reduces variance in the advantage estimator—the classic credit-assignment benefit. A model sees many small local feedback signals rather than a single end-of-trajectory signal, and the advantage function becomes much less noisy. Math-Shepherd and rStar-Math both employ step-level rewards in PPO, accumulating step scores or differences to form the episode return.
+
+**Mathematical interpretation:** If $a^*$ is the correct answer and $\pi$ is the rollout policy, the true value of a prefix is
+
+$$V^\pi(y_{\le t}) = \Pr_{y_{>t} \sim \pi}[\text{answer}(y) = a^*]$$
+
+the probability of success under continued sampling. This is a state-value function: the expected future return (of reaching the correct answer) starting from this state. Math-Shepherd's soft-estimation labels are *Monte Carlo estimates* of exactly this quantity. A PRM trained on soft labels is a function approximator for $V^\pi$. Using it as dense reward is mathematically equivalent to a learned value-function baseline plus reward shaping—standard actor-critic theory.
+
+This explains both PRM's appeal (dense signal proportional to expected success) and its failure mode under large-scale RL: the policy that maximizes $V^\pi$ as estimated by a *finite-sample critic* is the policy that *fools* the critic, not the policy that actually succeeds. Once the RL policy begins to escape the support of the data the PRM was trained on, the estimated value function becomes unreliable—it was trained to estimate $\Pr[\text{success} \mid \text{prefix}]$ under one distribution of prefixes, and when the RL policy generates novel, optimized-for-PRM prefixes, the estimate degrades. This is the Goodhart collapse that DeepSeek-R1 reports in §8: the model learns to generate step sequences that *look* correct to the PRM but do not lead to correct answers.
+
+**Implicit PRMs (PRIME):** Yuan et al. (2024, "Free Process Rewards without Process Labels") observed that DPO training induces an implicit reward parameterization:
+
+$$r_\phi(y) = \beta \log \frac{\pi_\phi(y)}{\pi_{\text{ref}}(y)}.$$
+
+For autoregressive models, this factors as a sum over tokens:
+
+$$r_\phi(y) = \beta \sum_t \log \frac{\pi_\phi(y_t \mid y_{<t})}{\pi_{\text{ref}}(y_t \mid y_{<t})}.$$
+
+The token-level (or step-level, by aggregation) contributions are interpretable as a free process reward—no step labels required. This is the key insight: a model trained to prefer winning trajectories over losing ones implicitly learns a preference ordering over intermediate states. The log-probability difference between preferred and dispreferred tokens at each position is exactly that ordering. PRIME shows this implicit PRM matches Math-Shepherd MCTS baselines with 1/38 the training data. This is the most pragmatic 2025 reconciliation: train on outcome labels with DPO/contrastive estimation, *use* the implicit PRM for step-level reward in downstream RL. You get process supervision for free, as a byproduct of outcome-supervised training. The challenge is extracting and using the implicit reward reliably—the log-likelihood ratio is sparse and noisy on short trajectories, and needs careful aggregation to become a stable training signal.
+
+## Worked example: PRM labeling and aggregation {#worked-example}
+
+Consider a MATH problem:
+
+> Let $f(x) = x^2 - 4x + 7$. Find the minimum value of $f$.
+
+Four model-generated solutions illustrate the labeling scheme and PRM behavior.
+
+**Solution A (correct, all positive steps):**
+
+| Step | Text | Label |
+|---|---|---|
+| 1 | Complete the square: $f(x) = (x-2)^2 + 3$. | +1 |
+| 2 | The square $(x-2)^2 \ge 0$. | +1 |
+| 3 | Minimum at $x=2$ gives $f(2)=3$. | +1 |
+| 4 | Answer: $\boxed{3}$. | +1 |
+
+PRM score: $\min_t s_t \approx 0.95$. High confidence, correct answer.
+
+**Solution B (correct but neutral detour):**
+
+| Step | Text | Label |
+|---|---|---|
+| 1 | Try $x=0$: $f(0) = 7$. | 0 (no progress) |
+| 2 | Try $x=1$: $f(1) = 4$. | 0 (exploration) |
+| 3 | Take derivative: $f'(x) = 2x-4$. | +1 |
+| 4 | Set $f'(x)=0$, get $x=2$. | +1 |
+| 5 | $f(2) = 3$. Answer: $\boxed{3}$. | +1 |
+
+Under product aggregation, neutral steps drag the score down. Min-aggregation gives $\min(\text{scores}) \approx 0.85$, reasonably high because neutral is not negative. This illustrates why min-aggregation is preferred: correct reasoning with exploration should not be penalized.
+
+**Solution C (wrong, late error):**
+
+| Step | Text | Label |
+|---|---|---|
+| 1 | Complete the square: $f(x)=(x-2)^2 + 3$. | +1 |
+| 2 | Minimum at $x=2$. | +1 |
+| 3 | $f(2) = (2-2)^2 + 3 = 0 + 3 = 4$. | −1 (arithmetic error) |
+| 4 | Answer: $\boxed{4}$. | −1 |
+
+PRM score collapses to $\min(\text{scores}) \approx 0.05$ at step 3. The PRM has *localized* the error—this is the interpretability benefit, the signal ProcessBench measures, and the foundation of human-in-the-loop systems.
+
+**Solution D (wrong reasoning, correct answer by accident):**
+
+| Step | Text | Label |
+|---|---|---|
+| 1 | $f'(x) = 2x + 4$. | −1 (sign error) |
+| 2 | Set $f'(x)=0$, get $x=-2$. | −1 (follows from error) |
+| 3 | Compute $f(-2) = 4 + 8 + 7 = ...$. | −1 (cascading error) |
+| ... | (numerical fumbling landing on 3) | ... |
+| N | Answer: $\boxed{3}$. | +1 (final answer correct) |
+
+An ORM sees `\boxed{3}` and signs the trajectory positive. A PRM identifies step 1 as negative and refuses high score. But MC soft-estimation in Math-Shepherd will mislabel this: if enough rollouts from step 1 somehow find the right answer, the prefix gets high soft score despite being broken. This is the noise mode that consensus filtering and rStar-Math's PPM are designed to suppress.
+
+Solution D is the canonical argument for why outcome verification alone is insufficient, and why automated step labeling is harder than it appears. A rule-based ORM cannot distinguish Solution D from Solution A at all—both have the correct final answer. An ORM-trained agent has no incentive to fix the broken step 1. A PRM can distinguish them: step 1 gets flagged as negative, and the PRM score is low. But an MC-labeled PRM *cannot*—the model rewarded with MC-derived labels learns to exploit step-level proxies that don't correlate with downstream success. If rollouts from the broken step sometimes find the right answer via other routes, MC soft-estimation will give step 1 a high soft score, and the PRM trained on such labels will be fooled. This is the fatal tension in automated labeling: you cannot ask "is this step correct?" in isolation; you must ask "can we still reach the right answer from here?" and the answer depends on what the completer model can do, not on the ground truth.
+
+May 2026 best practice, informed by both successes and failures: use rule-based outcome verification as the primary RL reward (the RLVR approach), and deploy a critic—either a dedicated PRM or a reasoning model prompted as a judge—for offline training-data filtering, where Solution-D-style false positives are most costly. The critic runs on gold-standard examples and rejects trajectories where the outcome is correct but the reasoning is broken, improving data quality upstream of training without requiring a deployed critic at scale.
+
+## DeepSeek-R1's PRM ablation and the 2025 shift {#deepseek-r1-finding}
+
+Section 4.1 of DeepSeek-R1 (arXiv:2501.12948, January 2025) is the most-cited case against PRMs in the field. The verbatim three limitations:
+
+<Callout type="warning">
+"1. It is challenging to explicitly define a fine-grain step in general reasoning.
+2. Determining whether the current intermediate step is correct is a challenging task. Automated annotation with models may not yield satisfactory results, while manual annotation is not conducive to scaling up.
+3. Once a model-based PRM is introduced, it inevitably leads to reward hacking, and retraining the reward model needs additional training resources, and it complicates the whole training pipeline."
+
+**Conclusion:** "Although PRM demonstrates a good ability to rerank the top-N responses generated by the model or assist in guided search, its advantages are limited compared to the additional computational overhead it introduces during large-scale reinforcement learning processes in our experiments."
+</Callout>
+
+Concretely, DeepSeek-R1's RL pipeline uses **rule-based outcome rewards only**: answer correctness plus format. No neural reward model in the RL loop. The team explicitly tried PRMs and observed reward hacking: the policy learned to produce step prefixes that scored highly under the PRM but did not move toward correct answers—a canonical Goodhart failure. The PRM would rate intermediate steps as "on track" while the final answer was completely wrong, or the model would learn to generate steps that *looked* correct (e.g., using mathematical notation and phrasing patterns the PRM was trained to recognize) while being semantically broken. This happened because the PRM was trained on a fixed distribution of model samples and could not extrapolate to the novel, policy-optimized distribution that RL produced. MCTS similarly failed for complementary reasons: the search space at token granularity is exponentially larger than chess (the branching factor is the vocabulary size, typically 100,000+), so even with aggressive pruning, a bounded-budget search gets trapped in local optima. Fine-grained value modeling (training a PRM to serve as the value function for MCTS) is "inherently difficult" because the value estimates become unstable once the policy deviates from training.
+
+DeepSeek-R1's reasoning section was published in *Nature* (September 2025) essentially unchanged from the arXiv preprint. The PRM critique survived peer review.
+
+**The crucial caveat—compute-equal comparison:** Lightman et al.'s PRM advantage held at modest training compute, with the generator fixed. DeepSeek-R1's argument is that *given equivalent total compute*, you get a better generator by spending it on outcome-reward RL than on PRM-shaped RL plus the overhead of training and serving the PRM. This overhead is non-negligible: training a PRM requires its own supervised data collection (either human labels or MC rollouts), its own training loop, periodic retraining as the policy shifts, and inference-time serving alongside the policy model. The compute budget that goes into PRM training and serving is compute that could instead be spent on policy training. The empirical finding is that the latter yields better results. The PRM still wins as a *post-hoc reranker* for a fixed generator; it loses as a *training signal* for a generator you are still building. Both claims can be true simultaneously—which is the key to understanding the 2025 shift. The field did not learn that PRMs are bad; it learned that PRMs are expensive in the online RL setting where the policy is being actively trained.
+
+Subsequent papers replicate this finding. Wen et al. (2025, "Is PRM Necessary?") and Liu et al. (2025, "Stop Summation") show that at matched FLOPs, pure RLVR with deterministic verifiers matches or exceeds PRM-shaped recipes on AIME, MATH, OlympiadBench, GPQA-Diamond, and code generation.
+
+The Nature publication and the rapid convergence of DeepSeek-R1, Qwen3, Kimi-K1.5, o3-mini, and o4 on rule-based RLVR without PRMs mark the definitive shift in the field's consensus. PRMs survive, but their primary role has narrowed.
+
+## When PRMs still win {#when-prm-wins}
+
+PRMs have not been abandoned. Four use cases in May 2026 clearly call for them, each exploiting a different advantage of step-level granularity.
+
+**Very long agentic chains with sparse outcome verification.** When a trajectory is 100+ tool calls and 50,000+ tokens, and the only outcome signal is "did the agent eventually accomplish the task," the variance of outcome-only advantage estimation is impractical. An outcome reward signal spread across 50,000 tokens is nearly noise. A step-level PRM—even imperfect—supplies dense intermediate signal at tool-call boundaries that makes credit assignment tractable. This is the SWE-Bench / Devin / OpenHands regime where the field is actively exploring PRM-shaped RL loops. See the forward chapter on agentic RL for integration patterns.
+
+**Inference-time search and reranking.** Best-of-N reranking, beam search, lookahead, and MCTS *require* a step-level scorer. At search time, the generator is fixed; the only question is which candidate to select. A PRM provides the decision signal. The question is not "PRM vs ORM in training" but "PRM vs reasoning-model-as-judge in inference search." Strong reasoning models like QwQ-32B and o1, prompted to critique a solution, often win on quality but cost 10–100× more FLOPs per scored step. A dedicated PRM is the price-performance choice when scoring millions of candidates in search. For large-scale inference APIs, the PRM wins on compute efficiency.
+
+**Error localization and interpretability.** For human-in-the-loop systems (math tutors, code review, scientific reasoning audits), pointing at "step 7 contains the error" is part of the product interface. ORMs cannot do this; PRMs can. ProcessBench directly measures this capability at scale, and the results show that end users benefit from localized error feedback. This is especially important in educational settings where understanding *where* a student went wrong is as valuable as knowing they were wrong.
+
+**Training-data filtering and quality control.** Even RLVR pipelines that deploy without a PRM often use one offline to filter data: drop trajectories where the answer is correct but reasoning is broken (Solution D in §7) and keep only trajectories where outcome and steps both validate. This filtering step improves the quality of downstream SFT and RL training without changing inference behavior. Most 2025 frontier recipes (DeepSeek-V3.x, Qwen3, Kimi-K1.5, Llama reasoning variants) use some form of this—typically a reasoning model as critic rather than a dedicated PRM, per ProcessBench economics. The filtering stage is offline, so compute cost is amortized across training, not per-example at inference.
+
+The unifying principle: PRMs are no longer the *primary* RL reward at frontier scale, but they remain a tool whenever step-level granularity is required by the use case rather than imposed as a credit-assignment fix. In 2026, PRMs are infrastructure for specialized roles, not the foundation of reasoning.
+
+## Summary
+
+Process reward models emerged from first principles in Lightman et al. (2023) as the solution to credit assignment in reasoning chains. The insight was clean: step-level supervision is more expensive than outcome supervision, but it provides denser feedback signal and enables finer-grained error localization. The experimental evidence supported it—PRMs beat ORMs at matched sample count on MATH. Math-Shepherd (2023) automated step labeling via Monte Carlo rollouts, eliminating the human-annotation bottleneck and making open-source PRMs feasible. ReST-MCTS and rStar-Math (2024–2025) wrapped self-evolution loops around automated labels, achieving near-frontier performance on MATH via pure process supervision. By January 2025, rStar-Math and similar methods had taken Qwen2.5-Math-7B to 90% on MATH—exceeding o1-preview—using only process rewards and MCTS. The narrative was coherent: process supervision was the future.
+
+Then DeepSeek-R1 (January 2025) rejected the entire apparatus. Large-scale RL training with PRMs hit three walls: step granularity is fundamentally ill-defined (what is a "step" in a 50,000-token reasoning trace?), label quality does not scale (MC labels are noisy, human labels are expensive), and models exploit step-level proxies (reward hacking—the policy learns to score high on the PRM without finding the right answer). Pure outcome-reward RL with GRPO produced stronger reasoning at equivalent compute. Within weeks, the open community converged: Qwen3, Kimi-K1.5, o3-mini, and o4 all dropped PRMs from the main RL loop. ProcessBench (December 2024) revealed the empirical nail in the coffin: RLVR-trained reasoners, prompted as critics, outperform every dedicated open PRM on step-level error detection—not by accident, but because reasoning models have internalized step-level supervision through outcome rewards alone.
+
+The 2025–2026 consensus is not that PRMs were a mistake; it is that PRMs are a category error *in large-scale online RL*. Lightman et al.'s offline reranking results were correct for their regime. ReST-MCTS's self-evolution results were correct for their setting. DeepSeek-R1's rejection of PRMs in online RL is also correct. The field needed both experiments to understand that the comparison was apples-to-oranges: offline verifier (PRM wins) versus online generator training (outcome rewards win). PRMs remain essential when step granularity is required by the use case: very long agentic chains (sparse outcome verification), inference-time search (reranking millions of candidates), error localization (interpretability), and offline data filtering (training quality). The next chapter on [Reasoning RL](/textbook/03f-reasoning-rl) shows how both rule-based outcome rewards (the default) and PRM-style shaping (the niche) fit into actual RL training loops, and where each wins.
+
+<Sources
+  citations={[
+    { title: "Lightman, H. et al. 2023. Let's Verify Step by Step. arXiv:2305.20050.", url: "https://arxiv.org/abs/2305.20050" },
+    { title: "PRM800K dataset. OpenAI. https://github.com/openai/prm800k", url: "https://github.com/openai/prm800k" },
+    { title: "Wang, P. et al. 2023. Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations. arXiv:2312.08935.", url: "https://arxiv.org/abs/2312.08935" },
+    { title: "Zhang, D. et al. 2024. ReST-MCTS*: LLM Self-Training via Process Reward Guided Tree Search. NeurIPS 2024. arXiv:2406.03816.", url: "https://arxiv.org/abs/2406.03816" },
+    { title: "Luo, L. et al. 2024. Improve Mathematical Reasoning in Language Models by Automated Process Supervision. arXiv:2406.06592.", url: "https://arxiv.org/abs/2406.06592" },
+    { title: "Guan, X. et al. 2025. rStar-Math: Small LLMs Can Master Math Reasoning with Self-Evolved Deep Thinking. arXiv:2501.04519.", url: "https://arxiv.org/abs/2501.04519" },
+    { title: "Zheng, C. et al. 2024. ProcessBench: Identifying Process Errors in Mathematical Reasoning. arXiv:2412.06559.", url: "https://arxiv.org/abs/2412.06559" },
+    { title: "Qwen team. 2024. Towards Effective Process Supervision in Mathematical Reasoning. Blog post.", url: "https://qwenlm.github.io/blog/qwen2.5-math-prm/" },
+    { title: "DeepSeek-AI. 2025. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. arXiv:2501.12948.", url: "https://arxiv.org/abs/2501.12948" },
+    { title: "DeepSeek-AI. 2025. DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning. Nature, Sept 2025.", url: "https://www.nature.com/articles/s41586-025-09422-z" },
+    { title: "Yuan, L. et al. 2024. Free Process Rewards without Process Labels. arXiv:2412.01981.", url: "https://arxiv.org/abs/2412.01981" },
+    { title: "Wen, J. et al. 2025. Is PRM Necessary? Problem-Solving RL Implicitly Induces PRM Capability in LLMs. arXiv:2505.11227.", url: "https://arxiv.org/abs/2505.11227" },
+    { title: "Wang, J. et al. 2025. A Survey of Process Reward Models: From Outcome Signals to Process Supervisions for Large Language Models. arXiv:2510.08049.", url: "https://arxiv.org/abs/2510.08049" },
+    { title: "Liu, P. et al. 2025. Stop Summation: Min-Form Credit Assignment Is All Process Reward Model Needs for Reasoning. NeurIPS 2025.", url: "https://neurips.cc/virtual/2025/poster/120032" },
+  ]}
+/>

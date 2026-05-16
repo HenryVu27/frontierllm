@@ -1,0 +1,711 @@
+---
+slug: 03f-reasoning-rl
+title: Reasoning RL — o1, R1, GRPO
+description: GRPO derivation from policy gradient, DeepSeek-R1's cold-start and RL-only recipe, the o-series long-CoT story, test-time compute scaling, and the May 2026 reasoning-model landscape.
+order: 33
+chapter: 33
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 42
+depends_on: [03c-rlhf, 03e-rlvr]
+provides: [grpo, long-cot, reasoning-rl, aha-moment, test-time-compute, distillation]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+The previous chapters of this module built up a layered story. [RLHF](/textbook/03c-rlhf) replaced the language-model pretraining loss with a policy-gradient objective shaped by a learned Bradley–Terry reward model and a co-trained value head. [RLVR](/textbook/03e-rlvr) replaced the learned reward model with a *verifiable* binary signal — a unit-test pass, a correct numerical answer — eliminating the feedback bottleneck of human preference labelling on structured tasks. This chapter asks what happens when both of those moves are executed at frontier scale, with base models of 671 billion parameters, on tasks requiring chains of thought thousands of tokens long.
+
+The answer, worked out publicly between September 2024 and January 2025 and refined through a cascade of subsequent releases, has three components. First, a critic-free variant of PPO called **GRPO** (Group Relative Policy Optimization) makes RL on long chains of thought financially feasible by replacing the learned value function with a Monte-Carlo baseline computed over a group of rollouts on the same prompt. Second, when GRPO is run with binary correctness rewards on math and code prompts for long enough, the model's chain-of-thought length grows from hundreds of tokens to thousands, and behaviours such as backtracking, self-verification, and mid-derivation course correction appear without being explicitly trained for — the "aha moment" of DeepSeek-R1. Third, the resulting model gains two new scaling axes that pretraining-only models do not have: the total amount of RL compute spent during training, and the number of tokens allowed at inference. Both axes are roughly log-linear in the range studied, both are independently tunable, and both are exposed as explicit knobs in every frontier reasoning API by May 2026.
+
+The chapter is self-contained on algorithm mechanics but builds on [RLHF](/textbook/03c-rlhf) for PPO notation and on [RLVR](/textbook/03e-rlvr) for the argument that binary, rule-based rewards are preferable to learned reward models on verifiable tasks. Forward references run to [process reward models](/textbook/03g-process-rewards) for inference-time selection and to [tool use and agents](/textbook/03h-tool-use-and-agents) for the extension of the rollout to multi-turn, multi-tool trajectories.
+
+The notation used throughout: $\theta$ is the policy parameter, $\pi_\theta$ the current policy, $\pi_{\theta_{\text{old}}}$ the rollout policy, $\pi_{\text{ref}}$ the reference (SFT) policy, $q$ a prompt sampled from the prompt distribution $P(Q)$, $o_i$ the $i$-th completion from a group of $G$ completions, $r_i \in \{0, 1\}$ the terminal reward on completion $i$, and $\rho_{i,t}$ the per-token importance ratio. The PPO clipping hyperparameter is $\varepsilon$; the KL coefficient is $\beta$.
+
+---
+
+## From PPO to GRPO: removing the critic {#grpo-derivation}
+
+### Why PPO is awkward for long-chain reasoning
+
+Recall the PPO objective from the [RLHF chapter](/textbook/03c-rlhf):
+
+$$
+\mathcal{L}^{\text{PPO}}(\theta) = \mathbb{E}_t \!\left[ \min\!\left( \rho_t(\theta)\, \hat{A}_t,\; \operatorname{clip}(\rho_t(\theta), 1-\varepsilon, 1+\varepsilon)\, \hat{A}_t \right) \right] - \beta\, \mathbb{D}_{\text{KL}}[\pi_\theta \,\|\, \pi_{\text{ref}}]
+$$
+
+with importance ratio $\rho_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_{\text{old}}}(a_t \mid s_t)$ and advantage $\hat{A}_t = \text{GAE}(r_t, V_\phi(s_t))$ computed via Generalised Advantage Estimation from a learned value function $V_\phi$. In standard RLHF, $V_\phi$ is initialised from the policy backbone and co-trained throughout. For models in the 7B–70B range, the value head costs roughly as much as the policy itself in memory and compute. For a 671-billion-parameter mixture-of-experts architecture like DeepSeek-V3-Base — the backbone behind DeepSeek-R1 — a co-trained value head of commensurate capacity is prohibitively expensive.
+
+The second problem is more fundamental: GAE computes per-token advantage estimates by bootstrapping from $V_\phi(s_t)$, the estimated value of the state at token $t$. On a chain of thought that is thousands of tokens long, with a single sparse reward at the final answer, the value function faces a credit-assignment problem of extreme difficulty. Each token receives only a fraction of the terminal signal, value targets are noisy across rollouts, and the resulting advantage estimates exhibit high variance. PPO addresses this with the clipping mechanism, which limits how much a single update can shift the policy, but clipping on a noisy signal is a poor substitute for a well-estimated baseline.
+
+For tasks with verifiable outcomes — math problems, unit-test suites, constrained reasoning — a cheap baseline is available for free without training any separate network: sample $G$ independent completions from the **same prompt** under $\pi_{\theta_{\text{old}}}$, compute the terminal reward for each, and use the group mean as the baseline. That single observation is the algorithmic content of GRPO.
+
+### GRPO: derivation from the policy gradient theorem
+
+The policy gradient theorem states that for any baseline $b(q)$ that is a function only of the prompt and not of the completion:
+
+$$
+\nabla_\theta \mathbb{E}_{o \sim \pi_\theta(\cdot \mid q)}\bigl[r(q, o)\bigr] = \mathbb{E}_{o \sim \pi_\theta}\bigl[(r(q,o) - b(q))\, \nabla_\theta \log \pi_\theta(o \mid q)\bigr]
+$$
+
+The subtraction of $b(q)$ is unbiased because $\mathbb{E}_{o \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(o \mid q)] = 0$, leaving the gradient expectation unchanged while reducing variance when $b(q)$ is close to $\mathbb{E}[r(q, o)]$.
+
+GRPO chooses $b(q) = \hat{\mu}_G(q) \equiv \frac{1}{G} \sum_{i=1}^G r_i$, the empirical mean of $G$ rollouts, and normalises the resulting advantage by the empirical standard deviation $\hat{\sigma}_G(q) \equiv \sqrt{\frac{1}{G}\sum_{i=1}^G (r_i - \hat{\mu}_G)^2}$. This standardisation ensures that the gradient magnitude is invariant to the prompt difficulty: easy prompts (where nearly all rollouts succeed, $\hat{\mu}_G \approx 1$) and hard prompts (where nearly all fail, $\hat{\mu}_G \approx 0$) contribute comparable gradient signal. Without this normalisation, the rare successful rollouts on hard prompts dominate the update.
+
+The PPO importance-ratio clipping and KL regularisation are then applied on top of this group-normalised baseline, yielding the full GRPO objective.
+
+---
+
+## The GRPO loss function {#grpo-loss}
+
+The canonical statement of the GRPO objective appears as Equation 3 of Shao et al. (DeepSeekMath, February 2024) and is reproduced unchanged in Algorithm 1 of DeepSeek-R1 (January 2025):
+
+$$
+\mathcal{J}_{\text{GRPO}}(\theta) = \mathbb{E}_{q \sim P(Q),\; \{o_i\}_{i=1}^{G} \sim \pi_{\theta_{\text{old}}}(\cdot\mid q)}
+\left[
+\frac{1}{G}\sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}
+\left\{
+\min\!\left[
+\rho_{i,t}(\theta)\, \hat{A}_{i,t},\;
+\operatorname{clip}\!\left(\rho_{i,t}(\theta),\, 1-\varepsilon,\, 1+\varepsilon\right) \hat{A}_{i,t}
+\right]
+- \beta\, \mathbb{D}_{\mathrm{KL}}\!\left[\pi_\theta \,\Big\|\, \pi_{\text{ref}}\right]
+\right\}
+\right]
+$$
+
+with per-token importance ratio
+
+$$
+\rho_{i,t}(\theta) = \frac{\pi_\theta(o_{i,t}\mid q, o_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t}\mid q, o_{i,<t})}
+$$
+
+and **group-normalised advantage**, constant across all tokens within completion $i$:
+
+$$
+\hat{A}_{i,t} = \frac{r_i - \operatorname{mean}(r_1, \ldots, r_G)}{\operatorname{std}(r_1, \ldots, r_G)} \qquad \text{for every } t \in [1, |o_i|]
+$$
+
+The KL term uses the unbiased $k_3$ estimator of Schulman (2020), which is always non-negative, differentiable, and has lower variance than the standard sample-based KL:
+
+$$
+\mathbb{D}_{\mathrm{KL}}\!\left[\pi_\theta \,\big\|\, \pi_{\text{ref}}\right]
+= \frac{\pi_{\text{ref}}(o_{i,t}\mid \cdot)}{\pi_\theta(o_{i,t}\mid \cdot)}
+- \log\!\frac{\pi_{\text{ref}}(o_{i,t}\mid \cdot)}{\pi_\theta(o_{i,t}\mid \cdot)} - 1
+$$
+
+<Callout variant="note" title="No value head">
+GRPO has no learned value function, no GAE computation, and no bootstrap target. The advantage $\hat{A}_{i,t}$ is the same scalar for every token in completion $i$ — computed entirely from the group's terminal rewards. This is the entire innovation. Everything else (importance ratio, PPO clipping, KL regularisation) is inherited from PPO.
+</Callout>
+
+### Group baseline: properties and limits
+
+The group mean $\hat{\mu}_G$ is a Monte-Carlo estimate of the prompt-conditional expected return $b^*(q) = \mathbb{E}_{o \sim \pi_{\theta_{\text{old}}}}[r(q, o)]$ under the rollout policy. Substituting the sample mean for the population mean introduces bias relative to the oracle baseline, but this bias vanishes as $G \to \infty$. The variance of the gradient estimator scales as $O(1/G)$, which is why DeepSeek-R1 uses $G \in \{16, 64\}$ rollouts per prompt depending on training stage — larger groups reduce gradient variance at the cost of $G$ forward passes.
+
+Two edge cases require implementation care. When $G = 1$, the baseline equals the single reward and the gradient is identically zero — GRPO requires $G \geq 2$. When all $G$ rewards are equal (all completions succeed or all fail), $\hat{\sigma}_G = 0$ and the normalised advantage is undefined. Implementations either skip such groups entirely (the "Dynamic Sampling" strategy introduced in DAPO, discussed in the [frontier landscape section](#frontier-landscape)) or set the advantage to zero, wasting the compute on those rollouts.
+
+The reported hyperparameters from DeepSeekMath, which carry over to R1: $G = 64$, $\beta = 0.04$, learning rate $1 \times 10^{-6}$, maximum sequence length 1024 tokens (raised in subsequent R1 training stages), batch size 1024 prompts per update.
+
+### Compute savings relative to PPO
+
+The elimination of the value head has a measurable impact. For a 7B-parameter reasoning model, GRPO reduces GPU memory by roughly half the cost of the value head and eliminates the GAE backward pass, reducing wall-clock per-step time by an estimated factor of two relative to a naive PPO implementation. DeepSeek does not publish a side-by-side PPO baseline at 671B-parameter scale; the argument for GRPO there is financial rather than empirical: training a commensurate value head for a 671B MoE policy during the R1 RL stage is prohibitively expensive, whereas GRPO makes the experiment tractable.
+
+---
+
+## DeepSeek-R1-Zero: the cold-start ablation {#r1-cold-start}
+
+DeepSeek-R1 (released 20 January 2025) contains two distinct models. Understanding R1-Zero first clarifies what the full R1 pipeline adds.
+
+**R1-Zero** is the proof-of-concept that reasoning behaviour can emerge from RL alone, with **no supervised fine-tuning cold start**. The recipe is minimal:
+
+1. Start from DeepSeek-V3-Base — the 671B-parameter MoE pretrained model (37B parameters active per forward pass), with no instruction tuning or chat alignment.
+2. Apply GRPO directly. The reward is entirely rule-based: $r = 1$ if the model's final boxed answer matches the gold answer (mathematics) or all unit tests pass (code); $r = 0$ otherwise. A secondary **format reward** — a small additive bonus for wrapping the chain of thought in `<think>…</think>` tags and the answer in `<answer>…</answer>` tags — is added to encourage structural consistency.
+3. Run for several thousand RL steps on a mixture of math and code prompts with verifiable answers.
+
+The headline training trajectory reported by DeepSeek: AIME 2024 pass@1 rises from **15.6 %** at step 0 to **71.0 %** by the end of training. The consensus@64 figure — majority vote across 64 independent samples — reaches **86.7 %**, exceeding OpenAI o1-0912's reported 74.4 % on the same benchmark. Average response length grows monotonically from a few hundred tokens at step 0 to several thousand tokens by the end of training, with **no length term in the reward**. The policy lengthens its chains of thought because longer chains succeed more often on hard problems.
+
+R1-Zero's weaknesses are also disclosed. The model frequently switches languages mid-derivation (mixing Chinese and English), exhibits formatting drift, and produces chains of thought that are difficult for humans to follow. Codeforces performance (1444 Elo, well below o1-0912's 1843) reveals that the pure-RL recipe transfers less effectively to competitive programming than to mathematical reasoning. These limitations motivated the four-stage pipeline of full R1.
+
+<Sidenote>The cold-start ablation is the scientifically cleanest contribution of the R1 paper. It demonstrates, with a fully open recipe and disclosed numbers, that the reasoning behaviours attributed to o1 (self-correction, extended chains of thought, backtracking) are learnable from binary outcome rewards with no additional supervision. All subsequent reasoning RL papers take R1-Zero as a baseline rather than a curiosity.</Sidenote>
+
+---
+
+## DeepSeek-R1: the four-stage production pipeline {#r1-rl-only}
+
+The production R1 model adds structure on top of R1-Zero's pure-RL foundation. The pipeline has four stages, all built on top of DeepSeek-V3-Base.
+
+| Stage | What | Why |
+| --- | --- | --- |
+| **1. Cold-start SFT** | A few thousand long-CoT examples, hand-curated for readability, formatted into the `<think>…</think>` / `<answer>…</answer>` template. Bootstrapped from R1-Zero outputs with human filtering and prompted reformatting. | Prevents the readability collapse visible in R1-Zero from step 0; provides a clean structural template for RL to optimise from. |
+| **2. Reasoning RL** | GRPO on math, code, science, and logical-puzzle prompts with verifiable binary rewards. Adds a **language-consistency reward** — the fraction of target-language tokens in the chain of thought — to suppress code-switching. | Recovers R1-Zero's reasoning capability on a cleaner base; the language-consistency term addresses R1-Zero's readability failure mode. |
+| **3. Rejection-sampling SFT** | Sample many completions from the stage-2 checkpoint on a broader prompt mix; filter for correctness (verifiable prompts) or for a judge-model score (non-verifiable prompts such as open-ended writing). Produce approximately 600 k reasoning samples and 200 k non-reasoning samples; fine-tune from V3-Base on this combined corpus. | Distil the stage-2 reasoning behaviour into a model that is also competent at general instruction-following tasks. The corpus is also used to produce all six R1-distill variants (see [long-CoT distillation section](#long-cot-distillation)). |
+| **4. General RL** | A second GRPO pass mixing rule-based rewards (math, code) with a learned reward model (helpfulness, safety). | Final alignment and harmlessness pass; structurally equivalent to the RLHF stage in [the RLHF chapter](/textbook/03c-rlhf). |
+
+The final R1 numbers reported by DeepSeek (pass@1 unless otherwise noted):
+
+| Benchmark | DeepSeek-R1 | OpenAI o1-1217 (reference) |
+| --- | --- | --- |
+| AIME 2024 | **79.8 %** | 79.2 % |
+| MATH-500 | **97.3 %** | 96.4 % |
+| Codeforces Elo | **2 029** (96.3rd percentile) | 2 061 |
+| GPQA Diamond | **71.5 %** | 75.7 % |
+
+At matched benchmark scores with open weights, R1 was the structural event that the rest of 2025 and 2026 reacted to. Every subsequent open-source reasoning lab's pipeline is a commentary on or refinement of this four-stage skeleton.
+
+<Callout variant="info" title="Cold start vs no cold start">
+The R1 paper's Table 3 provides a direct ablation: DeepSeek-R1-Zero (no SFT before RL) achieves 71.0 % AIME 2024 pass@1, while full R1 (with cold-start SFT, then RL) achieves 79.8 %. The cold-start SFT contributes roughly 9 percentage points on this benchmark — meaningful but not transformative. The qualitative difference is larger: R1-Zero's chains of thought are often unreadable, while R1's are coherent.
+</Callout>
+
+---
+
+## The o-series: the closed-frontier lineage {#o-series}
+
+OpenAI's o-series does not publish its RL recipe, reward design, or dataset. The account here is drawn exclusively from OpenAI's research blog posts and published system cards; inferences beyond those disclosures are labelled as such.
+
+### What OpenAI discloses
+
+From "Learning to Reason with LLMs" (12 September 2024) and the o1 and o3 system cards, the verbatim confirmed claims are:
+
+- "The o1 model series is trained with large-scale reinforcement learning to reason using chain of thought."
+- "Through training, the models learn to refine their thinking process, try different strategies, and recognize their mistakes."
+- "The performance of o1 consistently improves with more reinforcement learning (train-time compute) and with more time spent thinking (test-time compute)."
+
+The research blog presents two log-linear plots: pass@1 on AIME 2024 versus train-time RL compute, and pass@1 versus test-time inference compute (tokens generated at inference). Both are approximately linear on log-log axes over the range shown. OpenAI does not disclose the RL algorithm, reward source, dataset, or the slopes of these curves. *(Inferred from system card and blog: the reward design almost certainly includes verifiable math and code evaluation signals consistent with the RLVR framework in [the RLVR chapter](/textbook/03e-rlvr); the RL algorithm is not confirmed to be PPO or GRPO.)*
+
+### o1 evaluation numbers
+
+| Benchmark | GPT-4o | o1 pass@1 | o1 cons@64 | o1 re-rank@1000 |
+| --- | --- | --- | --- | --- |
+| AIME 2024 | 13.4 % | 74.0 % | 83.0 % | 93.0 % |
+| MATH-500 | 60.3 % | 94.8 % | — | — |
+| GPQA Diamond | 56.1 % | 78.0 % | — | — |
+| Codeforces Elo | 808 (11th pctile) | 1673 (89th pctile) | — | — |
+
+The 93 % re-ranked figure is particularly significant: the correct answer is present among the top samples most of the time; what is needed is a better selector. This is the empirical form of the test-time-compute scaling claim and directly motivates the study of process reward models for inference-time selection in [the process rewards chapter](/textbook/03g-process-rewards).
+
+### o3 and o4-mini
+
+o3 was previewed on 20 December 2024 and shipped with o4-mini on 16 April 2025. Disclosed numbers:
+
+| Benchmark | o1 | o3 |
+| --- | --- | --- |
+| AIME 2024 | 74.3 % | **91.6 %** |
+| AIME 2025 | — | **88.9 %** |
+| GPQA Diamond | 75.7 % | **87.7 %** |
+| Codeforces Elo | 1673 | **2706** |
+| SWE-Bench Verified | 48.9 % | **69.1 %** |
+| ARC-AGI (standard) | — | **75.7 %** |
+| ARC-AGI (high compute) | — | **87.5 %** |
+
+The ARC-AGI high-compute figure is the most explicit publicly demonstrated example of test-time-compute scaling: the same trained model, given substantially more inference budget per task, gains 11.8 percentage points. The o3 system card also introduces **deliberative alignment** — an explicit safety-specification reasoning step trained into the chain of thought, which improved refusal correctness on ChallengeStrongReject from 0.713 (GPT-4o) to 0.92 (o1) and higher for o3. *(Inferred from system card: deliberative alignment is most naturally implemented by including policy-compliance reasoning in the RL rollout template and rewarding on-policy refusal quality, but the system card does not confirm this mechanism.)*
+
+### GPT-5 and the unified reasoning stack *(inferred from blog)*
+
+GPT-5 (released 7 August 2025) is best understood as the productisation of the o-series: a single model that dynamically allocates chain-of-thought depth per query rather than a separate reasoning-mode model. OpenAI's headline claim is that "GPT-5 (with thinking) performs better than OpenAI o3 with 50–80 % fewer output tokens" — the test-time-compute frontier moves down and to the right rather than simply up. Thinking budget control is presented as a product surface, not a model selection decision. The technical mechanisms are not disclosed.
+
+---
+
+## Process supervision versus outcome supervision {#process-vs-outcome}
+
+### The supervision dichotomy
+
+Two signal types are available for RL on reasoning chains:
+
+- **Outcome-Reward Model (ORM)**: a single scalar at the end of the trajectory, scoring the final answer. GRPO and R1 use this with a binary rule-based ORM — string match or unit-test pass — which is the RLVR special case from [the RLVR chapter](/textbook/03e-rlvr).
+- **Process-Reward Model (PRM)**: a scalar after each reasoning step, scoring whether that step is correct given the steps before it. Trained from step-level annotations, either human (PRM800K: 800 000 step-level labels on MATH-derived chains, Lightman et al. 2023) or model-generated.
+
+Lightman et al. demonstrated that for best-of-$N$ selection on MATH, a PRM-based selector strictly outperforms an ORM-based selector with the same generator: 78 % versus 72 % at $N = 1860$. That result is the canonical citation for "process supervision wins" at inference time and was widely cited as the presumed mechanism behind o1's training during 2024.
+
+### Why R1 uses only outcome supervision
+
+DeepSeek-R1 explicitly rejects process reward models for RL training, giving three reasons in Section 2.3.2 of the paper:
+
+1. **Annotation cost.** A PRM useful for frontier-scale math requires step-level labels. PRM800K cost over a million dollars to produce via human annotation; generating them with a model judge requires a judge at least as capable as the policy being trained — a recursive dependency.
+2. **Reward hacking.** A learned PRM is a neural model and will be Goodharted: the trained policy will optimise the PRM's *perception* of stepwise correctness rather than actual correctness. This is the same failure mode as standard RLHF reward hacking, but at finer granularity and harder to detect.
+3. **Credit-assignment complexity.** Per-step rewards must be assigned to individual tokens in the policy gradient loss, compounding the exact problem GRPO was designed to sidestep.
+
+The R1 paper's empirical claim is the strong one: **binary outcome rewards alone, applied to a strong enough base model for long enough, produce emergent process-like behaviour**. The model learns to backtrack, self-verify, and flag errors mid-derivation — behaviours resembling what a PRM would supervise — because these behaviours are instrumentally useful for earning terminal reward. The "process" emerges for free.
+
+<Callout variant="note" title="When PRMs are still needed">
+Outcome supervision is not sufficient for all tasks. PRM-based selection remains the state of the art for inference-time best-of-$N$ search (detailed in [the process rewards chapter](/textbook/03g-process-rewards)), for tasks where correctness is not rule-checkable (open-ended mathematical proofs, compositional multi-step tool calls — see [the agents chapter](/textbook/03h-tool-use-and-agents)), and as auxiliary tie-breaking signals on prompts where binary outcome rewards provide zero gradient (all rollouts succeed or all fail). The R1 result narrows the domain where PRMs are needed for *training*; it does not eliminate them from *inference*.
+</Callout>
+
+---
+
+## The aha moment and emergent self-correction {#aha-moments}
+
+### What the paper shows
+
+Section 3.3 of the R1 paper, titled "Self-evolution Process of DeepSeek-R1-Zero," contains the now-canonical aha-moment example. The paper reproduces a rollout on a mathematical problem where, mid-derivation, the model produces (in translation):
+
+> "Wait, wait. Wait. That's an aha moment I can flag here. Let's reevaluate this step-by-step to identify if the correct sum can be…"
+
+and then re-derives the answer correctly. Two properties make this notable. First, the model was not trained to produce this behaviour: there is no "say 'wait' if uncertain" reward; the only positive signal is a correct final boxed answer. The behaviour arises because policies that detect and correct their own mistakes earn more terminal reward on average. Second, this example appears during a training run in which average response length grows monotonically from a few hundred to several thousand tokens with no length term in the reward — longer chains are more rewarded because they have more opportunities for error correction.
+
+### How robust is the aha-moment claim?
+
+Two pieces of follow-up work warrant a sceptical note. Liu et al. (Sea AI Lab, March 2025) argue that self-reflection patterns are already present in the base model at step zero and that RL primarily **amplifies** their frequency rather than instantiating a qualitatively new capability. Zeng et al. (March 2025, arXiv:2503.20783) study which base models support R1-Zero-style training and confirm that aha-style outputs are highly base-model-dependent: Qwen2.5-base exhibits them readily under RL; Llama-3-base does not, and requires cold-start SFT to bootstrap the template.
+
+The textbook framing: emergent self-correction is real in the sense that it becomes large, frequent, and causally connected to correctness under RL, but it is not magic. The base model must already contain the linguistic building blocks of reflection and backtracking, acquired during pretraining on human-generated text. What RL does is upweight those building blocks and chain them into longer, higher-reward reasoning sequences.
+
+### Length scaling as the leading indicator
+
+Empirically, average chain-of-thought length is the single most reliable leading indicator of reasoning RL progress in all published training curves. Across R1, Qwen 3, and Kimi K1.5, pass rate and mean tokens per response rise together, with the length curve typically steeper in early training. By May 2026, "thinking budget" — a user-specified cap on chain-of-thought tokens — is a first-class parameter on every frontier reasoning API, precisely because length and capability are so tightly coupled that controlling length is de-facto controlling reasoning depth.
+
+---
+
+## Long-CoT distillation: from R1 to the open ecosystem {#long-cot-distillation}
+
+### How DeepSeek built the SFT corpus
+
+The stage-3 rejection-sampling corpus that R1 distils into its smaller variants comprises approximately **800 000 samples**: roughly 600 000 reasoning samples generated by sampling from the stage-2 post-RL R1 checkpoint and filtering for verifiable correctness or judge-model score, plus roughly 200 000 non-reasoning samples from the DeepSeek-V3 SFT pool. This corpus is the active ingredient of the entire R1-distill family.
+
+### R1-distill: open-weight reasoning at every scale
+
+DeepSeek released six distilled checkpoints simultaneously with R1, produced by **SFT only** — no RL — on the 800 k corpus, applied to Qwen-2.5 and Llama-3 base models:
+
+| Model | AIME 2024 | MATH-500 | Codeforces Elo | Source |
+| --- | --- | --- | --- | --- |
+| R1-Distill-Qwen-1.5B | 28.9 % | 83.9 % | 954 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| R1-Distill-Qwen-7B | 55.5 % | 92.8 % | 1189 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| R1-Distill-Qwen-14B | 69.7 % | 93.9 % | 1481 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| **R1-Distill-Qwen-32B** | **72.6 %** | **94.3 %** | **1691** | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| R1-Distill-Llama-8B | 50.4 % | 89.1 % | 1205 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| R1-Distill-Llama-70B | 70.0 % | 94.5 % | 1633 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+
+R1-Distill-Qwen-7B at 55.5 % AIME notably exceeds QwQ-32B-Preview at 50.0 % — a 7-billion-parameter model distilled from a strong reasoning teacher outperforms a 32-billion-parameter model trained from scratch on the same task. The R1 paper also reports a negative result directly: applying GRPO to Qwen2.5-32B-Base without distillation reached only approximately 47 % AIME, well below the 72.6 % achievable via pure SFT distillation.
+
+<Callout variant="warning" title="RL versus distillation at small scale">
+At small model scale, SFT from a larger RL-trained teacher consistently outperforms running RL from base. The asymmetry is intuitive: RL requires the base model to already be capable of occasionally reaching the correct answer (so that the group baseline can separate good from bad rollouts), whereas SFT distillation simply requires the model to imitate the teacher's format and strategy. Once a strong reasoner exists at frontier scale, capability propagates downward cheaply via supervised learning.
+</Callout>
+
+### Qwen 3 Thinking (May 2025): the productionised pipeline
+
+Qwen 3 (Alibaba, May 2025, arXiv:2505.09388) generalises R1's pipeline into the form that has become the default for open-source reasoning post-training:
+
+1. **Long-CoT cold start** — SFT on a curated reasoning corpus covering mathematics, code, STEM, and formal logic, heavily filtered for quality and diversity.
+2. **Reasoning RL** — GRPO with verifiable rewards on approximately 3 995 query-verifier pairs. The flagship Qwen3-235B-A22B model's AIME-2024 score rises from 70.1 % to 85.1 % over 170 RL steps. Implementation details include large rollout batches, entropy control to prevent collapse, and off-policy training for sample efficiency.
+3. **Thinking-mode fusion** — continued SFT that merges the reasoning checkpoint with a non-reasoning instruction-tuned checkpoint, exposing `/think` and `/no_think` chat-template flags so the same model weights serve both modes.
+4. **General RL** — a final GRPO pass across roughly 20 task families including instruction following, format adherence, and agent tool use.
+
+Two implementation details from Qwen 3 are pedagogically important. First, **strong-to-weak distillation** replaces the full pipeline for sub-flagship sizes: Qwen3-235B-A22B-Thinking teaches smaller bases via SFT at roughly one-tenth the GPU-hours of running the four-stage pipeline per scale. Second, thinking-budget control is an emergent property of stage 3, not a separately trained capability: the inference stack splices in a stop token when the chain-of-thought length reaches the user-specified threshold, and the model emits its best current answer.
+
+---
+
+## Test-time compute as a new scaling axis {#test-time-compute}
+
+### Snell et al. (2024): the optimal compute trade
+
+Snell, Lee, Xu, and Kumar (August 2024, arXiv:2408.03314) provided the cleanest pre-o1 articulation of test-time scaling. Their headline result: an optimally-allocated test-time-compute strategy applied to a smaller model **beats a 14×-larger model at matched total FLOPs** on MATH. Two mechanisms are studied:
+
+1. **Search against a dense PRM** — best-of-$N$, beam search, or look-ahead guided by a process reward model scoring partial chains.
+2. **Adaptive distribution updates** — having the model iteratively revise its own answer at test time.
+
+A further result: a compute-optimal strategy that allocates *more* test-time budget to harder prompts is **four times more efficient** than uniform best-of-$N$. The mental model to retain: test-time compute is a substitute for training compute, with a problem-dependent exchange rate. Hard problems benefit more from additional inference budget; easy problems plateau quickly.
+
+### The two scaling curves
+
+Every reasoning model paper or system card since o1 publishes some version of two plots:
+
+- **Train-RL-compute scaling**: pass rate versus total RL steps or rollout-token count. Approximately log-linear in compute over the range studied, bounded above by a base-model-dependent ceiling.
+- **Test-time-compute scaling**: pass rate versus tokens generated at inference, with the trained policy held fixed. Also approximately log-linear; mediated by chain-of-thought length (serial scaling, o1/R1 style) or sample count (parallel scaling, Gemini Deep Think style).
+
+The critical point: these are *two independent axes* from *one* training run. Thinking budget at inference is a deployment-time hyperparameter, not a property of the trained weights, and adjusting it costs marginal inference compute rather than retraining.
+
+### Serial versus parallel scaling
+
+By mid-2025, the reasoning landscape splits along a structural axis. OpenAI o1/o3 and DeepSeek-R1 scale *serially*: a single chain of thought is extended token by token, with more depth producing more opportunity for error detection and correction. Google DeepMind's Gemini 2.5 Deep Think (August 2025) scales *in parallel*: the system "tests multiple ideas in parallel" and aggregates across branches. The Deep Think model card and blog describe post-training that combines RL with multi-sampling that lets the model "think longer but also sample multiple answers, refine them and then combine them to generate the final answer." Deep Think was the system underlying Google's IMO-2025 gold-medal result. The deployed Bronze-level configuration runs within a smaller per-query budget.
+
+Neither approach dominates the other at all compute budgets. Serial scaling is more memory-efficient per token generated; parallel scaling provides natural diversity that benefits best-of-$N$ and tournament selection strategies. GPT-5's claim to achieve o3-level performance with 50–80 % fewer output tokens (inferred from blog) suggests the two approaches are converging on a hybrid that dynamically routes between depth and breadth.
+
+### Length regulation: the Kimi K1.5 approach
+
+Kimi K1.5 (Moonshot AI, January 2025, arXiv:2501.12599) is the cleanest published account of controlling chain-of-thought length during training. Where pure GRPO allows length to grow unchecked, Kimi's RL uses an online policy mirror descent variant with an explicit **length penalty**:
+
+$$
+\lambda_i = 0.5 - \frac{\ell_i - \ell_{\min}}{\ell_{\max} - \ell_{\min}}
+$$
+
+$$
+r_{\text{len}}(i) = \begin{cases} \lambda_i & \text{if completion } i \text{ is correct} \\ \min(0, \lambda_i) & \text{if completion } i \text{ is incorrect} \end{cases}
+$$
+
+Short correct answers receive a positive length bonus; long correct answers receive only a reduced net reward; any incorrect answer receives at most zero length reward. This is the architectural opposite of unregulated GRPO: length is penalised unless it produces correct answers, bounding the equilibrium chain-of-thought length below the KV-cache limit.
+
+Kimi K1.5's long-CoT and short-CoT performance from the paper:
+
+| Mode | AIME 2024 | MATH-500 | Codeforces |
+| --- | --- | --- | --- |
+| Long-CoT | 77.5 % | 96.2 % | 94th percentile |
+| Short-CoT (distilled) | 60.8 % | 94.6 % | — |
+
+By August 2025, every frontier lab uses some form of length or compute-budget regularisation. Unregulated GRPO — where length grows without bound until it hits the sequence length cap — is a research baseline, not a deployment recipe.
+
+---
+
+## GRPO's failure modes and the 2025 variant landscape {#frontier-landscape}
+
+### Known pathologies of naive GRPO
+
+By mid-2025, the open-source practitioner community had documented four failure modes of GRPO applied naively to long-CoT training:
+
+**1. Entropy collapse.** Symmetric $\varepsilon$ clipping suppresses the upper tail of the importance ratio: exploratory tokens that shift the policy far from $\pi_{\theta_{\text{old}}}$ are always clipped regardless of their advantage. Over hundreds of steps the policy entropy crashes and the policy concentrates on a small set of templates, failing to explore new reasoning strategies. This is particularly damaging for hard problems where the correct approach is rare in early rollouts.
+
+**2. Zero-variance groups.** On prompts where all $G$ rollouts succeed or all fail, $\hat{\sigma}_G = 0$ and the advantage is undefined. The standard fix — skipping such groups — wastes compute on the prompts most representative of where the model is clearly over- or under-capable. Dynamic Sampling (DAPO) overcomes this by over-sampling prompts until each batch contains at least $B_{\text{eff}}$ prompts with mixed-outcome rollout groups.
+
+**3. Token-level versus sequence-level normalisation.** The $1/|o_i|$ factor in the GRPO loss applies equal per-token weight to short and long completions. But long completions contribute many more loss terms per prompt, introducing an implicit bias toward longer completions in the per-group objective. DAPO drops the per-completion length normalisation and uses token-level averaging across the full group instead.
+
+**4. Overlong-response reward noise.** When a rollout hits the maximum sequence length and is truncated, the terminal reward is mechanically zero regardless of whether the chain of thought was on track. The model receives a false negative gradient signal on long chains that were correct but cut off. DAPO introduces soft overlong reward shaping that linearly interpolates the reward in a length buffer near the maximum sequence length.
+
+DAPO (ByteDance Seed, March 2025, arXiv:2503.14476) applies all four fixes and reports **50 % AIME-2024 on Qwen2.5-32B** versus **47 % for R1-Zero-Qwen-32B** at 50 % of R1-Zero's training compute. DAPO is the de-facto 2025 GRPO baseline for open research.
+
+### Named variants
+
+Beyond DAPO, three variants appear frequently in the 2025–2026 literature:
+
+**GSPO** (Group Sequence Policy Optimization, Zheng et al., July 2025, arXiv:2507.18071): computes the importance ratio at the *sequence* level rather than per token — $\rho_i = (\pi_\theta(o_i \mid q) / \pi_{\theta_{\text{old}}}(o_i \mid q))^{1/|o_i|}$ — which corresponds to the geometric mean of per-token ratios. Sequence-level importance ratios are reported to improve stability on large MoE policies; GSPO was used in Qwen3-235B training.
+
+**VAPO** (ByteDance, April 2025): re-introduces a value model into a DAPO-style scaffold for finer per-token credit assignment, recovering some of PPO's advantage-estimation quality at the cost of the value-head compute that GRPO eliminated. Smooths training curves on large batches at the price of roughly twice the memory of pure GRPO.
+
+**REINFORCE++** (Hu, January 2025, arXiv:2501.03262): replaces the local group-normalised advantage with global batch normalisation across all prompts in the minibatch. Reported to be more stable than GRPO on small datasets where group variance is unreliable, and simpler to implement since no per-group standard deviation computation is required.
+
+### The May-2026 reasoning-model landscape
+
+| Model | Released | AIME 2024 | GPQA Diamond | Codeforces Elo | Source |
+| --- | --- | --- | --- | --- | --- |
+| OpenAI o1 | Sep/Dec 2024 | 83 % (cons@64) | 78.0 % | 1673 | [o1 system card](https://cdn.openai.com/o1-system-card-20241205.pdf) |
+| DeepSeek-R1 | Jan 2025 | 79.8 % | 71.5 % | 2029 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| DeepSeek-R1-Distill-Qwen-32B | Jan 2025 | 72.6 % | — | 1691 | [arXiv:2501.12948](https://arxiv.org/abs/2501.12948) |
+| Kimi K1.5 | Jan 2025 | 77.5 % | — | 94th pctile | [arXiv:2501.12599](https://arxiv.org/abs/2501.12599) |
+| OpenAI o3 | Apr 2025 | 91.6 % | 87.7 % | 2706 | [o3 system card](https://cdn.openai.com/pdf/2221c875-02dc-4789-800b-e7758f3722c1/o3-and-o4-mini-system-card.pdf) |
+| Qwen3-235B-A22B-Thinking | May 2025 | 85.1 % | — | — | [arXiv:2505.09388](https://arxiv.org/abs/2505.09388) |
+| Google Gemini 2.5 Deep Think | Aug 2025 | IMO-2025 gold (parent) | — | — | [Deep Think model card](https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-2-5-Deep-Think-Model-Card.pdf) |
+| GPT-5 (with thinking) | Aug 2025 | ≥ o3 (fewer tokens) | ≥ o3 | ≥ o3 | [OpenAI blog](https://openai.com/index/introducing-gpt-5/) *(inferred from blog)* |
+| Kimi K2 Thinking | Nov 2025 | SOTA HLE/BrowseComp | — | — | [Moonshot blog](https://moonshotai.github.io/Kimi-K2/thinking.html) |
+
+Three structural observations:
+
+1. **Open weights closed a six-month gap with closed-frontier reasoning** between September 2024 (o1) and January 2025 (R1). The open-vs-closed parity in early 2025 was entirely driven by R1 publishing the recipe.
+2. **Closed labs moved up the test-time-compute axis** rather than the train-time axis after R1 — GPT-5, Deep Think, and o3 all emphasise efficient or parallel reasoning rather than longer single chains.
+3. **The reasoning post-training skeleton has stabilised**: cold-start SFT → reasoning RL (GRPO or variant) → mode-fusion SFT → general RL, plus distillation for smaller sizes. New 2025–2026 papers vary the RL stage; the four-stage skeleton itself is unchanged.
+
+<Callout variant="note" title="Kimi K2 Thinking and the agent shift">
+Kimi K2 Thinking (November 2025) extends the rollout to include 200–300 tool calls per problem, with rewards based on task completion (browse, code execution, multi-hop QA) rather than just answer match. This is the bridge to [the tool use and agents chapter](/textbook/03h-tool-use-and-agents): once the rollout becomes a tool-call graph rather than a token sequence, the credit-assignment structure of GRPO changes fundamentally. Kimi K2 Thinking also applies INT4 quantization-aware training during post-training, yielding claimed lossless quality at roughly half the inference cost — a deployment-cost lever specifically motivated by the long chains of thought that reasoning RL produces.
+</Callout>
+
+<Callout variant="note" title="SmolLM3's mid-training-then-SFT alternative to reasoning RL">
+SmolLM3 (Allal et al., 2025) is the cleanest 2025 example of a small-open-model recipe that delivers a hybrid reasoning model *without* running reasoning RL. The recipe substitutes a 35 B-token reasoning **mid-training** stage — continued pretraining on a mixture of OpenThoughts3-1.2M and an NVIDIA Llama-Nemotron subset containing R1-generated reasoning traces (4 epochs, ≈140 B tokens; ChatML; wrapped packing) — for the GRPO + verifier loop the four-stage R1 / o-series skeleton uses. The SFT stage that follows then teaches the model to *toggle* between reasoning and non-reasoning modes from the same checkpoint, using a 1.0 B / 0.8 B reasoning / non-reasoning token split across 22 datasets (cf. [§SmolLM3 mid-training + SFT](/textbook/03a-sft#frontier-recipes)). The position SmolLM3 occupies in the variant landscape is therefore distinct from both R1 (RL on a strong base) and o-series (RL with a process-reward signal): it is a *distillation-as-pretraining* recipe that uses next-token loss on R1's traces in lieu of GRPO on R1's reward signal. The trade-off the playbook acknowledges is that capability ceiling is bounded by the trace generator (R1, in this case) rather than open-ended through self-play; the gain is removing the entire RL infrastructure cost. Whether this trade is favourable at frontier-large scale is an open question; at the 3B / quarterly-cadence regime, SmolLM3 is the worked example that says yes.
+</Callout>
+
+---
+
+## Worked example: a GRPO update on a four-sample group {#worked-example}
+
+The following traces every quantity in one GRPO update for a concrete prompt with group size $G = 4$. Production GRPO typically uses $G \in \{16, 64\}$; four samples are chosen for arithmetic readability.
+
+### Setup
+
+**Prompt $q$:** "What is the smallest positive integer $n$ such that $n^2 + n$ is divisible by 11?"
+
+The correct answer is $n = 10$, because $10^2 + 10 = 110 = 11 \times 10$. (Equivalently, $n(n+1) \equiv 0 \pmod{11}$ requires $n \equiv 0$ or $n \equiv 10 \pmod{11}$; the smallest positive solution is 10.)
+
+Four completions are sampled from $\pi_{\theta_{\text{old}}}$:
+
+| $i$ | Length $|o_i|$ | Final boxed answer | Reward $r_i$ |
+| --- | --- | --- | --- |
+| 1 | 220 | 10 | 1 |
+| 2 | 410 | 11 | 0 |
+| 3 | 340 | 10 | 1 |
+| 4 | 95 | 5 | 0 |
+
+Reward is rule-based: $r_i = 1$ if the boxed answer parses to 10, otherwise $r_i = 0$.
+
+### Step 1 — Group statistics
+
+$$
+\hat{\mu}_G = \frac{1 + 0 + 1 + 0}{4} = 0.5
+$$
+
+$$
+\hat{\sigma}_G = \sqrt{\frac{(1 - 0.5)^2 + (0 - 0.5)^2 + (1 - 0.5)^2 + (0 - 0.5)^2}{4}} = \sqrt{0.25} = 0.5
+$$
+
+### Step 2 — Per-completion advantages
+
+$$
+\hat{A}_1 = \frac{1 - 0.5}{0.5} = +1.0 \qquad \hat{A}_2 = \frac{0 - 0.5}{0.5} = -1.0
+$$
+
+$$
+\hat{A}_3 = \frac{1 - 0.5}{0.5} = +1.0 \qquad \hat{A}_4 = \frac{0 - 0.5}{0.5} = -1.0
+$$
+
+These are **scalars**. The same advantage value is broadcast to every token within its completion: token 1 of completion 1 and token 220 of completion 1 both receive $\hat{A}_{1,t} = +1.0$. Completions 1 and 3 will be upweighted; completions 2 and 4 will be downweighted.
+
+### Step 3 — Token-level importance ratios
+
+For each token $t$ in completion $i$:
+
+$$
+\rho_{i,t} = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t} \mid q, o_{i,<t})}
+$$
+
+At the first gradient step within an inner-loop iteration, $\pi_\theta = \pi_{\theta_{\text{old}}}$, so $\rho_{i,t} = 1$ for all $i, t$ and the PPO clipping is inactive. After one or two SGD steps the ratio drifts; clipping at $\varepsilon = 0.2$ (DeepSeek's default) then activates on tokens where the policy moved fastest. The clip bounds are $[0.8, 1.2]$.
+
+### Step 4 — Per-completion objective contribution (before KL)
+
+For completion $i$, the contribution is:
+
+$$
+\frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \min\!\left[ \rho_{i,t}\, \hat{A}_i,\; \operatorname{clip}(\rho_{i,t}, 0.8, 1.2)\, \hat{A}_i \right]
+$$
+
+**Completions 1 and 3** ($\hat{A} = +1.0$): each token pushes the policy to *increase* probability. The clip caps the gain at $\rho = 1.2$: tokens where the policy has already moved 20 % toward this completion receive no further gradient. The effective update per token is $\min(\rho, 1.2) \cdot 1.0$.
+
+**Completions 2 and 4** ($\hat{A} = -1.0$): each token pushes the policy to *decrease* probability. The clip bounds at $\rho = 0.8$: tokens where the policy has already moved 20 % away receive no further gradient. The effective update per token is $\max(\rho, 0.8) \cdot (-1.0)$.
+
+**Note on the length asymmetry.** Completion 2 has 410 tokens; completion 4 has 95. Under the per-completion normalisation $1/|o_i|$, each completion contributes with outer weight $1/G = 1/4$ to the group loss. Completion 2 therefore contributes 4.3× more loss terms per token-of-compute than completion 4, but both receive the same gradient weight in the outer mean. This asymmetry — longer completions produce more token-level gradient steps yet count equally in the group mean — is the specific inefficiency that DAPO's token-level loss normalisation corrects.
+
+### Step 5 — KL regularisation
+
+For each token, the KL term adds:
+
+$$
+\beta \left( \frac{\pi_{\text{ref}}(o_{i,t} \mid \cdot)}{\pi_\theta(o_{i,t} \mid \cdot)} - \log \frac{\pi_{\text{ref}}(o_{i,t} \mid \cdot)}{\pi_\theta(o_{i,t} \mid \cdot)} - 1 \right)
+$$
+
+with $\beta = 0.04$. Here $\pi_{\text{ref}}$ is the SFT checkpoint (R1's stage-1 cold-start model). When $\pi_\theta = \pi_{\text{ref}}$, the $k_3$ estimator evaluates to zero exactly; as $\pi_\theta$ diverges from $\pi_{\text{ref}}$, the term grows and resists further divergence. The $k_3$ form is always non-negative and differentiable, unlike the sample-based KL used in standard RLHF.
+
+### Step 6 — The gradient step
+
+The full per-prompt loss is:
+
+$$
+\mathcal{L}_q = -\frac{1}{4} \sum_{i=1}^{4} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \left\{ \min\!\bigl[\rho_{i,t}\, \hat{A}_i,\, \operatorname{clip}(\rho_{i,t}, 0.8, 1.2)\, \hat{A}_i\bigr] - 0.04\, \mathbb{D}_{\text{KL},i,t} \right\}
+$$
+
+(negated because GRPO maximises $\mathcal{J}$ while the optimiser minimises $\mathcal{L}$). One GRPO update consists of: (a) generating $G$ rollouts under $\pi_{\theta_{\text{old}}}$, (b) running 1–4 SGD steps on $\mathcal{L}_q$ while keeping $\pi_{\theta_{\text{old}}}$ fixed, then (c) refreshing $\pi_{\theta_{\text{old}}} \leftarrow \pi_\theta$. This outer-inner-loop structure is identical to PPO's; what is absent is any forward or backward pass through a value network.
+
+### Interpretation
+
+At the population level, this gradient step upweights the token sequences that appeared in correct completions and downweights those that appeared in incorrect completions, with the normalisation ensuring that the magnitude is the same regardless of whether the group mean was 0.1 (hard prompt) or 0.9 (easy prompt). The mechanism is coarse: token 1 of completion 1 ("Let") and token 220 of completion 1 ("$\boxed{10}$") receive the same advantage $+1.0$, even though the early tokens have no direct causal connection to the correctness of the final answer. This credit-assignment compromise is GRPO's central limitation. Over millions of prompts and rollouts, the noise averages out: token sequences that *tend* to lead to correct boxed answers become more probable, and the macroscopic "aha moments" of Section [aha-moments](#aha-moments) are the aggregate shadow of this per-token reweighting accumulated over thousands of training steps.
+
+---
+
+## Summary {#summary}
+
+GRPO is a single variance-reduction trick — the group-mean baseline — applied to the policy gradient estimator underlying PPO. The trick eliminates the learned value function, halving the memory and compute of RL on long chains of thought, and making reasoning RL financially tractable at frontier model scale.
+
+Running GRPO with binary outcome rewards on a sufficiently strong base model for sufficiently many steps produces three empirical phenomena: average chain-of-thought length grows without a length reward; behaviours resembling process supervision (self-correction, backtracking, error flagging) emerge without being explicitly trained; and the model's capability scales log-linearly with both train-time RL compute and test-time token budget.
+
+DeepSeek-R1 operationalised this into a four-stage pipeline — cold-start SFT, reasoning RL, rejection-sampling SFT, general RL — that as of January 2025 matched closed-frontier reasoning performance at open weights and set the template for every subsequent open-source reasoning model. The R1-distill family demonstrated that once a strong reasoner exists at large scale, SFT distillation propagates the capability to smaller models more cheaply than re-running RL from base.
+
+Naive GRPO has known failure modes: entropy collapse, zero-variance groups, length-normalisation asymmetry, and overlong-response noise. DAPO addresses all four and is the de-facto 2025 practitioner baseline. GSPO, VAPO, and REINFORCE++ address further stability issues for specific deployment contexts.
+
+The closed frontier — o1, o3, GPT-5, Gemini Deep Think — has moved along the test-time-compute axis faster than along the train-time axis since January 2025, converging on unified models that expose thinking budget as a deployment parameter. By May 2026, this parameter is first-class on every frontier reasoning API.
+
+The forward link to [tool use and agents](/textbook/03h-tool-use-and-agents): everything in this chapter assumed the reward is a function of a single final answer string. Once the rollout includes tool calls — web search, code execution, file edits, multi-turn dialogue — the reward becomes trajectory-level, the rollout becomes a directed graph of actions and observations, and the credit-assignment problem becomes substantially harder. That is the subject of the next chapter.
+
+---
+
+<Sources items={[
+  {
+    authors: "Shao, Z. et al. (DeepSeek-AI)",
+    year: 2024,
+    title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
+    venue: "arXiv:2402.03300",
+    url: "https://arxiv.org/abs/2402.03300",
+    note: "Introduces GRPO. Equation 3 is the canonical GRPO objective reused unchanged by DeepSeek-R1. Reported hyperparameters: G=64, β=0.04, lr=1e-6."
+  },
+  {
+    authors: "DeepSeek-AI",
+    year: 2025,
+    title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    venue: "arXiv:2501.12948",
+    url: "https://arxiv.org/abs/2501.12948",
+    note: "Primary source for R1-Zero numbers (AIME 15.6%→71.0%), four-stage pipeline, distillation table, and the aha-moment example. Released 20 Jan 2025."
+  },
+  {
+    authors: "Schulman, J.",
+    year: 2020,
+    title: "Approximating KL divergence",
+    venue: "joschu.net blog",
+    url: "http://joschu.net/blog/kl-approx.html",
+    note: "Derives the k_3 unbiased, non-negative KL estimator used in GRPO's regularisation term."
+  },
+  {
+    authors: "Schulman, J. et al.",
+    year: 2017,
+    title: "Proximal Policy Optimization Algorithms",
+    venue: "arXiv:1707.06347",
+    url: "https://arxiv.org/abs/1707.06347",
+    note: "PPO baseline. GRPO inherits the clipped surrogate objective and the outer/inner-loop update structure."
+  },
+  {
+    authors: "OpenAI",
+    year: 2024,
+    title: "Learning to Reason with LLMs",
+    venue: "OpenAI research blog",
+    url: "https://openai.com/index/learning-to-reason-with-llms/",
+    note: "o1 launch post. Contains the two log-linear scaling plots (train-time and test-time compute). Does not disclose RL algorithm, reward, or dataset."
+  },
+  {
+    authors: "OpenAI",
+    year: 2024,
+    title: "OpenAI o1 System Card",
+    venue: "arXiv:2412.16720",
+    url: "https://arxiv.org/abs/2412.16720",
+    note: "Source for o1 AIME/MATH/GPQA/Codeforces numbers, deliberative alignment description, and refusal-correctness improvement figures."
+  },
+  {
+    authors: "OpenAI",
+    year: 2025,
+    title: "OpenAI o3 and o4-mini System Card",
+    venue: "OpenAI",
+    url: "https://cdn.openai.com/pdf/2221c875-02dc-4789-800b-e7758f3722c1/o3-and-o4-mini-system-card.pdf",
+    note: "Source for o3 AIME 91.6%, GPQA 87.7%, Codeforces 2706, SWE-Bench 69.1%, ARC-AGI 75.7%/87.5% numbers."
+  },
+  {
+    authors: "OpenAI",
+    year: 2025,
+    title: "Introducing GPT-5",
+    venue: "OpenAI blog",
+    url: "https://openai.com/index/introducing-gpt-5/",
+    note: "Source for the '50-80% fewer output tokens vs o3' claim. No RL algorithm or architecture details disclosed."
+  },
+  {
+    authors: "Google DeepMind",
+    year: 2025,
+    title: "Gemini 2.5 Deep Think Model Card",
+    venue: "Google DeepMind",
+    url: "https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-2-5-Deep-Think-Model-Card.pdf",
+    note: "Describes parallel-branch reasoning architecture and IMO-2025 gold-medal result. Notes multi-sampling aggregation in post-training."
+  },
+  {
+    authors: "Lightman, H. et al.",
+    year: 2023,
+    title: "Let's Verify Step by Step",
+    venue: "arXiv:2305.20050",
+    url: "https://arxiv.org/abs/2305.20050",
+    note: "PRM800K: 800k step-level labels on MATH. PRM-based selector reaches 78% vs ORM's 72% at N=1860. Canonical 'process supervision wins' citation."
+  },
+  {
+    authors: "Snell, C., Lee, J., Xu, K., Kumar, A.",
+    year: 2024,
+    title: "Scaling LLM Test-Time Compute Optimally Can Be More Effective Than Scaling Model Parameters",
+    venue: "arXiv:2408.03314",
+    url: "https://arxiv.org/abs/2408.03314",
+    note: "Demonstrates smaller model + optimal test-time budget beats 14× larger model at matched FLOPs. Compute-optimal strategy 4× more efficient than uniform best-of-N."
+  },
+  {
+    authors: "Kimi Team (Moonshot AI)",
+    year: 2025,
+    title: "Kimi k1.5: Scaling Reinforcement Learning with LLMs",
+    venue: "arXiv:2501.12599",
+    url: "https://arxiv.org/abs/2501.12599",
+    note: "Describes the length-penalty reward formula. Long-CoT numbers: AIME 77.5%, MATH-500 96.2%, Codeforces 94th pctile. Long2short distillation variants."
+  },
+  {
+    authors: "Qwen Team (Alibaba)",
+    year: 2025,
+    title: "Qwen3 Technical Report",
+    venue: "arXiv:2505.09388",
+    url: "https://arxiv.org/abs/2505.09388",
+    note: "Four-stage post-training pipeline. Qwen3-235B-A22B AIME rises 70.1%→85.1% over 170 RL steps. Strong-to-weak distillation at ~1/10 GPU-hours."
+  },
+  {
+    authors: "Moonshot AI",
+    year: 2025,
+    title: "Kimi K2 Thinking",
+    venue: "Moonshot AI blog",
+    url: "https://moonshotai.github.io/Kimi-K2/thinking.html",
+    note: "Tool-use-in-RL with 200-300 tool calls per rollout. INT4 quantization-aware training. State-of-the-art on HLE and BrowseComp at open weights."
+  },
+  {
+    authors: "Yu, T. et al. (ByteDance Seed)",
+    year: 2025,
+    title: "DAPO: An Open-Source LLM Reinforcement Learning System at Scale",
+    venue: "arXiv:2503.14476",
+    url: "https://arxiv.org/abs/2503.14476",
+    note: "Clip-Higher, Dynamic Sampling, token-level loss normalisation, overlong reward shaping. 50% AIME on Qwen2.5-32B at 50% of R1-Zero's compute."
+  },
+  {
+    authors: "Zheng, L. et al.",
+    year: 2025,
+    title: "Group Sequence Policy Optimization (GSPO)",
+    venue: "arXiv:2507.18071",
+    url: "https://arxiv.org/abs/2507.18071",
+    note: "Sequence-level importance ratio for MoE stability. Used in Qwen3-235B training."
+  },
+  {
+    authors: "Hu, J.",
+    year: 2025,
+    title: "REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models",
+    venue: "arXiv:2501.03262",
+    url: "https://arxiv.org/abs/2501.03262",
+    note: "Replaces group normalisation with global batch normalisation. More stable on small datasets."
+  },
+  {
+    authors: "Liu, M. et al. (Sea AI Lab)",
+    year: 2025,
+    title: "There May Not be Aha Moment in R1-Zero-like Training",
+    venue: "Sea AI Lab blog",
+    url: "https://sail.sea.com/blog/articles/62",
+    note: "Argues self-reflection patterns exist in the base model at step 0 and RL amplifies rather than instantiates them."
+  },
+  {
+    authors: "Zeng, Y. et al.",
+    year: 2025,
+    title: "Understanding R1-Zero-Like Training: A Critical Perspective",
+    venue: "arXiv:2503.20783",
+    url: "https://arxiv.org/abs/2503.20783",
+    note: "Empirically tests which base models support R1-Zero training. Qwen2.5-base exhibits aha-style outputs under RL; Llama-3-base does not without cold-start SFT."
+  },
+  {
+    authors: "Lambert, N.",
+    year: 2025,
+    title: "RLHF Book — Chapter 14: Reasoning Training",
+    venue: "rlhfbook.com",
+    url: "https://rlhfbook.com/c/14-reasoning.html",
+    note: "Accessible textbook treatment of GRPO and the reasoning RL landscape. Good complement to the primary sources."
+  },
+  {
+    authors: "Lambert, N.",
+    year: 2024,
+    title: "Reverse engineering OpenAI's o1",
+    venue: "The Interconnects",
+    url: "https://www.interconnects.ai/p/reverse-engineering-openai-o1",
+    note: "Best-effort inference of o1's recipe from public evaluations and analogies to the RLVR/GRPO literature."
+  },
+  {
+    authors: "Wolfe, C. R.",
+    year: 2025,
+    title: "GRPO++: Tricks for Making RL Actually Work",
+    venue: "Cameron R. Wolfe Substack",
+    url: "https://cameronrwolfe.substack.com/p/grpo-tricks",
+    note: "Practitioner survey of GRPO failure modes and fixes. Good entry point to the DAPO/GSPO/VAPO literature."
+  },
+  {
+    authors: "NormalUhr (Hugging Face blog)",
+    year: 2025,
+    title: "From GRPO to DAPO and GSPO",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/NormalUhr/grpo-to-dapo-and-gspo",
+    note: "Side-by-side comparison of GRPO, DAPO, and GSPO objectives with annotated pseudocode."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Cited in §GRPO's failure modes and the 2025 variant landscape as the cleanest small-open-model example of a hybrid reasoning model built without reasoning RL — substituting 35 B-token reasoning mid-training on R1 traces for the GRPO + verifier loop."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "The Smol Training Playbook",
+    venue: "Hugging Face Spaces",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook"
+  }
+]} />

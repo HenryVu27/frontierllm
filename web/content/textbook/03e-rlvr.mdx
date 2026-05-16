@@ -1,0 +1,493 @@
+---
+slug: 03e-rlvr
+title: RL with verifiable rewards (RLVR)
+description: Symbolic-math verifiers, unit-test code verifiers, and tool-call grounding — the engine of the 2024-2026 reasoning-RL recipes.
+order: 32
+chapter: 32
+module: 3
+module_title: Post-training and reasoning
+reading_minutes: 20
+depends_on: [03c-rlhf]
+provides: [rlvr, verifier-reward, math-verifier, code-verifier, sparse-reward, curriculum]
+last_reviewed: 2026-05-14
+---
+
+## Orientation {#orientation}
+
+The [RLHF](/textbook/03c-rlhf) and [DPO](/textbook/03d-dpo) chapters trained a learned reward model on human preference pairs and optimized the policy against it. This approach is powerful but has a fundamental vulnerability: the reward model generalizes only within its training distribution. Outside that distribution, it becomes prey to reward hacking — the policy learns to game the metric rather than solve the task.
+
+By mid-2026, frontier labs have discovered a simpler and more powerful alternative. Whenever the task has a checkable answer — a final boxed number, a function that passes unit tests, a tool call whose return matches a schema, an instruction following a regex — the learned reward model can be entirely replaced with a *deterministic verifier*. A verifier is a function that outputs 1 if the answer is correct and 0 otherwise. It executes outside the policy, outside the training loop, unchanged and uncorrupted.
+
+Reinforcement Learning with Verifiable Rewards (RLVR) is the formalization of this idea. It has become the dominant post-training recipe at scale: Tülu-3 (the first openly-published recipe), OpenAI o1 (inferred from capability evals), and DeepSeek-R1 (the first large-scale open evidence) all rely on RLVR as their training signal. This chapter walks through the definition, the three families of verifiers, the algorithmic changes needed to handle sparse binary rewards, and the empirical phenomena that make RLVR the workhorse of reasoning-RL.
+
+## The verifier-as-reward pattern {#verifier-pattern}
+
+### From learned RM to deterministic verifier
+
+The RLHF objective from Chapter [03c](/textbook/03c-rlhf) was
+
+$$
+\mathcal{J}_{\text{RLHF}}(\theta) = \mathbb{E}_{x\sim\mathcal{D},\, y\sim\pi_\theta(\cdot|x)} \left[ r_\phi(x, y) - \beta\, \text{KL}\bigl(\pi_\theta(\cdot|x) \,\|\, \pi_{\text{ref}}(\cdot|x)\bigr) \right]
+$$
+
+where $r_\phi$ is a learned reward model — a transformer with a scalar head trained on tens of thousands of human preference pairs via Bradley-Terry log-likelihood. This model is differentiable, continuous, and well-calibrated *in distribution*. It is also adversarially exploitable *out of distribution*.
+
+RLVR keeps the surrounding scaffold — sample rollouts, score them, take a policy-gradient step — and replaces $r_\phi$ with a deterministic function:
+
+$$
+r(x, y) \;=\; \text{verifier}(x, y) \;\in\; \{0, 1\}
+$$
+
+As Lambert states in *The RLHF Book* (Chapter 14):
+
+<Callout>
+"The training method for these models, Reinforcement Learning with Verifiable Rewards (RLVR), proceeds very similarly to RLHF, but it makes the reward model optional in lieu of a scoring function that returns a positive reward when the answer is correct and 0 otherwise." — Lambert 2025
+</Callout>
+
+Three properties define the verifier:
+
+1. **Determinism.** Given $x$ and $y$, the verifier returns the same value every time. There is no stochasticity, no Bradley-Terry noise.
+2. **Tamper-proofness.** The verifier executes outside the policy loop. The policy cannot influence its code or weights during training.
+3. **Sparseness.** $r \in \{0,1\}$ creates extreme sparsity: most rollouts on a non-trivial problem return $r=0$. The full apparatus of group baselines, curricula, and careful sample budgets exists to manage this.
+
+### The three verifier families
+
+By mid-2026, three families of verifiers have become production-grade:
+
+<ComparisonTable>
+| Family | Consumes | Checks | Cost |
+|---|---|---|---|
+| **Math symbolic** | Final boxed expression | String-match or SymPy-canonicalise | ~1 ms |
+| **Code execution** | Function + unit tests | Sandbox pass/fail | 0.1–10 s |
+| **Tool / API call** | Structured tool call + return | Schema + answer match | 10–1000 ms |
+</ComparisonTable>
+
+A fourth family — rubric and regex verifiers for instruction-following and length constraints — is a degenerate case of math symbolic: a regex matching the output string. Tülu-3 uses this for IFEval.
+
+### Why this changes the algorithm
+
+When $r$ is binary and sparse, standard PPO (actor + critic + GAE + KL penalty) becomes unstable. The reward signal is too noisy for a value function to learn effectively. Three algorithmic changes follow from RLVR's sparsity:
+
+1. **Drop the value model.** The critic was learning to predict a scalar from text; when $r \in \{0,1\}$, the conditional mean is just the empirical pass-rate. A *group baseline* — multiple rollouts per prompt, subtract the group mean — estimates this more cheaply and reliably. DeepSeek's GRPO formalizes this.
+
+2. **Soften or drop KL.** Lambert observes in Chapter 11:
+
+<Callout>
+"With the transition from RLHF to reasoning and reinforcement learning with verifiable rewards (RLVR), the prevalence of KL penalties has decreased overall, with many reasoning adaptations turning them off entirely." — Lambert 2025
+</Callout>
+
+With a non-hackable verifier, there is less need to anchor the policy tightly to $\pi_{\text{ref}}$.
+
+3. **Curriculum and filtering.** If the policy passes 99% of problems, there is no gradient. If it passes 1%, the signal is too sparse. The training set must be carefully tuned to a *medium-difficulty band*, and re-filtered online as the policy improves.
+
+## Math verifiers: symbolic check and ground-truth match {#math-verifiers}
+
+### The MATH dataset as the canonical math verifier
+
+Hendrycks et al.'s *MATH* dataset (NeurIPS 2021) contains **12,500 competition mathematics problems** from AMC, AIME, and olympiad sources. Each problem includes a natural-language statement, a human solution, and a ground-truth final answer in LaTeX boxed form: `\boxed{42}`, `\boxed{\frac{\pi}{3}}`, and so forth.
+
+The `\boxed{}` convention is the entire reason MATH became the canonical RLVR substrate. A simple regex extracts the substring inside the rightmost `\boxed{...}`, a symbolic canonicalization routine (typically SymPy) normalizes it, and the result is compared to the ground-truth string. As Lambert notes:
+
+<Callout>
+"The `\boxed{}` notation is a convention adopted from mathematical typesetting that makes answer extraction straightforward — a simple regular expression can pull the final answer from the response." — Lambert 2025, RLHF Book Ch. 14
+</Callout>
+
+The dataset is stratified by subject (Algebra, Counting & Probability, Geometry, Number Theory, and others) and difficulty levels 1–5. Level-5 geometry problems are an order of magnitude harder than level-1 prealgebra; frontier RL pipelines exploit this stratification to build curricula.
+
+### GSM8K: the origin of verifier-based rewards
+
+GSM8K (Cobbe et al., OpenAI, 2021) is older and historically more important. It contains **8,500 grade-school word problems** with answers marked by the literal sequence `#### N`, where $N$ is an integer. The original Cobbe et al. paper trained a *learned verifier* — a separate model that ranks candidate solutions — and showed that
+
+<Callout>
+"verification significantly improves performance on GSM8K ... verification scales more effectively with increased data than a finetuning baseline." — Cobbe et al., 2021
+</Callout>
+
+Modern RLVR pipelines discard the learned verifier entirely. They extract the final number with a one-line regex: `(\-?\d+)` after `####`, compare to ground truth. The Tülu-3 paper documents the recipe:
+
+<Callout>
+"For GSM8K, each sample is augmented with the standard 8-shot prompt used during evaluation to encourage chain-of-thought, and the final number produced is then extracted and compared to the ground-truth label to determine correctness." — Lambert et al., 2024
+</Callout>
+
+### Engineering the math verifier
+
+Three production-grade subtleties have cost labs weeks of silent training failures:
+
+1. **Canonicalization.** The strings `\frac{1}{2}`, `0.5`, `1/2`, and `\dfrac{1}{2}` should all match ground truth `0.5`. The MATH reference grader chains string-normalization rules with SymPy `simplify(a - b) == 0`. A famous hard case: `\sqrt{2}/2` vs `\frac{1}{\sqrt{2}}` vs `\frac{\sqrt{2}}{2}` — all correct, one canonical.
+
+2. **Cheap-string false positives.** If the policy outputs `\boxed{42}` in the middle of its chain of thought *and* the right answer at the end, naive extraction grabs the wrong one. The fix: extract *only the last* `\boxed{}`. Early R1 reproductions had this bug; it shows up as suspiciously high training reward but flat eval.
+
+3. **Format reward.** DeepSeek-R1 adds a second binary check:
+
+<Callout>
+"In addition to the accuracy reward model, we employ a format reward model that enforces the model to put its thinking process between '<think>' and '</think>' tags." — DeepSeek-AI, 2025
+</Callout>
+
+The total reward is a small linear combination (accuracy weight $\gg$ format weight). The core reward remains binary; the format component is a constant offset once the model learns the tag convention.
+
+## Code verifiers: unit tests and sandbox execution {#code-verifiers}
+
+### HumanEval and the pass@k metric
+
+Chen et al.'s *Codex* paper introduced HumanEval: **164 hand-written Python programming problems** consisting of a function signature, docstring, reference implementation, and 4–8 unit tests. The verifier executes the policy's completed function against the tests in a sandbox. The reward is binary: 1 if every test passes, 0 otherwise.
+
+The same paper introduced **pass@k**, an unbiased estimator of the probability that at least one of $k$ independent samples passes all tests:
+
+$$
+\text{pass@}k \;=\; \mathbb{E}_{\text{problems}}\!\left[\,1 - \binom{n - c}{k}\Big/\binom{n}{k}\,\right]
+$$
+
+where $n$ is the number of samples and $c$ the number that passed. For training rollouts, pass@1 is exactly the empirical pass-rate that the group-baseline estimates.
+
+### Beyond HumanEval: CodeContests and LiveCodeBench
+
+HumanEval is too easy by 2026 (frontier models exceed 95% pass@1), so the canonical code verifiers have shifted:
+
+- **CodeContests** (DeepMind, AlphaCode 2022) — 13,600 competitive-programming problems with hidden test suites. The verifier is the contest judge: compile, run against ~200 test cases per problem, enforce time and memory limits.
+
+- **LiveCodeBench** — rolling benchmark of recent LeetCode / Codeforces problems. DeepSeek-R1-Zero reaches **73.3% pass@1** on LiveCodeBench.
+
+- **SWE-bench Verified** — repository-level patch correctness. The verifier runs the target repo's test suite with and without the patch.
+
+### Sandbox engineering
+
+The cost asymmetry between math and code verifiers is large: math checks cost microseconds, code checks can cost seconds. At group size $G=16$ and batch size 1024 prompts, that is ~16,000 sandbox executions per training step. Production pipelines therefore:
+
+- run sandboxes asynchronously, decoupled from token generation,
+- pool a fixed-size sandbox cluster (e.g., 256 ephemeral containers),
+- aggressively timeout (1–5 seconds wall-clock per sample, assign $r=0$ on timeout),
+- cache verifier results by `(problem_id, code_hash)` — many rollouts produce structurally identical code.
+
+DeepSeek-R1 explicitly rejects neural reward models for code:
+
+<Callout>
+"Reward is the source of the training signal, which decides the optimization direction of RL. To train DeepSeek-R1-Zero, we adopt a rule-based reward system ... We do not apply the outcome or process neural reward model in developing DeepSeek-R1-Zero, because we find that the neural reward model may suffer from reward hacking in the large-scale reinforcement learning process." — DeepSeek-AI, 2025
+</Callout>
+
+## Tool-call grounding: API return correctness {#tool-grounding}
+
+### The verifier shape changes
+
+When the action space is not "text that renders to an answer" but "text that makes API calls that return observations," the verifier must score the entire trajectory $\tau = (a_1, o_1, a_2, o_2, \ldots, a_T, y_T)$ rather than the final string. Two practical designs exist:
+
+- **Outcome-only.** $r = 1$ iff the final answer $y_T$ matches ground truth. Multi-turn credit is assigned only at the end.
+- **Schema + outcome.** $r = 1$ iff every intermediate tool call is well-formed JSON matching the tool's schema *and* the final answer matches. Schema validation is cheap and prevents mode collapse to "always return the same call."
+
+### The 2025 agentic wave
+
+After R1 dropped, the open-source community generalized RLVR to agentic tasks within months:
+
+- **Search-R1** (March 2025) trained Qwen / Llama bases to interleave `<search>...</search>` tool calls with reasoning. Verifier is outcome-only on HotpotQA / NaturalQuestions.
+- **Agent-RLVR** (Arora et al., June 2025) targeted software-engineering agents; the verifier is the repo's pytest suite plus guidance during long trajectories.
+
+The unifying theme is that the *underlying objective is identical to single-turn RLVR* — $r \in \{0,1\}$, group-baseline GRPO, no value model — only the rollout machinery is more elaborate.
+
+### Why tool RLVR is harder
+
+Three failure modes absent in single-turn math:
+
+1. **Long horizons → vanishing per-token credit.** A 30-step trajectory with $r=1$ at the end gives a tiny gradient per token. Group baselines are insufficient; some pipelines add process-reward models or step-level RLVR.
+2. **Stochastic environments.** A web search returns different snippets each time. The same policy action yields $r=1$ in one rollout and $r=0$ in another.
+3. **Action-space cold start.** A model that has never used a tool will emit zero correctly-formatted calls in 10,000 rollouts. SFT on tool-use traces is mandatory before the RL loop begins.
+
+## Tülu-3-RLVR: the first openly-documented recipe {#frontier-recipes}
+
+### The baseline
+
+Tülu-3 (Lambert et al., AI2, November 2024) is the first paper to (a) name "RLVR" explicitly, (b) ship full training code, and (c) ablate RLVR's contribution from SFT and DPO. It applies three stages to a Llama-3.1 base: SFT on 939k curated examples, DPO on preference data, then RLVR on verifiable problems with PPO and binary rewards.
+
+The RLVR deltas at 8B scale, applied on top of the DPO checkpoint (Table 1 from the paper):
+
+<ComparisonTable>
+| Benchmark | DPO | +RLVR | Delta |
+|---|---|---|---|
+| MATH | 31.5% | 33.2% | +1.7pp |
+| GSM8K | 76.2% | 79.5% | +3.3pp |
+| IFEval | 81.1% | 82.4% | +1.3pp |
+</ComparisonTable>
+
+These are deliberately modest deltas at 8B scale. RLVR's payoff is much larger at 70B and 405B, where the base model can already solve hard problems some of the time, enabling a usable gradient signal.
+
+### Algorithmic details
+
+Tülu-3 uses standard PPO, not GRPO:
+
+- Standard actor + critic, value model initialized from the SFT checkpoint.
+- KL penalty $\beta = 0.05$ to the SFT reference policy.
+- Reward $r \in \{0, 1\}$ from the verifier, broadcast to the final token of the response.
+- Clip ratio $\varepsilon = 0.2$, learning rate $1 \times 10^{-6}$, batch size 64 prompts × 4 rollouts.
+
+This works despite reward sparsity because the DPO checkpoint already solves GSM8K 76% of the time. Most rollouts get $r=1$; the gradient signal is on the *minority of failures*. This is the opposite of DeepSeek-R1, where the base model starts at ~15% AIME and the signal is on the *minority of successes*.
+
+<Callout variant="note" title="A counterexample at small-open-model scale: SmolLM3 ships no RLVR">
+The orientation framed RLVR as "the dominant post-training recipe at scale". The qualifier matters: SmolLM3 (Allal et al., 2025), the cleanest 2025 open small-model disclosure, ships *without* an RLVR stage. Its recipe terminates at SFT + APO + linear merge (see [§SmolLM3's APO + model-merge pipeline](/textbook/03b-preference-tuning#smollm3-apo) and [§A third position](/textbook/03c-rlhf#dpo-vs-ppo-2026)). Reasoning capability comes from a 35 B-token mid-training pass on R1-style traces, not from on-policy RL against a verifier. The Smol Training Playbook discusses RLVR conceptually as a future direction but reports that, at the 3B scale and the team's compute budget, the mid-training-then-SFT path produced acceptable reasoning quality without the additional RL infrastructure cost. RLVR is dominant at the *frontier-large* scale (Tülu-3, R1, o-series); the open-small-model design space remains broader.
+</Callout>
+
+## DeepSeek-R1 with GRPO {#frontier-recipes}
+
+### The frontier breakthrough
+
+DeepSeek-R1 (January 2025) demonstrated that pure RLVR on a strong base model can produce frontier-grade reasoning. The R1-Zero variant achieves this *with no SFT cold start at all*. Headline numbers for R1-Zero:
+
+- **AIME 2024 pass@1: 15.6% → 71.0%** during RL training.
+- **MATH-500: 95.9% pass@1.**
+- **LiveCodeBench: 73.3% pass@1.**
+- **With majority voting at k=64 on AIME: 86.7%** consensus accuracy.
+
+The full R1 pipeline is a four-stage process: cold-start SFT on thousands of long-CoT examples, reasoning-oriented RL with GRPO, rejection sampling + SFT on ~600k generated samples mixed with ~200k general-purpose data, and final general RL with both rule-based verifiers and a learned preference RM.
+
+### GRPO: the algorithm
+
+The GRPO objective (formalized in the R1 paper) is:
+
+$$
+\mathcal{J}_{\text{GRPO}}(\theta) = \mathbb{E}_{q\sim P, \{o_i\}_{i=1}^{G}\sim \pi_{\theta_{\text{old}}}(\cdot|q)} \left[ \frac{1}{G}\sum_{i=1}^{G} \min\!\left(\frac{\pi_\theta(o_i|q)}{\pi_{\theta_{\text{old}}}(o_i|q)} A_i,\; \text{clip}\!\left(\frac{\pi_\theta(o_i|q)}{\pi_{\theta_{\text{old}}}(o_i|q)}, 1-\varepsilon, 1+\varepsilon\right) A_i\right) - \beta\, \mathbb{D}_{\text{KL}}(\pi_\theta \,\|\, \pi_{\text{ref}}) \right]
+$$
+
+where the group-normalised advantage is
+
+$$
+A_i = \frac{r_i - \text{mean}(r_1, \ldots, r_G)}{\text{std}(r_1, \ldots, r_G) + \epsilon}
+$$
+
+Three elements do work:
+
+1. **No value model.** The baseline is the empirical group mean, halving memory and removing instability from critic loss explosion.
+2. **Group standardization.** Dividing by std rescales gradients when the group is mostly homogeneous (all correct or all incorrect groups produce nearly-zero advantage).
+3. **PPO clipping and KL** are inherited from standard PPO. DeepSeek keeps KL with small $\beta$; many subsequent pipelines drop it entirely.
+
+### The cold start and readability
+
+R1-Zero demonstrated pure RLVR works, but outputs had "poor readability, language mixing" — interleaving Chinese and English mid-thought. The full R1 recipe inserts a small cold-start SFT phase on curated long-CoT examples (estimated ~10k examples [inferred]). This cold-start data:
+
+- has consistent `<think>...</think>` format,
+- uses English consistently,
+- includes self-correction patterns ("wait, let me reconsider..."),
+- maintains human-readable length and structure.
+
+Cold start adds ~2–3 percentage points on AIME at convergence and eliminates readability pathologies.
+
+### The "aha moment"
+
+The most-cited qualitative observation from R1:
+
+<Callout>
+"We observe a phenomenon termed 'aha moment' ... the model learns to reallocate more thinking time to a problem by reevaluating its initial approach." — DeepSeek-AI, 2025
+</Callout>
+
+During R1-Zero training, chain-of-thought length grows monotonically from ~hundreds of tokens to ~tens of thousands. The model spontaneously develops self-correction tokens like "Wait, that's not right. Let me reconsider..." despite no SFT example teaching this pattern. This empirical foundation enables the test-time compute scaling story.
+
+## OpenAI o-series (inferred from system card) {#frontier-recipes}
+
+### What OpenAI discloses
+
+OpenAI has not published technical papers for o1, o3, or o3-mini. Public evidence consists of:
+
+- The *Learning to Reason with LLMs* blog post (September 2024).
+- The *o1 System Card* (December 2024).
+- Public talks by Altman, Pachocki, and Brown.
+
+The repeated one-sentence claim across all OpenAI documents:
+
+<Callout>
+"The o1 model series is trained with large-scale reinforcement learning to reason using chain of thought." — OpenAI o1 System Card, Dec 2024
+</Callout>
+
+The system card does *not* use the word "verifier" or "RLVR." The reward signal is undisclosed.
+
+### The inference
+
+That o1 is trained with RLVR rests on convergent evidence:
+
+1. **Capability profile.** o1 shows frontier gains specifically on AIME, Codeforces, GPQA, MATH — exactly the benchmarks with clean verifiers. Creative writing and helpfulness scores are unchanged. This is the signature of a pipeline whose gradient signal lives in the math+code subspace.
+2. **R1 confirmation.** OpenAI engineers privately confirmed that R1 reproduces the o1 *training paradigm*, if not exact data and scale.
+3. **Test-time compute scaling.** The o1 chart (log training compute → linear gains; log CoT length → linear gains) is identical in shape to the R1 figure.
+4. **Pachocki's NeurIPS 2024 talk:** "We rewarded the model when it was right."
+
+<Sidenote>
+o1, o3, and o3-mini are widely understood to be trained with a variant of RLVR — large-scale RL with verifiable problem rewards as the dominant training signal. OpenAI has not published the precise reward, algorithm, or training data. The R1 paper is the publicly-available existence proof that the paradigm scales to frontier performance. [inferred]
+</Sidenote>
+
+### Headline o1 numbers
+
+From the September 2024 announcement:
+
+- AIME 2024 pass@1: **83.3%** (with 64 samples and majority vote: 93.4%).
+- Codeforces: **89th percentile** rating.
+- GPQA Diamond: **78.0%** pass@1.
+- MATH: **94.8%** pass@1.
+
+## Reward sparsity: most rollouts get r=0 {#sparsity}
+
+### The sparsity problem
+
+Let $p(x) = \mathbb{P}_{y \sim \pi}\!\left[r(x, y) = 1\right]$ be the policy's pass-rate on prompt $x$. The variance of the policy-gradient estimator scales like $p(x)(1 - p(x))$ — maximized at $p = 0.5$, vanishing at $p \in \{0, 1\}$. For a fresh base model on hard math, typically $p(x) \in \{0, 0.01\}$ for almost every $x$. The gradient is dominated by noise.
+
+As Lambert states:
+
+<Callout>
+"If the starting model for RLVR can solve a problem either 100% of the time or 0% of the time, there will be no gradient between different completions." — Lambert, 2025
+</Callout>
+
+### Four mitigations
+
+Every production RLVR pipeline deploys these in combination:
+
+1. **Group baselines (GRPO).** Sample $G \geq 8$ rollouts per prompt. The advantage of any one rollout is relative to the group mean. A single $r = 1$ rollout in a group of 16 produces a usable gradient. DeepSeek-R1 uses $G = 16$ to $G = 64$.
+
+2. **Offline difficulty filtering.** Before training, sample 16 rollouts per candidate prompt with the current base. Drop prompts where pass-rate is 0 or 1; keep the 20–80% band. Lambert:
+
+<Callout>
+"models restrict training to problems the base model solves only 20–80% of the time. This data is collected by sampling N, e.g. 16, completions to each prompt in the training set and verifying what percentage are correct." — Lambert, 2025
+</Callout>
+
+3. **Online curriculum.** Re-filter the training set every few thousand steps. Problems at 20% pass-rate at step 0 may be 90% at step 5,000 and need replacement.
+
+4. **Length-and-format rewards as dense scaffolding.** DeepSeek-R1's format reward (`<think>` tags present, non-empty thought, boxed answer) gives a near-dense signal even when accuracy is ~0%. Once format is learned, accuracy can take over.
+
+### AIME as a sparsity case study
+
+AIME 2024 on DeepSeek-V3-Base starts at 15.6% pass@1 (Figure 2 in the R1 paper). At group size $G=16$, the expected number of correct rollouts per prompt is $16 \times 0.156 \approx 2.5$. This is *exactly the bottom of the GRPO regime where group baselines work* — enough positive samples to define advantage, but high variance. The training curve climbs linearly with $\log(\text{steps})$ until pass-rate hits ~70%, where gains slow because most groups are now all-correct and the gradient vanishes again.
+
+## Curriculum: easy-to-hard verifier problems {#curriculum}
+
+### The canonical shape
+
+A 2025–2026 RLVR curriculum has three to four tiers:
+
+- **Tier 0 — Format only.** A handful of prompts where any well-formed `<think>...</think>` + `\boxed{}` output gets partial credit. Lasts ~100 steps. Purpose: bootstrap the output format.
+- **Tier 1 — GSM8K-level.** Grade-school word problems. Base pass-rate ~70–95%. Purpose: stabilize reasoning patterns at low difficulty.
+- **Tier 2 — MATH levels 1–3.** Base pass-rate ~30–70%. The workhorse RLVR tier; most compute spent here.
+- **Tier 3 — MATH levels 4–5, AIME, olympiad.** Base pass-rate 5–30%. Late-stage training once the policy solves Tier 2 reliably.
+
+Some pipelines add a Tier 4: synthetic problem generation by a stronger teacher to extend the curriculum beyond competition corpora. By mid-2026, synthetic curricula dominate at the frontier.
+
+### Online vs offline
+
+**Offline curricula** fix the prompt mix and train; only drop prompts that reach 100% pass-rate. Cheap, stable, suboptimal in late phases.
+
+**Online curricula** re-sample from a larger pool every $k$ steps, weighting by *current* pass-rate to keep the mix in the 20–80% band. More expensive but ~10–20% higher final accuracy in published comparisons.
+
+Lambert surveys the landscape:
+
+<Callout>
+"models employ offline difficulty filtering — Seed-Thinking 1.5, Open Reasoner Zero, Phi 4, INTELLECT-2, MiMo RL, Skywork OR-1, and others. ... many models use online filtering of questions in the batch, prebuilt curriculums/data schedulers, saving harder problems for later in training." — Lambert, 2025
+</Callout>
+
+### Length curriculum
+
+Beyond difficulty, there is a *response-length* curriculum. R1 observes CoT length grows from ~1k to ~10k tokens; Kimi-1.5 explicitly schedules a max-response-length budget increasing over training:
+
+<Callout>
+"Kimi 1.5 progressively extending the target length to combat overthinking (while training accuracy is high across difficulty curriculum)." — Lambert, 2025
+</Callout>
+
+Early in training, very long rollouts waste compute on immature policies. Late in training, longer rollouts solve hard problems. A length cap growing from 4k → 32k tokens over 10k steps trades off these regimes.
+
+## Worked example: GSM8K verifier on a concrete rollout {#worked-example}
+
+### The prompt
+
+GSM8K problem `train/0042`:
+
+> *"Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May? Answer: Let's think step by step. ####"*
+
+The 8-shot CoT prefix and trailing `####` are appended by the harness; the policy completes from there. Ground-truth answer: **72**.
+
+### Group rollout
+
+The training step samples $G = 8$ rollouts from $\pi_{\theta_{\text{old}}}$. Each rollout is a 50–200 token completion. After verifier extraction:
+
+<ComparisonTable>
+| Rollout | Extracted final number | $r_i$ |
+|---|---|---|
+| 1 | 72 | 1 |
+| 2 | 72 | 1 |
+| 3 | 24 | 0 |
+| 4 | 72 | 1 |
+| 5 | 96 | 0 |
+| 6 | 48 | 0 |
+| 7 | 72 | 1 |
+| 8 | 72 | 1 |
+</ComparisonTable>
+
+Group mean reward: $\bar{r} = 5/8 = 0.625$. Group std: $\sigma_r = \sqrt{0.625 \times 0.375} \approx 0.484$.
+
+### Group-normalised advantages
+
+For each rollout, $A_i = (r_i - 0.625) / 0.484$:
+
+- Correct rollouts ($r_i = 1$): $A_i \approx +0.775$.
+- Incorrect rollouts ($r_i = 0$): $A_i \approx -1.291$.
+
+The advantage is broadcast to every token in the rollout. Rollout 3 (answered 24) contributes a gradient pushing every token to be less likely; rollout 7 (answered 72) pushes every token to be more likely. Note the asymmetry: the negative magnitude (1.29) exceeds the positive (0.78) because incorrect rollouts are the minority. This is GRPO's automatic class-balancing.
+
+### The PPO loss per token
+
+For each token in each rollout, the ratio $\rho = \pi_\theta(o_i^t | q, o_i^{<t}) / \pi_{\theta_{\text{old}}}(o_i^t | q, o_i^{<t})$ is computed at the *current* weights $\theta$. The PPO surrogate loss is
+
+$$
+\ell_{i,t} = -\min\!\bigl(\rho A_i,\; \text{clip}(\rho, 1-\varepsilon, 1+\varepsilon)\, A_i\bigr) + \beta\, \text{KL}
+$$
+
+with $\varepsilon = 0.2$ and $\beta$ small or zero. Sum over tokens (masked by rollout length), average over rollouts, average over prompts — one optimization step.
+
+### What happens next
+
+After several thousand such steps, the policy's pass-rate on this prompt rises from 5/8 to 8/8. The online curriculum drops this prompt (too easy now). The policy trains on harder problems. Aggregated across the training set, GSM8K pass-rate climbs ~3 percentage points (Tülu-3 delta) or ~50 percentage points (R1-Zero delta), depending on whether RLVR is a finishing polish or the dominant signal.
+
+### Pseudocode
+
+```python
+# Sample G rollouts per prompt
+rollouts = [pi_old.generate(q) for _ in range(G)]
+rewards  = torch.tensor([verifier(q, o) for o in rollouts])  # {0,1}
+
+# Group-normalised advantage
+mean_r = rewards.view(-1, G).mean(dim=1)
+std_r  = rewards.view(-1, G).std(dim=1)
+adv    = (rewards - mean_r) / (std_r + 1e-4)
+
+# Per-token log-prob ratio
+ratio  = torch.exp(new_logps - old_logps)
+loss_unclipped = -adv * ratio
+loss_clipped   = -adv * torch.clamp(ratio, 1 - eps, 1 + eps)
+pg_loss        = torch.max(loss_unclipped, loss_clipped)
+
+# Optional KL penalty (often zero in 2025-2026 RLVR)
+per_token_loss = pg_loss + beta * per_token_kl
+loss = (per_token_loss * mask).sum() / mask.sum()
+loss.backward()
+```
+
+[Adapted from Lambert 2025, RLHF Book Chapter 11]
+
+## Summary {#summary}
+
+Reinforcement Learning with Verifiable Rewards is the engine of frontier reasoning models in mid-2026. By replacing the learned reward model with a deterministic, tamper-proof verifier, RLVR eliminates reward hacking and enables training on tasks with clean correct/incorrect signals: mathematics (symbolic answer matching), code (unit test execution), tool use (API schema validation), and instruction-following (regex checks).
+
+The three canonical deployments — Tülu-3 (modest deltas on top of DPO), DeepSeek-R1 (pure RL from a strong base), and OpenAI o-series (inferred as RLVR at scale) — demonstrate that the paradigm works across base model sizes and training regimes. The algorithmic changes (group baselines, curriculum filtering, optional KL) are not optional: they are necessary to manage the extreme sparsity of binary $\{0,1\}$ rewards.
+
+The frontier recipes converge on a pattern: cold-start SFT (or not), RLVR on medium-difficulty verifiable problems with group-baseline GRPO, online curriculum filtering, and test-time scaling via longer chain-of-thought. The "aha moment" — spontaneous emergence of self-correction without explicit training — is the signature phenomenon of RLVR at scale, suggesting that longer test-time compute is both a consequence and a driver of reasoning capability.
+
+The next chapter, [Reasoning RL](/textbook/03f-reasoning-rl), scales RLVR from the math+code slice to the full reasoning regime, explores process-level rewards, and formalizes the test-time compute scaling laws.
+
+<Sources>
+- Cobbe et al., 2021. "Training Verifiers to Solve Math Word Problems." https://arxiv.org/abs/2110.14168
+- Chen et al., 2021. "Evaluating Large Language Models Trained on Code." https://arxiv.org/abs/2107.03374
+- DeepSeek-AI, 2024. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." https://arxiv.org/abs/2402.03300
+- DeepSeek-AI, 2025. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." https://arxiv.org/abs/2501.12948
+- Hendrycks et al., 2021. "Measuring Mathematical Problem Solving With the MATH Dataset." https://arxiv.org/abs/2103.03874
+- Hu et al., 2025. "Open-Reasoner-Zero: An Open Source Approach to Scaling Up RL on the Base Model." https://arxiv.org/abs/2503.24290
+- Jimenez et al., 2023. "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?" https://arxiv.org/abs/2310.06770
+- Jin et al., 2025. "Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning." https://arxiv.org/abs/2503.09516
+- Kimi Team, 2025. "Kimi k1.5: Scaling Reinforcement Learning with LLMs." https://arxiv.org/abs/2501.12599
+- Lambert et al., 2024. "Tülu 3: Pushing Frontiers in Open Language Model Post-Training." https://arxiv.org/abs/2411.15124
+- Lambert, 2025. *The RLHF Book*, Chapters 11 and 14. https://rlhfbook.com/
+- Li et al., 2022. "Competition-Level Code Generation with AlphaCode." https://arxiv.org/abs/2203.07814
+- Liu et al., 2025. "Dr.GRPO: Understanding R1-Zero-Like Training." https://arxiv.org/abs/2503.20783
+- OpenAI, 2024. "Learning to Reason with LLMs." https://openai.com/index/learning-to-reason-with-llms/
+- OpenAI, 2024. "OpenAI o1 System Card." https://cdn.openai.com/o1-system-card-20241205.pdf (arXiv:2412.16720)
+- Yu et al., 2025. "DAPO: An Open-Source LLM Reinforcement Learning System at Scale." https://arxiv.org/abs/2503.14476
+- Allal, L. B. et al. (Hugging Face), 2025. "SmolLM3: smol, multilingual, long-context reasoner." https://huggingface.co/blog/smollm3 — counterexample to the "RLVR is dominant at scale" framing: a 3B open recipe that ships without an RLVR stage, substituting reasoning mid-training on R1 traces.
+- Allal, L. B. et al. (Hugging Face), 2025. "The Smol Training Playbook." https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook
+</Sources>
