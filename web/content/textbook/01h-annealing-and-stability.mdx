@@ -191,6 +191,49 @@ A reordered or "Peri-LN" normalisation — applying LN around both the input and
 
 ---
 
+## Mid-run operational failures {#mid-run-failures}
+
+The architectural stability stack (QK-norm + z-loss + Peri-LN, plus the recipe-level $\epsilon$ and gradient-clipping choices above) addresses failure modes that originate inside the model. A second class of failures originates in the training infrastructure and shows up in the loss curve only as a downstream symptom. Allal et al. (2025) — the Hugging Face SmolLM3 playbook — is the cleanest open disclosure of this category, including a full restart at the ~1T-token mark from a silent tensor-parallelism bug that consumed roughly 46,080 GPU-hours of sunk cost (cross-reference: the orientation [callout](/textbook/01-pretraining#shape) in Module 1 quotes the full compute breakdown). The playbook flags three failure families that share a single diagnostic discipline: narrow the search space by separating *compute*, *communication*, and *data* hypotheses, then bisect.
+
+### Vanishing throughput {#vanishing-throughput}
+
+**Symptom.** Tokens-per-second-per-GPU drifts downward over hours or days, with the loss curve continuing to descend on the surface but the wall-clock cost per step rising. The model is "training," but slowly and at the wrong cost per token.
+
+**Common causes.** Dataloader inefficiency (worker memory leaks, prefetch starvation, slow shuffling on a remote filesystem); GPU thermal throttling in a node whose airflow has degraded; network congestion in shared inter-node fabrics; NCCL fragmentation after a transient hardware error; a single straggler rank that gates the synchronous step.
+
+**First-pass diagnostic.** Separate the per-step time into compute, communication, and dataloader components. A profile (Nsight Systems, PyTorch profiler, or framework-internal step-time accounting) localises which component grew. If communication grew while compute is flat, suspect the network or NCCL state; if compute grew while communication is flat, suspect thermal or kernel-replan issues; if dataloader wait grew, restart workers and re-check the data pipeline. Allal et al. (2025) note that all three modes were observed at different points in the SmolLM3 run; their published recommendation is to log per-component step time *at every checkpoint*, not only on suspicion.
+
+### Persisting loss spikes {#persisting-spikes}
+
+The deep first-principles treatment of loss spikes is in §[loss-spike taxonomy](#loss-spikes) above. The *operational* observation here is the most-difficult subclass: spikes that recur on a quasi-periodic schedule rather than as isolated events.
+
+**Common causes.** Batch-composition shifts — rare-but-outlier-heavy domains landing in the same micro-batch, in particular at the boundary between data shards; gradient-accumulation determinism breaking on resume (the accumulator and the optimiser state load from different sources and disagree); a silent numerical issue affecting only one parallelism rank, surfacing in the all-reduced gradient as a small but recurring perturbation.
+
+**First-pass diagnostic.** Log per-rank loss and per-shard batch-domain composition at each step; plot both alongside the global loss. If the spikes correlate with a specific shard or a specific rank, the diagnosis is local. If they correlate with neither, suspect an accumulation-order issue and verify that the gradient accumulator state is bitwise-reproducible on resume.
+
+### Noisy loss curves {#noisy-loss}
+
+**Symptom.** Step-to-step variance of 5–10% on a schedule that should be stable; no clear spikes, but no clear convergence either.
+
+**Common causes.** Peak LR too high for the chosen global batch size (the schedule has not actually finished warmup at the apparent peak); data-order shuffling causing within-epoch distribution shifts (the shuffling seed is wrong, or the shards are not interleaved); insufficient warmup duration relative to the batch ramp.
+
+**First-pass diagnostic.** Replay the last 10–50 B tokens at half the peak LR; if variance drops, the LR is too high. Verify the data-shuffling seed is deterministic across resumes. Extend warmup if the first plateau in the LR schedule has not yet been reached.
+
+### Monitoring beyond loss {#monitoring-beyond-loss}
+
+The common thread across all three families is that **loss alone is the wrong sensor**. Loss is a final-product metric; it lags the upstream symptom by anywhere from a single step (sharp spike) to thousands of steps (slow throughput drift). Allal et al. (2025) recommend logging the following at every checkpoint, alongside loss:
+
+- **Tokens/sec/GPU** — gates throughput regressions.
+- **Gradient global-norm** — gates pre-clip instability and signals optimiser drift.
+- **Per-rank loss** — distinguishes a silent single-rank failure from a global event.
+- **Batch domain composition** — confirms the data mixture matches the schedule's intent.
+- **Optimiser-state on-disk size** — sanity-checks the checkpoint round-trip and detects partial-save corruption.
+- **A 1–3% held-out evaluation slice** on cloze-formulated benchmarks (see the evaluation methodology chapter for why cloze and not MCF at this scale).
+
+One operational rule that pairs with the monitoring discipline: **do not change architecture mid-training.** Data-mixture transitions and sequence-length transitions are first-class operations and feature in most frontier recipes (cf. the SmolLM3 8 T mixture shift in [Chapter 15](/textbook/01f-data-curriculum) and the 4 K → 32 K → 64 K long-context staging in [Chapter 16](/textbook/01g-long-context)). Architectural changes — head count, layer count, MLP ratio, normalisation placement — are not, and require a fresh run. The rule is operational rather than theoretical: in principle a model can be surgically modified mid-run, but the published frontier recipes that do this are the exceptions cited in §[checkpoint surgery](#checkpoint-surgery) below, not the norm.
+
+---
+
 ## FP8 training {#fp8}
 
 The 2024–2026 window is when FP8 transitioned from a research curiosity (NVIDIA H100 plus Transformer Engine) into a production-quality recipe shipping in real frontier models. Three generations of recipe are visible in the literature.
@@ -694,5 +737,21 @@ The biggest open uncertainty in the table is whether the published "no-spike" cl
     venue: "smol-training-playbook gist",
     url: "https://gist.github.com/unclecode/e5da5fb6a1d37022b089e243e0d9e00e",
     note: "2025 open-recipe example of full training restart from a silent tensor-parallelism bug; 46,080 GPU-hours sunk-cost; ~10% of total compute spent on debugging + restart."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs",
+    venue: "Hugging Face Spaces",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook",
+    note: "Canonical first-party source for the three operational failure families covered in §Mid-run operational failures, the monitoring-beyond-loss checklist, and the 'do not change architecture mid-training' rule."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "Companion blog disclosure of SmolLM3 architecture, schedule, and post-training recipe. Cited throughout Module 1 for verified per-recipe hyperparameters."
   }
 ]} />

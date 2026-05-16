@@ -330,6 +330,16 @@ Second, **mix-design philosophy varies, but not by as much as the disclosure noi
 
 The Llama-3 50/25/17/8 figures specifically deserve a caveat: they are from the 2024-07 Llama 3 Herd paper and were not updated in the Llama-3.1 (2024-11) or Llama-4 (2025) releases. Treat 50/25/17/8 as the Llama-3-era anchor for what a disclosed frontier mix looks like, not as a current Meta production figure. The Llama-4 announcement quotes a 40T-token training budget across 200 languages without a per-domain breakdown.
 
+<Callout variant="note" title="SmolLM3's three-stage mix as a worked example of mix–schedule co-evolution">
+SmolLM3 (Allal et al., 2025) is the cleanest 2025 open small-model disclosure of how the data mix evolves *along* the WSD schedule from [Chapter 14](/textbook/01e-schedules-and-batch#frontier-recipes). Three stages with explicit token boundaries:
+
+- **Stage 1 (0 → 8 T tokens, stable phase):** Web 85% (12% multilingual share within Web), Code 12%, Math 3%. Web sources are FineWeb-Edu, DCLM, FineWeb2, and FineWeb2-HQ; Code is The Stack v2 across 16 languages plus StarCoder2 PRs, Jupyter, Kaggle, GitHub issues, and StackExchange; Math is FineMath3+ and InfiWebMath3+.
+- **Stage 2 (8 → 10 T tokens, still stable phase):** Web drops to 75%, Code rises to 15% with Stack-Edu added, Math rises to 10% with FineMath4+, InfiWebMath4+, and MegaMath added.
+- **Stage 3 decay (10 → 11.1 T tokens, coinciding with the final 10% linear-decay tail of WSD):** Web 63%, Code 24% (high-quality upsampling), Math 13% with OpenMathReasoning added.
+
+Two operational lessons. First, the *direction* of the Stage-3 shift — Web 85 → 63%, Code 12 → 24%, Math 3 → 13% — mirrors Llama-3's annealing tilt at much larger scale: a four-fold relative upweighting of code and math within the WSD decay tail. Second, the *timing* couples to the schedule: the Stage-3 mix change is co-scheduled with the LR decay, so the model commits the high-quality data-mix capability at the moment its update step is shrinking. This is the small-model open recipe analogue of the closed multi-phase recipes whose disclosure stops at "we shifted the mix in the cooldown".
+</Callout>
+
 ---
 
 ## Chapter summary {#summary}

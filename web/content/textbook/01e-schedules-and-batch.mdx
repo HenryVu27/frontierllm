@@ -496,6 +496,7 @@ The following table reproduces the disclosed schedule and batch hyperparameters 
     ["DeepSeek-V3 671B (37B active)", "2024", "Warmup → constant → cosine → constant tail", "2.2e-4 → 2.2e-5 → 7.3e-6", "2,000 steps", "≈12.6M → 62.9M (sequences × 4K)", "3,072 → 15,360 sequences over first 469B tok", "Cosine then constant tail", "DeepSeek-AI 2024, arXiv:2412.19437, §4.2"],
     ["Kimi K2 (1T MoE, 32B active)", "2025", "WSD with cosine decay", "2e-4 → 2e-5", "500 steps", "67M (constant)", "none", "Cosine (last 5.5T of 15.5T)", "Moonshot 2025, arXiv:2507.20534"],
     ["Qwen 3 235B-A22B", "2025", "Cosine (stage 1) + WSD-like (later stages)", "3.2e-4 (stage 1)", "linear over 500B tokens", "up to 6M (dynamic)", "2M → 4M → 5M → 6M every 125B tok", "Multi-stage", "Yang et al. 2025, arXiv:2505.09388"],
+    ["SmolLM3 3B (open small-model anchor)", "2025", "WSD with linear decay", "2e-4", "2,000 steps", "2.36M (constant; seq-len 4,096)", "none", "Linear to 0 over final 10% of steps", "Allal et al. 2025, huggingface.co/blog/smollm3"],
   ]}
 />
 

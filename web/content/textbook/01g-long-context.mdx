@@ -160,6 +160,15 @@ YaRN with CPT is the standard recipe at DeepSeek and at Alibaba for context abov
 
 The headline claim of the YaRN paper is *10× fewer tokens and 2.5× fewer training steps* than position interpolation to reach equivalent perplexity at the target length. For the 7 B-class base model of the paper, that translates to roughly 400 fine-tuning steps at 64 k to reach a perplexity of 2.37 at 131 k context. The advantage shrinks at the 128 k frontier — ABF + CPT is competitive at modest 16× extension — but YaRN is the dominant recipe whenever the extension ratio exceeds roughly 32× or the target perplexity is tight.
 
+<Callout variant="note" title="SmolLM3's small-model ABF-then-YaRN recipe">
+SmolLM3 (Allal et al., 2025) is the cleanest 2025 open small-model recipe combining the ABF base bump with YaRN extrapolation, on top of the selective-NoPE architectural choice from the [positional encodings chapter](/textbook/00c-positional-encodings#rope). After the main 11.2 T-token pretraining at 4 K context, two continued-pretraining stages extend the window:
+
+1. **4 K → 32 K** via ABF: RoPE base raised from default to $\theta = 1.5 \times 10^{6}$, with $5 \times 10^{10}$ tokens of continued pretraining.
+2. **32 K → 64 K** via a second ABF step: RoPE base raised to $\theta = 5 \times 10^{6}$, another $5 \times 10^{10}$ tokens.
+
+At inference, the 64 K-trained model is extended to **128 K via YaRN** — a 2× extrapolation, well inside the regime where YaRN is reliable without further fine-tuning. The selective-NoPE choice (NoPE on every fourth layer, RoPE on the others) was made *from training start*, so the long-context phase needs only the base-frequency ramp and the YaRN extrapolation; it does not bolt on a new positional scheme. This contrasts with the more common closed-lab pattern of pretraining at 8 K and extending to 128 K through a YaRN-CPT phase larger than SmolLM3's entire long-context budget.
+</Callout>
+
 ### LongRoPE {#longrope}
 
 **Reference: Ding, Zhang, Zhang, Xu, Shang, Xu, Yang, Yang, "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens", arXiv:2402.13753, Microsoft Research, February 2024.**
