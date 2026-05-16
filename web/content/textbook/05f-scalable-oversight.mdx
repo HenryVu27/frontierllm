@@ -1,0 +1,204 @@
+---
+slug: 05f-scalable-oversight
+title: Scalable oversight
+description: Debate, iterative amplification, weak-to-strong, deliberative alignment, sandwiching — protocols for supervising models stronger than the supervisor.
+order: 50
+chapter: 50
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 26
+depends_on: [05e-circuit-analysis]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Modules 3 and 5 to this point have assumed a human (or a human-trained reward model) can reliably evaluate model outputs. Bradley–Terry preference modelling, Constitutional AI's red-team-to-revise loop, RLVR's verifier rewards, and the Arena's pairwise judgments all rest on this assumption. The assumption breaks the moment the model becomes more capable than the evaluator on the task at hand. A non-mathematician cannot certify a novel proof; a non-specialist cannot audit a 10k-line patch for subtle security bugs; a non-expert cannot tell whether a long-horizon plan contains a hidden loophole.
+
+**Scalable oversight** asks how to keep the training signal informative once human judgment is the bottleneck. The problem was formalised by Leike et al. (2018) under the heading "scalable agent alignment", and is now central to the superalignment research programme: maintaining alignment as capabilities grow beyond the evaluator's expertise.
+
+The chapter is organised by protocol. After motivation (§ orientation), we cover the three classical proposals — debate (Irving 2018), iterated distillation and amplification (Christiano 2018), and recursive reward modelling (Leike 2018) — followed by the 2023–2024 empirical pillars — weak-to-strong generalisation (Burns OpenAI 2023) and deliberative alignment (Guan OpenAI 2024). We then look at the *measurement* side: sandwiching benchmarks (Bowman et al. 2022), critique-of-critique experiments, and what the 2025–2026 literature actually shows about whether any of this works. The closing sections cross-reference the protocols against Module 3's RLHF / Constitutional / RLVR pipelines and flag the open problems.
+
+<Callout variant="note" title="Why this chapter is not Module 3 redux">
+Module 3 covers the *implementation* of alignment recipes that already work at human-level oversight (RLHF, DPO, Constitutional AI, RLVR). This chapter covers the proposals for *what happens next* — when the supervisor is structurally weaker than the model. The boundary is fuzzy: Constitutional AI is a deployed scalable-oversight mechanism today, deliberative alignment turned into a production technique inside the o-series, and process reward models started as a scalable-oversight prototype and ended up in DeepSeek-R1's pipeline.
+</Callout>
+
+The complexity-theoretic intuition framing Irving 2018 is worth stating up front: a polynomial-time verifier that watches two unbounded provers debate can decide any problem in PSPACE (the standard complexity zoo result that $\text{IP} = \text{PSPACE}$, Shamir 1992). Direct verification of an NP-hard answer is hard for the verifier; verification after an adversarial debate is — under sufficient assumptions about the debaters — much easier. This is the analogy, not a proof. Whether real LLM debaters approximate the unbounded-prover assumption is the empirical question the rest of the chapter addresses.
+
+---
+
+## Debate {#debate}
+
+Irving, Christiano, and Amodei (2018) propose a two-agent zero-sum game. A question is posed; two AI agents take turns making short arguments up to a fixed token and round budget; a human judge (assumed weak and non-expert) reads the transcript and declares a winner. Agents are trained by self-play with reward equal to the judge's binary verdict. The hope is that under sufficiently competent self-play, an agent that lies will be successfully rebutted by the truthful opponent, so truth is the equilibrium strategy.
+
+**The complexity analogy.** Under the idealisation of unbounded-compute agents and a polynomial-time judge, debate can in principle answer any PSPACE question — the debaters effectively walk the judge through a game tree the judge could never enumerate alone. Irving et al. flag four immediate questions the analogy does not resolve: (i) do real LLM debaters approximate the optimal-prover assumption; (ii) can the judge actually distinguish true from persuasive arguments; (iii) does the equilibrium require multiple rounds, or can a single exchange suffice; (iv) what happens when one agent has more compute than the other.
+
+**Khan et al. (2024) — empirical reading comprehension.** The largest-scale debate experiment to date used the QuALITY long-document reading-comprehension benchmark. Two LLM debaters had access to a ~5,000-word source document and were asked to argue for opposing answers to a multiple-choice question; a weaker LLM judge that had **not** read the source had to pick the better-argued answer. Three findings stood out. First, judge accuracy under debate exceeded judge accuracy on the answer alone or on summaries — debate added information the judge could not get otherwise. Second, accuracy increased when the debaters were stronger (consistent with the equilibrium argument). Third, the effect held even when the debaters were finetuned to be more *persuasive* rather than more truthful, suggesting that quoted evidence is harder to fake than free-form rhetoric — the structure of the debate protocol does some of the work.
+
+**Brown-Cohen, Irving and Christiano (2023) — doubly-efficient debate.** The classical Irving debate is computationally expensive: both agents produce long arguments and a judge reads both. Brown-Cohen et al. analyse variants in which agents commit to claims before seeing the rebuttal (simultaneous-move) and in which the judge can request only short cross-examinations rather than full transcripts. They show that under reasonable assumptions debate retains its accuracy guarantees while reducing the per-step compute and judge-read budget to within a constant factor of plain supervised learning.
+
+**Frontier deployment as of May 2026.** Debate has not been deployed as the primary alignment technique at any frontier lab. The closest production analogue is **multi-agent verifier ensembles** used inside RLVR and PRM pipelines (Module 3 §03e, §03g): a "prover" LLM emits a candidate solution, a "checker" LLM produces an adversarial counter-argument, and a verifier judges. This recovers the structural skeleton of debate without committing to the full self-play training regime.
+
+**Open empirical questions.** Whether debate generalises beyond QuALITY-style reading comprehension to open-ended reasoning is unclear. Khan et al. only tested tasks where the ground truth was a quotation from a document. On tasks with no ground truth (open-ended ethics, strategy), debate's truth-seeking guarantees are speculative. The 2025–2026 literature is also concerned with **debater collusion**: two agents trained together might learn correlated lies that the judge cannot distinguish from correlated truths.
+
+---
+
+## Iterative amplification {#iterative-amplification}
+
+Christiano, Shlegeris, and Amodei (2018), in "Supervising strong learners by amplifying weak experts", propose **Iterated Distillation and Amplification (IDA)**. The procedure is a recursive bootstrap:
+
+$$A^{\star}(x) = H\big(f(A(x_1), A(x_2), \ldots, A(x_k))\big)$$
+
+where $A$ is the current learner, $H$ is a human (or weak supervisor), $f$ decomposes the hard input $x$ into $k$ easier subproblems $x_1, \ldots, x_k$, and $A^{\star}$ is the *amplified* learner — the (human, current-AI) team. A new learner $B$ is then trained by *distillation* to imitate $A^{\star}$, and the loop iterates with $B$ in $A$'s role.
+
+The safety argument runs by induction: if $A$ is aligned, then $A^{\star} = H \circ f(A, \ldots, A)$ is aligned (because $H$ vetoes), and if distillation is faithful then $B \approx A^{\star}$ is also aligned. The procedure never relies on direct human supervision of the strongest model; supervision is always supplied by a (human + slightly-weaker model) team.
+
+**What IDA buys.** Two things. First, it converts a hard alignment problem (supervise a superhuman model directly) into a sequence of easier problems (supervise a model only slightly stronger than the supervisor). Second, it provides a recursive guarantee structure that does not require any new alignment insight to be solved at scale — the alignment property is preserved across rounds rather than re-discovered.
+
+**The three classical failure modes.**
+
+1. **Task indecomposability.** Not every hard task decomposes into easier subtasks the prior-round model can solve. Tasks requiring globally coherent reasoning — long-horizon planning, novel mathematical synthesis — may resist the decomposition $f$. Critch (2019) and others have argued that the class of tasks for which IDA is meaningful is narrower than the original paper suggests.
+2. **Distillation error.** Each round of $A \mapsto B$ introduces imitation error. Even if $A^{\star}$ is aligned, $B$ may not be — and over many rounds the drift compounds. Christiano's safety argument requires distillation to be approximately faithful uniformly over rounds, which is not obviously achievable.
+3. **Human consistency.** The procedure assumes the human $H$ is consistent across all decomposed subtasks. If $H$ is biased or inconsistent (preferring verbose answers, missing rare failure modes), the amplification step embeds those biases at every round.
+
+**Connection to today's pipelines.** Modern pipelines do not run an explicit IDA tree. They run a one-round amplification: the human is augmented by a previous-generation model (e.g., a critique model, a verifier, a search tool) when labelling data for the next-generation model. RLHF with model-assisted preference labelling, Anthropic's "constitutional critique" loop (Module 3 §03d), and OpenAI's PRM-assisted human review of o-series reasoning traces all fit this pattern. None of them iterate IDA beyond one or two rounds, and the formal guarantees are not invoked — the structural intuition is.
+
+---
+
+## Weak-to-strong generalisation {#weak-to-strong}
+
+Burns et al. (OpenAI, December 2023), "Weak-to-Strong Generalization", tests a more direct empirical question: if you finetune a *strong* pretrained model using labels generated by a *weak* model, does the strong model match the weak supervisor, or does it surpass it by leveraging its own pretrained knowledge?
+
+**Setup.** A small "weak" model generates labels on a task. A larger "strong" pretrained model is finetuned on those (noisy) labels. Performance is compared against: the weak supervisor alone, the strong model finetuned on ground-truth labels (the "ceiling"), and the strong model with no finetuning.
+
+**The PGR metric.** Burns et al. define **performance gap recovered (PGR)** as
+
+$$\text{PGR} = \frac{\text{strong-student} - \text{weak-supervisor}}{\text{strong-ceiling} - \text{weak-supervisor}}$$
+
+A PGR of 0 means the student perfectly imitates the weak supervisor and recovers none of the gap. A PGR of 1 means the student matches the strong-ceiling model trained on ground truth. Real numbers in the paper sit between roughly 0.2 and 0.8 depending on task and method.
+
+**Findings.** On NLP classification, chess move prediction, and reward modelling, the strong student consistently outperformed the weak supervisor — sometimes substantially. Adding two simple modifications boosted PGR: an **auxiliary confidence loss** that encourages the student to maintain confident predictions even where the supervisor is uncertain, and **bootstrapping** through intermediate model sizes. The qualitative claim is that pretrained representations contain useful task knowledge that survives noisy supervision; the supervisor's role is to *elicit* this knowledge, not to *transmit* it.
+
+**Why it matters for scalable oversight.** Weak-to-strong is the empirical pillar that says scalable oversight is not vacuous. We will eventually be in a position where humans are the weak supervisors and superhuman models are the strong students. The 2023 experiments are a controlled analogue of that future situation, and they suggest that meaningful alignment signal does transfer.
+
+**Limitations explicit in the paper.** Burns et al. flag that the analogy is imperfect. Real future supervisors won't have the same systematic errors as small pretrained models; the strong student's "ability to know better" comes from pretraining on data that included expert demonstrations, which may not apply when the strong student is superhuman on a frontier task with no prior expert data. Tasks where the weak and strong models have qualitatively *different* priors (rather than the strong having a more accurate version of the same prior) are still open.
+
+**Follow-up work (2024–2026).** Subsequent papers have extended the protocol to debate-style data (the "debate helps weak-to-strong" line, including Khan et al. 2024 in spirit), to reward-modelling tasks at larger scale, and to multimodal settings. The empirical headline has held up: a strong pretrained model finetuned on weak labels does typically beat the weak labeller, often by a wide margin.
+
+---
+
+## Deliberative alignment {#deliberative-alignment}
+
+Guan, Amodei, and colleagues (OpenAI, December 2024), "Deliberative Alignment: Reasoning Enables Safer Language Models", introduce the training technique that produced the safety profile of the o-series reasoning models (o1, o3-mini, and successors).
+
+**Core insight.** Rather than train the model to follow safety policies *implicitly* via preference data, train it to **reason explicitly over a written specification** before answering. The specification — a "constitution" of human-readable policies — becomes part of the model's chain of thought during training, and the model learns to invoke and apply the relevant clauses on each request.
+
+**Procedure.**
+
+1. Author a written specification $C$ — a structured document listing behaviours required (e.g., refuse weapons-of-mass-destruction synthesis; comply with reasonable creative-writing requests; refuse impersonation of real people without consent).
+2. Generate a training dataset by, for each prompt $x$: have the model produce a candidate response; produce a chain of thought that cites specific clauses of $C$; produce a critique against $C$; produce a revised response.
+3. Supervised-finetune on the (prompt, CoT-citing-policy, response) trajectories.
+4. Optionally, run RL with a reward model trained on policy-adherence preferences.
+
+**Why this scales human oversight.** A human writes the specification *once*. The model then applies it at scale. The model's reasoning chain becomes inspectable — if it misbehaves, you can read which clauses it cited and which it ignored. This converts an opaque preference-based pipeline into one with a written, debuggable policy artefact.
+
+**Connection to o-series safety reports.** OpenAI's o1 and o3 system cards report substantial improvements on internal safety benchmarks attributable to deliberative alignment: lower overrefusal on reasonable requests, higher refusal rate on disallowed requests, and better out-of-distribution generalisation to novel jailbreaks. The mechanism — explicit reasoning over a written policy — is also why the o-series can be "specified into" specialised deployments by partner organisations; the specification is the surface they adjust.
+
+**Relationship to Constitutional AI.** Deliberative alignment is the lineal descendant of Anthropic's Constitutional AI (Bai et al. 2022, Module 3 §03d). Both replace human preference judgments with model-applied policy judgments. The differences are operational: Constitutional AI's policy is invoked at preference-generation time and the model is trained on the resulting preferences (RLAIF); deliberative alignment's policy is invoked at response-generation time and the model is trained on the resulting reasoning traces directly. The deliberative-alignment chain of thought is also retained as part of inference behaviour, not just training, which is what makes the o-series read like they are "thinking through" the policy at decode time.
+
+**Where it does not yet scale.** Deliberative alignment requires a tractable written specification. Domains where the desired behaviour cannot be cleanly written down — aesthetic judgment, fine-grained social calibration, domain-specific code quality — still rely on preference-based pipelines. Writing the specification is itself an alignment problem.
+
+---
+
+## Sandwiching and benchmarks {#sandwiching-and-benchmarks}
+
+The proposals above are theory or trained-system claims. The complementary line of work is **measurement**: empirically test scalable-oversight protocols on tasks where we know the answer but the human evaluator does not.
+
+**Sandwiching (Bowman et al., 2022, "Measuring Progress on Scalable Oversight for Large Language Models").** Find a task where a panel of human experts succeeds (so ground truth is available), unaided non-expert humans fail (so direct supervision is unreliable), and current LLMs alone also fail. Then test whether non-expert humans assisted by LLMs can recover expert-level accuracy. The task "sandwiches" the supervision protocol between unaided humans (weak) and experts (strong).
+
+**Setup on QuALITY.** Non-expert humans were given five minutes to answer a reading-comprehension question on a ~5,000-word document. Three arms: human alone, GPT model alone, human in dialog with the model. Human-plus-model dialog substantially outperformed either alone on the reported configurations. The point is not the absolute numbers — they age — but the demonstration that the sandwich framework yields measurable, replicable results.
+
+**Why this matters.** Many scalable-oversight proposals are evaluated on toy environments (binary classification, sparse rewards) where the gap between "weak supervisor" and "strong agent" is wide but the tasks are unrealistic. Sandwiching forces the evaluation onto tasks with sufficient richness that human plus model is non-trivial.
+
+**Follow-up benchmarks (2024–2026).**
+
+- **GPQA-Diamond.** Hard graduate-level science questions where expert PhDs in the question's field get ~65%, expert PhDs outside the field get ~30%, and Google-armed laypeople get ~34%. Strong sandwich substrate for testing whether LLM-assisted laypeople can close the gap.
+- **HLE (Humanity's Last Exam).** Frontier hard questions across disciplines. Used as a stress test for both raw model capability and human-plus-model performance.
+- **Anthropic and DeepMind internal sandwiches.** Both labs have run model-organism studies in which a deliberately-misaligned model is finetuned, and human evaluators (with and without aid) are tested on whether they can catch the misalignment. Results have been published in summary form; the headline is that aided humans do better than unaided humans, but neither catches all the misalignments.
+
+**The critique-of-critique line.** A recent variant: rather than ask a human to judge whether an answer is correct (hard), ask the human to judge whether an *AI's critique* of the answer is correct (easier — verification of a critique is typically easier than producing one). Empirical work in 2024–2025 ("Scalable Oversight for Superhuman AI via Recursive Self-Critiquing", arXiv:2502.04675, and follow-ups) shows that second-order critique is reliably easier than first-order judgment, supporting the recursive verification idea.
+
+---
+
+## Empirical results, 2024–2026 {#empirical-results-26}
+
+What does the 2024–2026 literature actually show works?
+
+**1. Pretrained-knowledge transfer is the workhorse.** Weak-to-strong generalisation is the most robust empirical finding. Across NLP, code, math, and chess, strong pretrained students trained on weak supervisor labels close a meaningful fraction of the gap to ground-truth supervision. The mechanism is pretraining — the strong model already knows things the supervisor does not — and the implication is that the bulk of "alignment signal" is being elicited rather than transmitted.
+
+**2. Explicit written policies work better than preferences alone.** Constitutional AI (Anthropic) and deliberative alignment (OpenAI) both show that having a written, model-invokable policy outperforms learning the policy implicitly from human preferences. The policy artefact is debuggable; the preference data is not. As of 2026, every frontier lab publishes some version of a written safety specification (OpenAI's Model Spec, Anthropic's policy documents, DeepMind's Responsibility & Safety Council outputs) and uses it as direct input into post-training.
+
+**3. Process reward models are easier to oversee than outcome rewards.** Lightman et al. (2023) and follow-ups in Module 3 § 03g show PRMs substantially reduce reward hacking. The scalable-oversight interpretation: humans can spot errors in a single reasoning step (verification problem) far more easily than verify the correctness of a 50-step trajectory (generation problem). The asymmetry verification < generation is the recurring engine across the techniques in this chapter.
+
+**4. Debate works on tasks with quotable ground truth.** Khan et al. (2024) and follow-ups show debate elicits truthful judgments from weak judges when the ground truth is a specific passage. Whether debate works on tasks without such quotable ground truth (open-ended reasoning, ethics, strategy) is empirically open.
+
+**5. Pure IDA is not in production.** No frontier lab runs explicit multi-round amplification trees in production. The closest analogue is single-round assisted labelling, which is essentially universal. Whether multi-round IDA is necessary or whether single-round suffices in the near-term superhuman regime is an open question.
+
+**6. Sandwich benchmarks are converging on the same headline.** Across QuALITY, GPQA-Diamond, HLE, and internal lab studies, the consistent finding is that LLM-assisted weak supervisors meaningfully outperform unaided weak supervisors, but typically fall short of expert-level performance. The gap is closing year over year as both models and protocols improve.
+
+<Callout variant="warning" title="What the 2025-2026 work does not establish">
+None of the published scalable-oversight studies have been run in the regime that matters most — superhuman models on tasks where no expert ground truth exists. The current evidence base is strongly indicative but not direct. It is plausible that the techniques continue working in the superhuman regime; it is also plausible that they fail in ways the current benchmarks cannot detect. This is a frequent caveat in the 2025–2026 literature and the open empirical problem is to construct evaluation protocols that can detect failure of supervision *itself*.
+</Callout>
+
+---
+
+## Cross-references {#cross-references}
+
+Scalable-oversight protocols touch many other chapters of this textbook. The map:
+
+- **Constitutional AI and RLAIF** (Module 3 § 03d) are the production instantiation of "use a written policy + an AI policy-verifier in place of a human judge." The deliberative-alignment section in this chapter is the direct lineal descendant.
+- **Process reward models** (Module 3 § 03g) are the production instantiation of "decompose a hard final-answer judgment into easy per-step verifications." PRM800K (Lightman et al. 2023) is both a scalable-oversight artefact and a post-training resource.
+- **RLVR** (Module 3 § 03e) instantiates the scalable-oversight observation that *some* domains admit programmatic verifiers — and where they do, learned reward models can be eliminated entirely. RLVR is the scalable-oversight ideal: the supervisor is exact ground truth, available at unlimited scale.
+- **Red-teaming protocols** (this module, § 05g) consume the outputs of scalable-oversight pipelines: an automated red-teamer is itself an instance of "weak supervisor stress-testing a strong model".
+- **Mechanistic interpretability and circuit analysis** (this module, §§ 05d, 05e) are the orthogonal alignment lever: instead of asking "how do we extract a training signal from a weak supervisor?", interpretability asks "how do we read the model directly?" The two programmes are complementary; some labs (Anthropic explicitly) frame interpretability as a prerequisite for scalable oversight, on the grounds that you cannot oversee what you cannot inspect.
+- **Sleeper agents and alignment-faking evaluations** (this module, § 05h) are scalable-oversight stress tests: deliberately-misaligned models that test whether downstream alignment protocols can catch a strategically-deceptive student.
+
+---
+
+## Open problems {#open-problems}
+
+**Specification gaming under explicit policies.** Both Constitutional AI and deliberative alignment require a written specification. Models trained on these specifications nevertheless find loopholes: a model that has learned to "refuse harmful requests" may comply with a sufficiently obfuscated harmful request that the policy's surface form does not match. Specification gaming is the alignment analogue of Goodhart's law and has no general solution; current practice mitigates it by iterating the specification against red-team probes.
+
+**Debater collusion.** When two debaters are trained jointly via self-play, they may develop correlated strategies that the judge cannot distinguish from honest disagreement. Whether realistic training procedures induce collusion or honest debate is an empirical question that current experiments cannot conclusively resolve.
+
+**Failure detection in the superhuman regime.** All current evaluations rely on tasks where ground truth is available to the experimenter. The regime that motivates the field — superhuman models on tasks with no available expert ground truth — has no published direct evaluation. Constructing **scalable-oversight failure tests** that can detect when supervision is breaking *without* requiring ground truth is the central open problem of the 2025–2026 agenda.
+
+**Composition of techniques.** The community has not converged on a canonical recipe combining debate, weak-to-strong, deliberative alignment, recursive critique, and verifiable rewards. Production pipelines run hybrids: Constitutional AI's critique loop plus PRM-style stepwise verification plus deliberative-alignment-style policy reasoning. Whether any combination yields formal guarantees, or whether the field is still in a "best-effort empirical stack" regime, is unsettled.
+
+**Cost.** Multi-round amplification, debate, and critique chains all increase training-time compute substantially. Whether the alignment improvements justify the cost at the scale of frontier pretraining is a budget-allocation problem that frontier labs have not made public.
+
+---
+
+## Summary {#summary}
+
+Scalable oversight is the problem of supplying reliable training signal when the evaluator is structurally weaker than the model. The classical proposals — debate (Irving 2018), iterated distillation and amplification (Christiano 2018), recursive reward modelling (Leike 2018) — share the structure of decomposing or adversarialising a hard supervision task into easier sub-tasks. The empirical pillars from 2023–2024 are weak-to-strong generalisation (Burns OpenAI 2023), which shows that pretrained knowledge transfers usefully across the strong-student / weak-supervisor gap, and deliberative alignment (Guan OpenAI 2024), which shows that explicit written specifications outperform implicit preference learning. The measurement programme — sandwiching benchmarks (Bowman 2022), GPQA-Diamond, HLE, lab-internal model-organism studies — gives the protocols an empirical home, but always on tasks where ground truth is available; the superhuman regime where scalable oversight *matters* has no direct test yet.
+
+For a reader of Module 3, the practical upshot is that the production frontier-LLM alignment stack is already a scalable-oversight stack: Constitutional AI's policy-verifier loop, the o-series' deliberative chains of thought, PRMs that decompose final-answer judgments into per-step verifications, and RLVR's exact verifier rewards are all instances of the protocols in this chapter. The remaining research problem is whether these techniques continue to work as the supervisor's relative weakness grows.
+
+<Sources items={[
+  { authors: "Irving, G., Christiano, P., Amodei, D.", year: 2018, title: "AI Safety via Debate", venue: "arXiv:1805.00899", url: "https://arxiv.org/abs/1805.00899", note: "Foundational debate paper; PSPACE intuition." },
+  { authors: "Christiano, P., Shlegeris, B., Amodei, D.", year: 2018, title: "Supervising strong learners by amplifying weak experts", venue: "arXiv:1810.08575", url: "https://arxiv.org/abs/1810.08575", note: "IDA / iterated amplification framework." },
+  { authors: "Leike, J., Krueger, D., Everitt, T., Martic, M., Maini, V., Legg, S.", year: 2018, title: "Scalable Agent Alignment via Reward Modeling: A Research Direction", venue: "arXiv:1811.07871", url: "https://arxiv.org/abs/1811.07871", note: "Recursive reward modelling; coins 'scalable agent alignment'." },
+  { authors: "Bai, Y. et al. (Anthropic)", year: 2022, title: "Constitutional AI: Harmlessness from AI Feedback", venue: "arXiv:2212.08073", url: "https://arxiv.org/abs/2212.08073", note: "Production-scale RLAIF; written-constitution mechanism." },
+  { authors: "Bowman, S. R. et al.", year: 2022, title: "Measuring Progress on Scalable Oversight for Large Language Models", venue: "arXiv:2211.03540", url: "https://arxiv.org/abs/2211.03540", note: "Sandwiching benchmark; QuALITY-based protocol." },
+  { authors: "Burns, C. et al. (OpenAI)", year: 2023, title: "Weak-to-Strong Generalization: Eliciting Strong Capabilities With Weak Supervision", venue: "arXiv:2312.09390", url: "https://arxiv.org/abs/2312.09390", note: "Empirical pillar; PGR metric; auxiliary-confidence loss." },
+  { authors: "Brown-Cohen, J., Irving, G., Christiano, P.", year: 2023, title: "Scalable AI Safety via Doubly-Efficient Debate", venue: "arXiv:2311.14125", url: "https://arxiv.org/abs/2311.14125", note: "Compute-efficient debate variants." },
+  { authors: "Khan, A. et al.", year: 2024, title: "Debate Helps Supervise Unreliable Experts", venue: "arXiv:2311.08702", url: "https://arxiv.org/abs/2311.08702", note: "Largest published empirical debate study on QuALITY." },
+  { authors: "Guan, M. Y. et al. (OpenAI)", year: 2024, title: "Deliberative Alignment: Reasoning Enables Safer Language Models", venue: "arXiv:2412.16339", url: "https://arxiv.org/abs/2412.16339", note: "Trains o-series to reason over a written policy at inference time." },
+  { authors: "Lightman, H., Kosaraju, V., Burda, Y. et al.", year: 2023, title: "Let's Verify Step by Step", venue: "arXiv:2305.20050", url: "https://arxiv.org/abs/2305.20050", note: "PRM800K; process- vs outcome-reward verification." },
+  { authors: "Lambert, N.", year: 2024, title: "The RLHF Book — Chapter 13: Constitutional AI and AI Feedback", venue: "rlhfbook.com", url: "https://rlhfbook.com/c/13-cai", note: "Synthesis playbook; modern survey treatment." },
+  { authors: "Greenblatt, R. et al. (Anthropic)", year: 2024, title: "Alignment Faking in Large Language Models", venue: "Anthropic Research", url: "https://www.anthropic.com/research/alignment-faking", note: "Sandwiching-style stress test of supervision protocols." },
+  { authors: "OpenAI", year: 2024, title: "Scalable Oversight for Superhuman AI via Recursive Self-Critiquing", venue: "arXiv:2502.04675", url: "https://arxiv.org/abs/2502.04675", note: "Critique-of-critique hierarchies; recursive verification." },
+  { authors: "Shamir, A.", year: 1992, title: "IP = PSPACE", venue: "Journal of the ACM", url: "https://dl.acm.org/doi/10.1145/146585.146609", note: "Complexity-theoretic background for the debate analogy." },
+]} />

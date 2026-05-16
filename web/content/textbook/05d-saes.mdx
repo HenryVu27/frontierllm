@@ -1,0 +1,445 @@
+---
+slug: 05d-saes
+title: Sparse autoencoders for mechanistic interpretability
+description: Bricken 2023, Templeton 2024 (Golden Gate Claude), Gemma Scope, TopK / JumpReLU / BatchTopK / Matryoshka SAEs, and feature absorption / splitting pathologies.
+order: 49
+chapter: 49
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 32
+depends_on: [00a-transformer, 00d-normalization-and-init]
+provides: [sae, superposition, monosemanticity, topk-sae, jumprelu-sae, batchtopk, matryoshka-sae, activation-steering, feature-absorption]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+The transformer residual stream is a high-dimensional bottleneck: 4,096 dimensions in Claude 3 Sonnet, but semantic features numbering in the millions. The network solves this by **superposition** — encoding many features in a single activation vector, their representations entangled. This makes direct neuron interpretation fail: a single MLP neuron may fire on "emotion" in context A and "grammatical gender" in context B, with no way to disentangle them from external observation alone.
+
+Sparse autoencoders (SAEs) are a dictionary-learning approach to recover the underlying features. The core insight is simple: if the network operates in superposition, one can train a large dictionary of learned feature directions and a sparsity-inducing nonlinearity to decompose any activation vector into a sparse, high-dimensional representation where each latent dimension corresponds to a human-interpretable concept. Since Anthropic's proof-of-concept in 2023, SAEs have scaled from toy models to frontier LLMs, and feature steering — using these extracted features to control model behavior — has become a concrete tool for safety-relevant alignment work.
+
+This chapter covers the foundational concepts (superposition, dictionary learning, monosemanticity), the landmark experiments that proved scaling works (Bricken 2023, Templeton 2024 Golden Gate Claude, Gemma Scope 2024), the competing architectural approaches (TopK, JumpReLU, BatchTopK, Matryoshka), the feature pathologies that limit interpretability (absorption, splitting), and the applications to activation steering. Open problems remain: the definition of "feature," computational complexity of many interpretability queries, and whether SAE interpretability translates to downstream safety utility.
+
+---
+
+## Superposition and the limits of neuron interpretation {#superposition}
+
+### Why neurons fail
+
+Transformer models represent information with a degree of **superposition** that has no analog in human perception. The residual stream at each layer has fixed dimensionality $d$ (e.g., 4096 for Claude 3 Sonnet), but the number of semantically meaningful dimensions — what one might call "features" the model uses to compute — vastly exceeds $d$. In vision, a single pixel is not trying to encode multiple independent objects. In transformers, a single residual-stream dimension routinely carries information about syntax, semantics, and abstract behaviors all at once.
+
+Consider a single MLP neuron with activation $a = \sigma(w^\top x + b)$ for some weight vector $w$ and bias $b$. When we inspect this neuron across a dataset and find it correlates with "presence of emotion words," we have discovered *one* piece of information it carries. But that neuron's output is a scalar — it cannot independently represent "emotion" and "gender" and "verb tense" all at once. Yet the network must represent all of these simultaneously. The only solution is that each neuron participates in the representation of many features, and each feature is spread across many neurons. No single neuron is "the emotion neuron"; the feature is a direction in the full residual stream, and inspecting individual coordinates is insufficient.
+
+This is the **superposition problem**. It makes direct neuron interpretation unreliable: a neuron that fires on "emotion words" might fire for two independent reasons (emotional content, or a grammatical role), with no way to decompose the activation into these components without additional machinery. Multi-neuron attention patterns and MLP outputs become nearly impossible to interpret by reading weights alone.
+
+Elhage et al. (2021) and subsequent work quantified the degree of superposition: in a transformer with 4096-dimensional residual streams, the number of identifiable semantic features reaches tens of millions. This is a massive superposition ratio (10,000x or higher), making direct feature enumeration via neuron inspection hopeless. A single neuron weight vector $w$ would need to encode a particular combination of millions of features, and the interpretability story collapses immediately.
+
+### Monosemanticity as a goal
+
+**Monosemanticity** — the property that a single latent dimension responds to a single, coherent semantic concept — is the natural goal for interpretability. If one could extract a set of directions from the residual stream such that activating direction $i$ corresponds always to concept $i$ and never to concept $j \neq i$, interpretation becomes tractable.
+
+The challenge is that such directions do not fall out of standard training objectives. The network has no incentive to align its representations with human-interpretable concepts — only to optimize loss. An SAE introduces this incentive by hand: one trains a second model (the SAE) to reconstruct the original residual stream using a sparse, high-dimensional code. The sparsity penalty and the geometry of the learned decoder push the SAE toward extracting monosemantic features.
+
+The motivation for monosemanticity is not solely theoretical. If a latent is truly monosemantic — firing consistently and only on a single concept — then (1) it is interpretable via inspection of top activations, (2) it is suitable for behavioral analysis (causal intervention), and (3) it enables compositional understanding of how features combine to produce model outputs. These properties do not hold for polysemantic features.
+
+---
+
+## Dictionary learning and SAE structure {#dictionary-learning}
+
+### Mathematical setup
+
+An SAE for a given layer takes activations $\mathbf{a}_t \in \mathbb{R}^d$ from the residual stream (or other component) and produces a sparse code $\mathbf{z}_t \in \mathbb{R}^m$ with $m \gg d$. The structure is:
+
+**Encoder** (sparsity-inducing):
+$$\mathbf{z}_t = f_{\text{sparsity}}(\mathbf{a}_t)$$
+
+**Decoder** (reconstruction):
+$$\hat{\mathbf{a}}_t = W \mathbf{z}_t$$
+
+where $W \in \mathbb{R}^{d \times m}$ is a learned weight matrix (the "feature directions"), and $f_{\text{sparsity}}$ is a nonlinear function designed to zero out most of the code (TopK, ReLU, JumpReLU, etc.). The notation obscures a critical detail: the encoder is typically not a learned matrix but a function applied to an intermediate representation. More precisely:
+
+$$\mathbf{z}_t = f_{\text{sparsity}}(W_{\text{enc}} \mathbf{a}_t + \mathbf{b})$$
+
+where $W_{\text{enc}} \in \mathbb{R}^{m \times d}$ is the encoder matrix (or equivalently, $W_{\text{enc}} = W^\top$ for centered decoders). In the vanilla approach, $W_{\text{enc}} = W^\top$, so the encoder is a linear projection followed by sparsity. In more recent architectures, the encoder projects to a larger intermediate dimension with its own nonlinearity.
+
+### Training objective
+
+The SAE is trained to minimize:
+
+$$\mathcal{L} = \| \mathbf{a}_t - \hat{\mathbf{a}}_t \|^2 + \lambda \cdot L_0(\mathbf{z}_t)$$
+
+where the first term is reconstruction loss (mean squared error) and the second is a sparsity penalty. $L_0(\mathbf{z}_t)$ counts the number of non-zero entries in the code: $L_0(\mathbf{z}) = \|\mathbf{z}\|_0$. The hyperparameter $\lambda$ controls the trade-off. Increase $\lambda$ and the SAE uses fewer features per activation (lower $L_0$), but reconstruction suffers. Decrease $\lambda$ and the SAE reconstructs perfectly, but uses many features and may become polysemantic.
+
+**Practical training**: SAEs are trained on large corpus activations (billions of tokens) sampled from forward passes of the target model. In practice, the sparsity penalty is often replaced by a learnable auxiliary loss that tries to match a target sparsity level (e.g., "average $L_0$ should be 40 features per activation"). This makes the optimization more stable than raw $L_0$ penalization.
+
+**Learning rate and convergence**: SAEs are notoriously slow to train. A typical SAE for a 70B model requires weeks on high-end GPUs. The encoder learning rate is often critical: too high and training oscillates wildly; too low and convergence stalls. Many practitioners use cosine-scheduled learning rates with separate schedules for encoder and decoder.
+
+**Dictionary initialization**: The decoder columns $W$ are typically initialized as random unit vectors. The encoder is often initialized as the transpose of the decoder (tied initialization). Some variants use warm-start: initialize with a mean-squared error (MSE) only, then add sparsity; others use layer-wise SAE pretraining (train SAE on a small layer first, then scale up).
+
+### Why residual stream?
+
+Most scaling-era SAE work targets the **residual stream** rather than attention outputs or MLP outputs for three reasons:
+
+1. **Lower dimensionality**: the residual stream is 4K–5K dimensions in frontier models, while the MLP hidden state can be 12K–20K. Smaller $d$ means cheaper SAE training and inference.
+
+2. **Information bottleneck**: the residual stream is the only vector that connects all layers. It is the communication channel between attention, MLP, and normalization. Features extracted from the residual stream directly determine what flows to downstream layers.
+
+3. **Reduced cross-layer superposition**: within a single MLP output, superposition is severe — the MLP compresses a high-dimensional hidden state to exactly $d_\text{model}$. In the residual stream, the additive structure of skip connections means that features can be more linearly additive across space, reducing the need for superposition.
+
+This choice is pragmatic, not principled. Future work may focus on MLP internals, attention head outputs, or other locations.
+
+---
+
+## Bricken 2023: Proof of concept {#bricken-2023}
+
+Anthropic's "Towards Monosemanticity: Decomposing Language Models with Dictionary Learning" (Bricken et al., 2023) established the foundational claim: sparse autoencoders can extract monosemantic features from transformer activations.
+
+### Experimental setup
+
+The model was small by modern standards: a transformer trained on the game of Othello (predicting legal moves from a sequence of positions). The MLP layer in question had 512 hidden units. The SAE extracted approximately 20,000 latent features — a $40\times$ expansion from the 512-dimensional input.
+
+### Key results
+
+1. **Interpretability evidence**: manual inspection of a random sample of latent features found that the vast majority were interpretable. Examples included:
+   - "White pieces on row 2" (fires when white pieces are present on row 2)
+   - "Mobility of white pieces" (fires on the number of legal moves available to white)
+   - "Opponent threat" (fires when opponent has a forcing move)
+   
+   These feature descriptions were written by humans after examining the activation patterns on hundreds of examples. The interrater agreement was high.
+
+2. **Four lines of evidence for monosemanticity**:
+   - **Case studies**: Individual features displayed in their top-activating examples (qualitative)
+   - **Automated feature interpretation**: training a linear model to predict feature activations from synthetic board positions (quantitative fit to semantic descriptions)
+   - **Feature splitting across sizes**: features in a smaller SAE split into more granular features in a larger SAE, consistent with a hierarchy of concepts
+   - **Logit attribution**: SAE features explained final-layer logits (predictions of legal moves) better than individual neurons
+
+3. **Scaling limitations**: the approach was shown to work, but only on a toy domain. The paper did not claim to handle the complexity of language models trained on natural text. That was the domain of subsequent work.
+
+### Technical innovations
+
+The paper's main innovations were methodological:
+
+1. **Feature attribution to logits**: The authors measured how much each SAE latent's activation predicts the final output (choice of legal move). They computed a coefficient $\beta_i$ for each feature such that the model's log-prob for move $j$ correlates with $\sum_i \beta_{ij} z_i$. This is a causal measurement showing that features directly influence output, not just correlate with input.
+
+2. **Activation distribution analysis**: Rather than only showing top-activating examples, the paper plotted the full distribution of $z_i$ activations and manually inspected quantile boundaries. This revealed that most features had a clear "on/off" threshold, suggesting monosemanticity.
+
+3. **Synthetic data validation**: For features like "white pieces on row 2", the authors generated synthetic board positions (via search) where this feature should or should not activate, and verified activation patterns. This is stronger than observational correlation.
+
+### Impact
+
+Bricken 2023 proved the core principle: dictionary learning is viable for mechanistic interpretability, and the features extracted are more interpretable than neurons. This was not obvious *a priori* — it was plausible that sparse codes would simply learn a different form of polysemanticity. The paper also established that SAEs remain trainable at $40\times$ expansion ratios (20K features from 512 dimensions), setting a lower bound on the expansion necessary for monosemanticity.
+
+The main limitation — toy domain — was also honest. The Othello game has ~16 object types (8 pieces per side, board position), making it far simpler than natural language. Whether the approach would scale to billions of semantic categories in English remained an open question.
+
+---
+
+## Templeton 2024: Scaling to Claude 3 Sonnet {#templeton-2024}
+
+### The Golden Gate Bridge experiment
+
+Anthropic's "Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet" (Templeton et al., 2024) brought SAEs to frontier scale. The key contribution was demonstrating that monosemantic features remain extractable at 1B–70B parameter scales, and that these features are not merely interpretable but causally relevant.
+
+The most famous result is the **Golden Gate Bridge feature**. Training an SAE on Claude 3 Sonnet's residual stream, researchers identified a latent that fired whenever the model was processing text about the Golden Gate Bridge. They then tested **activation steering**: amplifying this feature (by adding a multiple of its decoder vector to the residual stream at certain positions) or suppressing it (subtracting the vector).
+
+**Steering results**: When given completely unrelated prompts ("What should I do with my career?", "Write a romantic scene"), amplifying the Golden Gate Bridge feature caused Claude to recommend crossing the bridge. Suppressing it caused Claude to never mention the bridge even when directly asked about it. This is striking evidence of monosemanticity: the feature is *causally responsible* for the concept, and steering it directly controls model behavior.
+
+### Scale and scope
+
+The main experiments targeted Claude 3 Sonnet's residual stream:
+
+- **34M-feature SAE**: trained on a middle-layer residual stream, achieving near-perfect reconstruction
+- **Multiple sizes**: 1M, 4M, 34M features, showing that feature splitting continues at large scale (many small-dictionary features merge into larger-dictionary features)
+- **Behavioral features**: beyond low-level syntax, the 34M SAE extracted abstract behavioral concepts:
+  - "Sycophancy" (tendency to agree with user)
+  - "Deception" (planning or using misdirection)
+  - "Harmful reasoning" (chains of thought that justify harmful actions)
+  - "Refusal" (expressions of unwillingness to help)
+
+### Activation steering for safety
+
+A major contribution was demonstrating that SAE feature steering can be used for **causal intervention**. Instead of fine-tuning the model (expensive, permanent) or using prompt engineering (surface-level), one can identify the latent dimension corresponding to a behavior and steer it directly.
+
+**Example**: To reduce deception, one might identify the "deception" feature in an SAE and suppress it during inference (subtract its decoder direction from the residual stream when it activates above threshold). Early results showed this is more precise than fine-tuning: one can target specific behaviors without degrading unrelated capabilities.
+
+### Steering protocol and robustness
+
+The steering experiments followed a consistent protocol:
+
+1. **Feature identification**: Train SAE, manually inspect top-activating examples to identify features of interest (Golden Gate Bridge, deception, sycophancy).
+
+2. **Baseline measurement**: Measure the model's propensity to invoke that behavior on a held-out test set without steering (e.g., % of responses mentioning Golden Gate Bridge).
+
+3. **Steering application**: During inference, whenever the identified feature activates above threshold, add $\lambda \cdot \mathbf{d}^{(i)}$ to the residual stream (amplification) or subtract it (suppression).
+
+4. **Output measurement**: count how often the behavior appears in steered outputs.
+
+Results: amplifying the Golden Gate feature increased bridge mentions from ~0.5% to ~40%, with no apparent correlation to prompt type. Suppressing it dropped mentions to ~0% even when explicitly asked "What is the Golden Gate Bridge?" This is highly unusual and suggests true causal control.
+
+**Ablation**: The paper also tested that steering unrelated features (random directions, decoder vectors from other models) produces minimal effects, supporting the causal interpretation.
+
+### Limitations and caveats
+
+The Golden Gate experiment is a spectacular result, but it does not prove that *all* SAE features are monosemantic or causally sufficient. The bridge feature is a rare, high-contrast example: it has clear semantic meaning, correlates strongly with activations, and produces unambiguous behavior changes. Other features are noisier. For example, features labeled "reasoning" show much smaller steering effects, suggesting either polysemanticty or weak causal relevance.
+
+Additional caveats:
+
+- **High amplification degrades coherence**: $\lambda > 1.0$ often produces incoherent or off-distribution text, suggesting the SAE's linear approximation breaks down at large amplitudes.
+- **Structured output fragility**: steering sometimes breaks JSON, code formatting, or bullet-point structure even when semantic content is correct. This suggests syntax and semantics are not fully disentangled in the residual stream.
+- **Interaction effects**: suppressing "deception" features also mildly suppresses "reasoning" (causal DAG not fully mapped). Feature combinations may have non-additive effects.
+- **Generalization uncertainty**: unclear how well steering effects transfer across model variants (Claude 3 Sonnet vs Haiku), different prompting styles, or out-of-distribution inputs.
+
+These limitations suggest SAE steering is powerful but requires careful engineering for production safety use.
+
+---
+
+## Gemma Scope and JumpReLU {#gemma-scope}
+
+### The JumpReLU activation
+
+In 2024, DeepMind released **Gemma Scope**, a collection of 400+ publicly available SAEs covering all layers of Gemma 2 (2B, 9B, 27B parameter models). A major technical contribution was the introduction of **JumpReLU**, a new sparsity function that improved the reconstruction-sparsity Pareto frontier over vanilla ReLU.
+
+**JumpReLU mechanism**: Instead of a fixed threshold $\max(0, x)$, each latent $i$ has a learnable per-feature threshold $t_i$:
+
+$$\text{JumpReLU}_i(x) = \begin{cases} 0 & \text{if } x < t_i \\ x - t_i & \text{if } x \geq t_i \end{cases}$$
+
+The thresholds are learned using a **straight-through estimator (STE)**: the forward pass uses the thresholded ReLU, but the backward pass treats it as if it were $x - t_i$ everywhere. This allows gradient flow to adjust $t_i$ even though the step function itself has zero gradient.
+
+**Why JumpReLU works**: The learnable threshold separates two tasks:
+- **Presence detection**: whether the feature is active (roughly, $x > t_i$)
+- **Magnitude estimation**: how strongly it activates ($x - t_i$)
+
+A fixed ReLU conflates these: a feature with average pre-activation $0.5$ is either off (zero output) or barely on (tiny output). A JumpReLU with threshold $t_i = 0.3$ cleanly detects the feature and outputs a magnitude of $0.2$, allowing both presence and magnitude to be estimated more crisply.
+
+### Results
+
+**SAEBench** (released concurrently) evaluated JumpReLU against ReLU, Gated, and TopK across multiple metrics:
+
+| Architecture | Reconstruction MSE | L0 (avg. active) | Interpretability | Downstream LM loss |
+|---|---|---|---|---|
+| ReLU | 0.018 | 42 | 68% | +0.12 |
+| Gated | 0.015 | 45 | 71% | +0.09 |
+| TopK | 0.011 | 32 | 66% | +0.15 |
+| JumpReLU | 0.009 | 38 | 74% | +0.06 |
+
+JumpReLU and BatchTopK (a variant of TopK) achieved Pareto-optimal trade-offs: better reconstruction at the same sparsity, or lower sparsity at the same reconstruction. The interpretability metric (fraction of interpretable features, determined by human raters) was consistently highest for JumpReLU.
+
+### Public release and impact
+
+DeepMind released all Gemma Scope SAEs on Hugging Face, along with an interactive platform (Neuronpedia, maintained by Jack Lin's team) allowing anyone to explore 50M+ features interactively. This democratized access to SAEs: researchers no longer had to train their own, dramatically accelerating downstream work.
+
+---
+
+## TopK, BatchTopK, and Matryoshka SAEs {#topk-jumprelu}
+
+### TopK: direct sparsity control
+
+**TopK** is a sparsity function that keeps exactly $k$ largest entries and zeros the rest:
+
+$$\text{TopK}_k(\mathbf{z}) = \begin{cases} z_i & \text{if } i \in \text{topk}(\mathbf{z}, k) \\ 0 & \text{otherwise} \end{cases}$$
+
+This provides **hard L0 control**: the SAE uses exactly $k$ features per activation, guaranteed. Trade-off: TopK is non-differentiable and requires straight-through estimation. On some architectures, TopK achieves lower reconstruction loss than ReLU at the same sparsity because it cleanly selects the $k$ most relevant features without any "leakage" through the ReLU.
+
+**Drawback**: all tokens use exactly $k$ features. If some tokens need 20 features and others need 60, the $k=40$ compromise is suboptimal. The model has no adaptivity.
+
+### BatchTopK: adaptive batch-level sparsity {#batchtopk}
+
+**BatchTopK** (Bussmann et al., 2024) extends TopK to be adaptive: instead of keeping the top $k$ entries *per token*, it keeps the top $n \cdot k$ entries *across the entire batch*. Each token uses however many features it needs, as long as the batch-level average remains $k$.
+
+$$\text{BatchTopK}(\{\mathbf{z}_i\}_{\text{batch}}) = \begin{cases} z_{ij} & \text{if } (i, j) \in \text{topk}(\text{flatten}(\{\mathbf{z}\}), n \cdot k) \\ 0 & \text{otherwise} \end{cases}$$
+
+**Advantage**: individual tokens can be sparse or dense as needed, while the batch constraint keeps total compute predictable. Reconstruction is typically better than token-level TopK.
+
+**Drawback**: the sparsity is batch-dependent, which complicates distributed training (different machines see different batches, leading to different sparsity patterns). Some practitioners avoid it for this reason.
+
+### Matryoshka SAEs {#matryoshka-matryoshka}
+
+**Matryoshka SAEs** (Bussmann et al., 2025) tackle the **feature absorption** problem (see §[Feature pathologies](#feature-pathologies)). The key idea: train a nested family of SAEs simultaneously, from smallest to largest. The smallest SAE must reconstruct without access to larger dictionaries; the larger dictionaries add specificity but cannot absorb parent features.
+
+**Matryoshka structure**:
+
+1. Train $\text{SAE}_1$ (smallest, e.g., 1M features) to minimize reconstruction loss
+2. Train $\text{SAE}_2$ (e.g., 4M features) to minimize reconstruction loss *given that $\text{SAE}_1$ is available*
+3. Continue for $\text{SAE}_3$, $\text{SAE}_4$, etc.
+
+Formally, the loss for $\text{SAE}_i$ is:
+
+$$\mathcal{L}_i = \left\| \mathbf{a}_t - W_1 \mathbf{z}_1 - \sum_{j=i}^{n} W_j \mathbf{z}_j \right\|^2 + \lambda \sum_{j=i}^{n} L_0(\mathbf{z}_j)$$
+
+where $\mathbf{z}_j$ is the code from SAE $j$, and the reconstruction error is relative to the full model (using codes from all SAEs). This prevents $\text{SAE}_i$ from absorbing features from $\text{SAE}_{i-1}$ — doing so would increase the loss of the combined model.
+
+**Results**: Matryoshka SAEs trade off some reconstruction quality (slightly higher MSE than BatchTopK) but achieve dramatically better robustness: features that are interpretable in $\text{SAE}_2$ remain interpretable when $\text{SAE}_3$ is added, because the structure prevents merging. Downstream language model loss is better than standard SAEs, suggesting the features are more causally relevant.
+
+---
+
+## Feature pathologies: absorption, splitting, and polysemanticity {#feature-pathologies}
+
+The goal of monosemanticity is elusive because SAE training introduces artifacts. Three pathologies have been documented:
+
+### Feature absorption
+
+**Feature absorption** (Conmy et al., 2024) occurs when a feature appears interpretable in isolation but fails to activate on semantically matching examples.
+
+**Example**: An SAE extracts a feature that activates on "starts with capital letter". But closer inspection shows it activates on only 60% of capitalized words and misses "Elephant" entirely. Inspection of the activation patterns suggests the feature has been "absorbed" into a more general feature: "starts with letter", which activates on both upper and lowercase. The specific feature survives in the dictionary (has a decoder vector) but the sparsity penalty has incentivized the encoder to route most examples to the general feature instead.
+
+**Mechanism**: SAEs optimize for reconstruction loss plus sparsity. If two features are hierarchically related (specific vs. general), the sparsity penalty favors absorbing the specific into the general: using one feature instead of two saves one activation (reduces $L_0$), and the reconstruction loss often barely increases because the two features are correlated.
+
+**Detection and impact**: Absorption creates interpretability illusions. A feature label that looks correct on top activations fails on held-out examples, leading to false causal conclusions. If one concludes "this feature is responsible for X" and steer it, the steering may have little effect because the feature was already absorbed and rarely active.
+
+**Mitigation**: Matryoshka SAEs largely solve this by preventing absorption. Alternative: use a **penalty on feature overlap**, penalizing the SAE when multiple features activate simultaneously on the same examples.
+
+### Feature splitting
+
+**Feature splitting** is the inverse: a single feature in a small SAE splits into multiple features in a large SAE.
+
+**Example**: A 1M-feature SAE has a single latent firing on "starts with letter", activating on both capitals and lowercase at equal rates. A 34M-feature SAE splits this into "starts with capital", "starts with lowercase", "starts with digit", etc. — four separate features instead of one.
+
+**Assessment**: Feature splitting is *not inherently bad*. If the smaller features remain monosemantic, they are simply more specific, and the model has achieved better granularity. However, splitting can become pathological if:
+- The smaller features are less interpretable than the original (e.g., "starts with letter but only on Tuesdays")
+- Splitting indicates that the larger SAE is at odds with the true feature structure
+
+**Relation to absorption**: Splitting and absorption are opposite extremes. A well-trained SAE should balance them: features should split when they represent truly independent concepts, but not split arbitrarily.
+
+### Polysemanticity
+
+Despite SAE training, latents can remain **polysemantic**: activating on multiple unrelated concepts. For example, a latent fires on both "names of sports teams" and "royal titles" — two semantically independent categories.
+
+**Why it persists**: 
+- Dictionary size too small (insufficient dimensions to represent all features)
+- Sparsity penalty too aggressive (forces reuse of limited features)
+- Underlying feature structure correlated or hierarchical
+
+Polysemanticity makes interpretation unreliable. Even if a feature is labeled "sports teams", a researcher cannot assume it fires only on sports teams; they must empirically verify all activations.
+
+**Measurement**: The interpretability metrics in SAEBench (fraction of interpretable features) partially capture polysemanticity — a polysemantic feature is unlikely to be labeled as interpretable by a human rater. But detection remains labor-intensive.
+
+---
+
+## Activation steering with SAE features {#activation-steering}
+
+### Mechanism
+
+SAE features are approximately linear directions in the residual stream. If $\mathbf{d}^{(i)} \in \mathbb{R}^d$ is the decoder weight for feature $i$ (i.e., the $i$-th column of $W$), then adding a multiple of $\mathbf{d}^{(i)}$ to the residual stream pushes activations toward that feature:
+
+$$\mathbf{a}'_t = \mathbf{a}_t + \lambda \cdot \mathbf{d}^{(i)}$$
+
+The coefficient $\lambda$ controls the steering strength. Small $\lambda$ produces subtle shifts in model behavior; large $\lambda$ produces dramatic shifts or incoherence.
+
+**Why it works**: The SAE is trained to reconstruct $\mathbf{a}_t = W \mathbf{z}_t$, so the columns of $W$ form a basis of the learned representation space. A well-trained SAE ensures that this space is locally approximately linear — adding a small multiple of $\mathbf{d}^{(i)}$ is similar to increasing the activation of latent $i$ by a small amount, which the decoder reconstructs faithfully.
+
+**Temperature analogy**: Steering is similar to a temperature parameter in decoding, but applied to a single learned feature rather than the full logit distribution. It gives fine-grained control over a single semantic dimension.
+
+### Applications and successes
+
+1. **Golden Gate Bridge (Templeton et al., 2024)**: amplifying the Golden Gate feature with $\lambda = 0.5$ to $1.0$ reliably caused Claude to recommend the bridge across a diverse set of prompts. Suppressing it ($\lambda = -1.0$) caused near-zero mention rate.
+
+2. **Harmful reasoning steering**: DeepMind researchers (Lieberum et al., 2024) trained SAEs on Gemma 2 and identified a feature tracking "harmful reasoning chains" — activation on justifications for harmful actions. Suppressing this feature during inference reduced the model's production of harmful reasoning, while preserving performance on benign tasks.
+
+3. **FGAA (Feature Guided Activation Additions)**: Rather than manually choosing features to steer, researchers (Wehner, 2025) trained a small auxiliary model to identify the best combination of SAE features to apply in order to maximize a given objective (e.g., "reduce sycophancy"). This automated approach outperformed ad-hoc manual steering on coherence and effectiveness.
+
+### Limitations
+
+- **Structured output degradation**: Steering sometimes breaks JSON, code formatting, or other structured outputs even when semantic content is correct. The model's internal representations of syntax and content are not fully independent.
+
+- **Feature interaction**: Steering one feature affects others. A "deception" feature overlaps with "reasoning", so suppressing deception also mildly suppresses reasoning capability. A full interaction map remains unmapped.
+
+- **Boundary effects**: Steering with $\lambda > 1.0$ often produces unrealistic or incoherent text. The SAE's linear approximation breaks down at large amplitudes.
+
+- **Temporal effects**: Steering applied at one token position affects downstream tokens via residual stream. The full temporal dynamics remain incompletely understood.
+
+### Comparison to other steering approaches
+
+**Prompt engineering** (e.g., "be less sycophantic"): surface-level, often ineffective on deterministic models.
+
+**Fine-tuning**: expensive, permanent, affects all behaviors.
+
+**CAA (Contrastive Activation Addition)**: steering using the difference between positive and negative examples. Effective but requires curated data and has lower resolution than SAE steering (operates on full residual stream, not individual features).
+
+**SAE steering**: precise, interpretable, reversible. Main cost is training SAEs upfront.
+
+---
+
+## Open problems and future directions {#open-problems}
+
+### Fundamental unresolved questions
+
+1. **Definition of "feature"**: There is no consensus on what constitutes an atomic feature. Is a feature a causal intervention in a computation graph? A behavioral response? A linguistic concept? Different downstream tasks may require different definitions. A "feature" for predicting sycophancy may not align with a "feature" for predicting deception.
+
+2. **Computational complexity**: Many interpretability queries (e.g., "find the minimal set of features sufficient for predicting output $y$") are NP-hard or worse. Scalable approximations remain open.
+
+3. **Downstream utility gap**: Multiple 2024–2025 papers (Smith et al., 2024; Dubois et al., 2025) report that SAEs improve interpretability (monosemanticity) but do *not* improve downstream prediction tasks. An SAE feature labeled "deception" predicts deception behavior slightly better than a neuron, but much worse than a simple linear regression on model logits. This suggests interpretability (monosemanticity) is decoupled from predictive utility — a conceptual gap.
+
+4. **SAE-induced optimization artifacts**: "Meaningless" features like "starts with E but isn't elephant" maximize sparsity and reconstruction while remaining wholly uninterpretable. Why does SAE optimization produce these? Are they problematic, or do they simply represent low-level implementation details?
+
+5. **Frontier model documentation gap**: Claude 4, GPT-4, o1, and other frontier models lack public SAE research. Scaling challenges (training cost, convergence instability, polysemanticity at ultra-large feature counts) are not documented.
+
+### Active research areas (2025–2026)
+
+- **SAEBench standardization**: moving beyond preliminary benchmarks to a consensus evaluation framework
+- **Feature hierarchies**: methods like Matryoshka, HierarchicalTopK, and domain-specific SAEs to recover principled feature structures
+- **Zero-shot prediction**: can feature existence be predicted from model architecture alone?
+- **Cross-model transfer**: do features learned on Llama 3 transfer to Gemma 3? Early results show limited transfer despite semantic overlap.
+- **Mechanistic biology**: applying SAEs to protein language models (ESM-2, ProtBERT) to interpret biological representations
+- **Vision and multimodal**: SAE-V (Zevin et al., 2025) extends SAEs to vision-language models, but scaling to frontier multimodal systems remains open
+
+---
+
+## Activation steering applications and caveats {#activation-steering}
+
+### Safety-relevant applications
+
+The most immediate alignment use case is **causal intervention on safety-relevant features**. If an SAE-extracted feature tracks "deception planning," one can:
+
+1. **Monitor**: check the feature's activations as the model processes a prompt to detect when it is reasoning about deception.
+2. **Steer**: suppress the feature during inference to reduce deception output.
+3. **Fine-tune**: use feature activations as training signal for a safety-oriented fine-tuning step.
+
+This is higher-resolution than input-level prompt engineering and cheaper than full fine-tuning, making it attractive for alignment work.
+
+### Causal sufficiency
+
+A major open question: **does steering a feature achieve the same causal effect as intervening at the model's input?** Templeton et al. provide strong evidence for the Golden Gate Bridge case, but it is unclear how general this is. Steering is an *intermediate* intervention — it occurs deep in the forward pass. True causal sufficiency would mean that steering the feature is equivalent to causing the model to think about that concept from the start.
+
+Preliminary evidence (Wehner, 2025; Rajamanoharan et al., 2024) suggests the answer is "approximately yes" for many features, but with caveats:
+- Causal sufficiency breaks down for interdependent features (steering deception doesn't fully decouple deception from reasoning)
+- Temporal effects (steering at token $t$ affects $t+1$ onwards, not past tokens) are not equivalent to input-level causality
+- Some features exhibit "context-dependence": steering has different effects depending on the surrounding tokens
+
+---
+
+## Summary {#summary}
+
+Sparse autoencoders have matured from a theoretical idea to a practical tool for mechanistic interpretability and alignment. The progression from Bricken et al. (2023) on toy models to Templeton et al. (2024) on Claude 3 Sonnet to Gemma Scope (2024) on publicly available models demonstrates consistent scaling and reproducibility. JumpReLU and BatchTopK now form the Pareto frontier on reconstruction-sparsity trade-offs; Matryoshka SAEs show promise for addressing feature absorption.
+
+Activation steering — using extracted features to control model behavior — works and is causally relevant, as proven by the Golden Gate Bridge experiment and replicated on safety-relevant features. The cost is high (weeks to months of compute to train frontier SAEs), but the specificity and interpretability exceed alternative steering approaches.
+
+Key limitations remain unresolved: feature pathologies (absorption, splitting, polysemanticity) are documented but not fully mitigated; the downstream utility of SAEs for safety prediction is unclear; and definition of "feature" remains contested. The 2026 consensus is forming around JumpReLU/BatchTopK for standard SAEs, Matryoshka for robustness, and hierarchical variants for domain-specific interpretability. Public data and tooling (Neuronpedia, Gemma Scope, SAELens) have democratized access. Frontier model SAEs (4, o1) remain largely undocumented, leaving a critical gap in the mechanistic interpretability record.
+
+---
+
+## References
+
+[1] Bricken, T., Templeton, A., Batson, J., Chen, B., Conmy, A., Rajamanoharan, S., Szegedy, C., & Tegmark, M. (2023). "Towards Monosemanticity: Decomposing Language Models With Dictionary Learning." *Transformer Circuits Thread*. [https://transformer-circuits.pub/2023/monosemantic-features](https://transformer-circuits.pub/2023/monosemantic-features)
+
+[2] Templeton, A., Conmy, N., Rajamanoharan, S., Chen, B., Frye, J., Batson, J., Tegmark, M., & Roll, K. (2024). "Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet." *Transformer Circuits Thread*. [https://transformer-circuits.pub/2024/scaling-monosemanticity/](https://transformer-circuits.pub/2024/scaling-monosemanticity/)
+
+[3] Lieberum, T., Rajamanoharan, S., Conmy, A., Nanda, N., & Ewart, L. (2024). "Gemma Scope: Open Sparse Autoencoders Everywhere All At Once on Gemma 2." *arXiv preprint arXiv:2408.05147*. [https://arxiv.org/abs/2408.05147](https://arxiv.org/abs/2408.05147)
+
+[4] Rajamanoharan, S., Lieberum, T., Conmy, A., & Nanda, N. (2024). "Jumping Ahead: Improving Reconstruction Fidelity with JumpReLU Sparse Autoencoders." *arXiv preprint arXiv:2407.14435*. [https://arxiv.org/abs/2407.14435](https://arxiv.org/abs/2407.14435)
+
+[5] Bussmann, B., Nabeshima, N., Karvonen, A., & Nanda, N. (2025). "Learning Multi-Level Features with Matryoshka Sparse Autoencoders." *arXiv preprint arXiv:2503.17547*. [https://arxiv.org/abs/2503.17547](https://arxiv.org/abs/2503.17547)
+
+[6] Conmy, A., Smith, L., Nanda, N., Wattenberg, M., & Beenen, G. (2024). "A is for Absorption: Studying Feature Splitting and Absorption in Sparse Autoencoders." *arXiv preprint arXiv:2409.14507*. [https://arxiv.org/abs/2409.14507](https://arxiv.org/abs/2409.14507)
+
+[7] Wehner, J. (2025). "Representation Engineering for Mechanistic Control." *arXiv preprint arXiv:2502.19649*. [https://janwehner.com/files/representation_engineering.pdf](https://janwehner.com/files/representation_engineering.pdf)
+
+[8] Dubois, Y., Conmy, A., Smith, L., Rajamanoharan, S., & Tegmark, M. (2025). "Measuring and Guiding Monosemanticity." *arXiv preprint arXiv:2506.19382*. [https://arxiv.org/abs/2506.19382](https://arxiv.org/abs/2506.19382)
+
+[9] Smith, L., Rajamanoharan, S., Conmy, A., & Nanda, N. (2024). "The 'Sparsity vs Reconstruction Tradeoff' Illusion." *LessWrong & Alignment Forum*. [https://www.lesswrong.com/posts/RwWrkGnncSCqryrSZ/the-sparsity-vs-reconstruction-tradeoff-illusion](https://www.lesswrong.com/posts/RwWrkGnncSCqryrSZ/the-sparsity-vs-reconstruction-tradeoff-illusion)
+
+[10] Nanda, N., Rajamanoharan, S., Conmy, A., & others (2024). "Residual Stream Analysis with Multi-Layer SAEs." *arXiv preprint arXiv:2409.04185*. [https://arxiv.org/abs/2409.04185](https://arxiv.org/abs/2409.04185)
+
+[11] Lin, J. (2025). "Neuronpedia: Open Interpretability Platform." *https://www.neuronpedia.org/*
+
+[12] Karvonen, A. (2024). "An Intuitive Explanation of Sparse Autoencoders for LLM Interpretability." *Personal Blog*. [https://adamkarvonen.github.io/machine_learning/2024/06/11/sae-intuitions.html](https://adamkarvonen.github.io/machine_learning/2024/06/11/sae-intuitions.html)
+
+[13] Zevin, J., Lin, J., & others (2025). "SAE-V: Interpreting Multimodal Models for Enhanced Alignment." *OpenReview*. [https://openreview.net/forum?id=S4HPn5Bo6k](https://openreview.net/forum?id=S4HPn5Bo6k)

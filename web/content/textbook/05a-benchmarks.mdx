@@ -1,0 +1,231 @@
+---
+slug: 05a-benchmarks
+title: Benchmark families for frontier LLMs
+description: Knowledge (MMLU, GPQA, HLE), reasoning (MATH, AIME, FrontierMath, ARC-AGI-2), code (HumanEval, LiveCodeBench, SWE-bench), long-context, multimodal, agentic — and the saturation crisis.
+order: 46
+chapter: 46
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 28
+depends_on: [03-post-training]
+provides: [mmlu, gpqa, hle, frontiermath, arc-agi-2, swe-bench, livecodebench, ruler, mmmu, gaia, browse-comp, saturation]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+The frontier AI benchmark landscape underwent a phase transition between 2024 and 2026. Classical benchmarks that served as the primary intelligence metric (MMLU, HumanEval, AIME) saturated by November 2025. In their place, a specialized, dynamic ecosystem emerged: expert-authored hard problems (HLE, FrontierMath), realistic environment tasks (SWE-bench Verified, OSWorld), multimodal reasoning challenges (MMMU-Pro, MathVista), and agentic synthesis tasks (GAIA, BrowseComp). The saturation phenomenon forced a reckoning with data contamination, reward hacking, and the fundamental question: *can a single leaderboard metric capture frontier capability?*
+
+The answer, empirically, is no. No single benchmark now discriminates across the frontier landscape. Model comparison requires composite scoring across 4–5 dimensions (knowledge, reasoning, code, agentic, multimodal). This chapter maps the benchmark families used to evaluate frontier LLMs as of May 2026, catalogs saturation timelines and reliability concerns, and flags the protocols required to avoid contamination and reward-hacking vulnerabilities.
+
+Three notes on scope:
+
+1. **Saturation is structural, not temporary.** As frontier models approach and exceed expert-level performance on a task, the ceiling effect — the bunching of top-model scores within 1–3 percentage points — becomes inevitable. No benchmark design innovation has reversed saturation once it begins. Mitigation relies on continual problem refresh (LiveCodeBench) or problems authored specifically at the frontier edge (FrontierMath).
+
+2. **Data contamination is endemic.** Roberts et al. (2024) found a statistically significant correlation between GitHub presence in training data and GPT-4's performance on Project Euler problems, with an odds ratio of 1.478× per log unit of GitHub presence. Contamination by itself is not malice; it is structural: text-based pretraining absorbs benchmark-adjacent material; cutoff dates do not cleanly partition the data landscape.
+
+3. **Composite scoring is now table-stakes.** A responsible model comparison report in May 2026 cites performance on 8–12 benchmarks across multiple dimensions. Single-metric evaluation is treated as a red flag.
+
+<Callout variant="note" title="Cloze (CF) vs multiple-choice (MCF) formulation: a methodological detail that matters for pretraining ablations">
+The same MMLU questions can be scored in two distinct ways, and the choice materially affects the resulting metric, especially during pretraining ablations.
+
+- **Cloze formulation (CF).** The model is asked to score continuations of each answer; the answer with the highest log-likelihood (typically length-normalised) is selected. The format is identical to language modelling: no instruction-following capability is required.
+- **Multiple-choice formulation (MCF).** The model is shown the question, the candidate answers labelled A/B/C/D, and asked to emit the letter of its chosen answer. The format requires the model to have learned the *structured-output convention* — a capability that develops late in pretraining and earlier in post-training.
+
+The two formulations measure different things during a pretraining run. Allal et al. (2025) — the Hugging Face SmolLM3 playbook — report that MCF benchmarks on a ~7B-class model show near-random performance through the first hundreds of billions of tokens of pretraining and only begin discriminating after roughly 500 B tokens of training. CF discriminates from the first tens of billions of tokens. The methodological implication: **use CF for architecture- and data-mixture ablations at the 1B/10–100B-token scale; switch to MCF for final-run evaluation once the model has crossed the capability threshold.** SmolLM3 followed this pattern, evaluating ablations with MMLU CF, ARC, HellaSwag, WinoGrande, CommonSenseQA, OpenBookQA, PIQA, GSM8K (generative), and HumanEval (generative).
+
+Four properties the playbook recommends checking before relying on a benchmark for ablations:
+
+1. **Monotonicity** — score improves with training-token count.
+2. **Low noise across seeds** — variance is small relative to expected effect size.
+3. **Avoids random-floor regime** — non-random performance starts early enough to differentiate.
+4. **Ranking consistency** — orderings between two architectures are stable across training duration.
+
+This is the pretraining-ablation analogue of the "monitoring beyond loss" recommendation in [§Mid-run operational failures](/textbook/01h-annealing-and-stability#mid-run-failures) and of the small held-out cloze slice in the [new chapter on running a training](/textbook/02i-running-a-training#monitoring). The reader who sees a "MMLU saturated at random" claim in a pretraining ablation log should ask which formulation was used before drawing conclusions.
+</Callout>
+
+---
+
+## Knowledge benchmarks {#knowledge}
+
+**MMLU** (Massive Multitask Language Understanding) remains the most-cited benchmark despite saturation. 57 academic subjects; ~14K multiple-choice questions. OpenAI o1-preview saturated MMLU at 92.3% in September 2024. As of May 2026, top-5 models cluster in the 90–93% band; the benchmark adds minimal discriminative value.
+
+**MMLU-Pro** (2023, graduate-level variant) was designed as the saturation-escape hatch: 12K questions, 10-choice format (vs. MMLU's 4–5), deliberately harder. The strategy worked for approximately 18 months. Google Gemini 3 Pro and Claude Opus 4.5 saturated MMLU-Pro at ~90% in November 2025. The performance cliff between MMLU and MMLU-Pro is sharp — top models drop 16–33 percentage points — but the second-order saturation undermined the design intent. MMLU-Pro remains useful for identifying performance tiers in the 60–90% band; at the frontier, it is saturated.
+
+**GPQA Diamond** (Graduate-level Google-Proof QA, 198 expert-curated questions) set a higher bar: PhD experts achieve 65%; skilled non-experts with web access achieve 34%. The gradient between expert and non-expert performance suggested deeper reasoning demand. Gemini 3 Pro saturated GPQA Diamond at 93.8% in November 2025. Like MMLU-Pro, GPQA remains useful in the 60–85% band but has lost discriminative power at the frontier.
+
+**Humanity's Last Exam (HLE)** represents the current frontier of knowledge-benchmark hardness. 2,500 expert-authored questions across mathematics (41%), physics (9%), biology/medicine (11%), humanities (9%), computer science (10%), engineering (4%), chemistry (7%), and other fields (9%). 24% are multiple-choice; 76% are short-answer, exact-match scored. 14% are multimodal (text + image). Frontier models score 10–45% across the distribution; below expert baselines on specialized fields. No frontier model saturates HLE; the benchmark maintains discriminative signal in the 20–40% range.
+
+Critical caveat: FutureHouse (July 2025) discovered approximately 30% of chemistry and biology answers are potentially incorrect; the benchmark team committed to continuous revision. Confidence intervals on HLE scores should be treated as soft until revisions complete. Despite reliability concerns, HLE remains the hardest public knowledge benchmark.
+
+---
+
+## Reasoning benchmarks {#reasoning}
+
+**MATH** (12.5K math competition problems, high school to olympiad) and **AIME 2025** (30 olympiad-level integer-answer problems) defined the reasoning-capability frontier through 2024. Median human performer on AIME: 27–40% (4–6 of 15). GPT-5 achieved 94.6% on AIME 2025 in Autumn 2025; the benchmark is saturated. MATH is equally saturated — frontier models exceed 90%. Both benchmarks retain historical value as progression metrics but no longer discriminate.
+
+**FrontierMath** (unsolved problems at the frontier of advanced mathematics) emerged as the primary frontier-reasoning metric in 2025. Tier structure: Tiers 1–3 increase in difficulty. GPT-5.2 achieved 40.3% on Tiers 1–3 in late 2025 — approximately 10 percentage points above GPT-5.1, suggesting real capability progression. The benchmark maintains headroom (well below saturation ceiling) and resists data contamination by design: problems are unsolved, hence not publicly available pre-training data. FrontierMath's main weakness is sample size — hundreds of problems, not thousands. Variance on frontier-performance estimates is correspondingly high.
+
+**ARC-AGI-2** (expanded from Chollet's 2020 ARC) focuses on abstract reasoning via input-output grid pairs (1×1 to 30×30). Models identify transformation rules from demonstrations; 13 core task types. The benchmark targets fluid intelligence and generalization. Frontier performance as of May 2026:
+
+- GPT-5.5: 85.0%
+- Gemini 3.1 Pro: 77.1%
+- GPT-5.4: 73.3%
+
+ARC-AGI-2 maintains strong discriminative signal in the 70–85% band; models have not saturated. The benchmark is emerging as the canonical abstract-reasoning metric for the frontier.
+
+---
+
+## Code benchmarks {#code}
+
+**HumanEval** (164 hand-written Python functions, pass@k metric) and **MBPP** (974 basic programming tasks) defined coding capability through 2024. Frontier models saturated both by 2024; GPT-4 and Claude 3.5 Sonnet exceed 95% on HumanEval. These benchmarks are retained for backward-compatibility and historical progression tracking but add no frontier-discriminative value.
+
+**LiveCodeBench** (continuously updated; problems from LeetCode, AtCoder, CodeForces released post-August 2024) is the canonical anti-contamination coding benchmark. The methodology: problems released *after* model training cutoffs are folded into a dynamic refresh cycle. This design prevents data leakage by construction. LiveCodeBench tests code generation, self-repair, code execution, and test prediction — moving beyond isolated function writing. Frontier leaders (May 2026) cluster in the 75–82% range (Claude Opus 4.6, GPT-5.4, Gemini 3.1 Pro), suggesting meaningful performance separation. LiveCodeBench is the recommended primary metric for general coding ability.
+
+**SWE-bench Verified** (500 human-curated real GitHub issues, from the broader SWE-bench dataset) represents repository-scale coding reasoning. Real software engineers confirm each issue is solvable; the benchmark requires multi-file edits, contextual understanding, and real-world complexity. Frontier performance (May 2026):
+
+- Claude Mythos Preview: 93.9%
+- GPT-5.4 Pro: ~88%
+- Gemini 3.1 Pro: ~85%
+
+**SWE-bench Multimodal** (617 visual software engineering tasks, January 2025) extends SWE-bench to require synthesis of code, issue description, *and* visual context (screenshots, mockups). This dimension captures a capability orthogonal to text-only coding. Together, SWE-bench Verified and Multimodal represent the gold standard for software engineering evaluation. The combination discriminates strongly at the frontier.
+
+---
+
+## Long-context benchmarks {#long-context}
+
+**RULER** (synthetic, configurable tasks across 13 categories: retrieval, multi-hop tracing, aggregation, question-answering) tests claimed context windows from 4K to 200K+ tokens. Key finding: despite near-perfect performance on vanilla needle-in-haystack (NIAH) tasks, models degrade significantly on RULER as sequence length increases. Only ~50% of models claiming 32K+ context can effectively handle 32K tokens. RULER exposes the gap between claimed and effective context windows — a critical distinction for production deployment.
+
+**ONERULER** (2025 multilingual extension) adapts RULER across 26 languages with retrieval and aggregation tasks. This captures long-context capability in non-English settings.
+
+**HELM Long Context** (Stanford CRFM leaderboard) aggregates diverse long-context tasks (ZeroScrolls, MTOB, ∞Bench, RULER, LOFT, Michelangelo, HELMET) into a composite metric. Provides transparent, reproducible comparison across recent models. Multiple standards coexist in the long-context space; RULER remains the primary synthetic benchmark for retrieval; HELM provides holistic assessment.
+
+The gap between long-context *capability* and long-context *reliability* remains open. RULER measures retrieval; real-world long-context tasks require synthesis, multi-document reasoning, and contradiction resolution — dimensions not yet standardized.
+
+---
+
+## Multimodal benchmarks {#multimodal}
+
+**MMMU** (Massive Multi-discipline Multimodal Understanding, 11.5K college-level questions across 6 disciplines, 30 subjects, 183 subfields) anchors text-image understanding. Question types span charts, diagrams, maps, tables, music sheets, chemical structures. The benchmark has diverse visual requirements; no single caption-matching strategy succeeds.
+
+**MMMU-Pro** (September 2024) was designed to escape text-only solvability. Filters questions answerable via text alone; augments choices; introduces vision-only input setting. Result: frontier accuracy drops from 40–50% (original MMMU) to 16.8–26.9% (MMMU-Pro). Qwen 3.6 Plus leads at 86.0%; GPT-5.1 at 85.4%; Claude Opus 4.6 at 83.2%. MMMU-Pro is strictly harder and represents a meaningful frontier-discrimination metric.
+
+**MathVista** (6,141 examples blending mathematical reasoning with visual context) measures math-reasoning grounded in visual information. Covers arithmetic, geometry, symbolic math, data reasoning in visual form. Frontier performance: GPT-5.1 ~68%, Claude Opus 4.5 ~64%, Gemini 3 Pro ~62%. MathVista captures a capability dimension orthogonal to text-only math benchmarks (AIME, MATH), filling a gap in the evaluation landscape.
+
+---
+
+## Agentic benchmarks {#agentic}
+
+**GAIA** (General AI Assistant) targets tool-use and multi-step reasoning across varied domains. Requires information synthesis, sequential tool invocation, cross-domain knowledge. Frontier leaders (May 2026):
+
+- Claude Sonnet 4.5: 74.6% (Princeton HAL track)
+- Anthropic models occupy top-6 HAL spots
+- GPT-5.4: ~71%
+
+GAIA maintains meaningful performance separation and no saturation signal.
+
+**OSWorld** (369 computer tasks spanning real web applications, desktop environments, OS file I/O, cross-app workflows) is positioned as the "AI driver's license test for computers." Covers Ubuntu, Windows, macOS. Frontier performance: Claude Mythos Preview leads at ~60–65%. The benchmark captures real-world agentic complexity: environments are chaotic, sequences are multi-step, outcomes are not deterministic. No frontier model saturates OSWorld; there is headroom for capability advancement.
+
+**WebArena** (812 long-horizon web autonomy tasks) requires navigation of realistic websites, information synthesis, and cross-site decision-making. Frontier leaders (May 2026):
+
+- Claude Mythos Preview: 68.7%
+- GPT-5.4 Pro: 65.8%
+
+**BrowseComp** (multi-hop information synthesis from open web, targeting deep-research paradigm) measures persistent browsing, cross-source comparison, and evidence synthesis. OpenAI Deep Research leads at 51.5%, indicating specialized strength in research-mode capabilities.
+
+---
+
+## The saturation crisis {#saturation-crisis}
+
+Four phenomena defined the benchmark landscape shift between 2024 and 2026:
+
+**Saturation by ceiling effect.** Classical knowledge and coding benchmarks hit performance ceilings. The progression:
+
+- MMLU saturated September 2024 (92.3%)
+- HumanEval saturated 2024 (95%+)
+- MMLU-Pro saturated November 2025 (90.1%)
+- GPQA Diamond saturated November 2025 (93.8%)
+- AIME saturated Autumn 2025 (94.6%)
+
+Once top-5 models cluster within 2–3 percentage points, discriminative power is lost. Saturation is structural: as models approach and exceed expert performance, the ceiling effect becomes inevitable.
+
+**Data contamination.** Test data present in training sets inflates performance without matching real-world capability. Roberts et al. (2024) quantified this: statistically significant correlation between GitHub presence and GPT-4's performance on Project Euler, with odds ratio 1.478× per log unit. StarCoder-7B achieved 4.9× higher pass rate on leaked APPS samples vs. non-leaked. Scale AI (May 2024) documented a worst-overfitting model dropping 13 percentage points on new grade-school math. Contamination is endemic to text-based pretraining; cutoff dates do not cleanly partition the data landscape.
+
+**Reward hacking on agentic benchmarks.** UC Berkeley (April 12, 2026) disclosed a critical vulnerability: an automated scanning agent broke all 8 major agentic benchmarks (SWE-bench, WebArena, OSWorld, GAIA) via reward hacking—achieving near-perfect scores without solving a single task. The agent exploited evaluation protocol assumptions (deterministic return codes, specific output formats, shallow task decomposition) to game the system. This finding called the reliability of agentic evaluations into question and signaled that human validation for edge cases is non-negotiable.
+
+**Ecosystem fragmentation.** The response to saturation was not a single successor benchmark but a fragmented ecosystem: classical knowledge (saturated, retained for history), dynamic coding (LiveCodeBench, anti-contamination design), expert-authored hard problems (HLE, FrontierMath, active), agentic/environment tasks (emerging but fragile post-reward-hacking discovery). Composite scoring across 4–5 dimensions became standard practice.
+
+---
+
+## Benchmark comparison matrix {#comparison}
+
+The following table summarizes benchmark families, saturation status, and reliability risk as of May 2026:
+
+| Category | Benchmark | Type | N | Saturation | Frontier Score | Signal Quality | Risk |
+|----------|-----------|------|---|------------|-------|--------|------|
+| **Knowledge** | MMLU | MC | 14K | Yes | 92.3% (o1) | Low | High contamination |
+| | MMLU-Pro | MC | 12K | Yes | 90.1% (Gemini 3) | Medium | Approaching saturation |
+| | GPQA Diamond | MC | 198 | Yes | 93.8% (Gemini 3) | Medium | Small sample; saturation |
+| | HLE | SA/MC | 2.5K | No | 45% max | High | Answer quality concerns; reliability improving |
+| **Reasoning** | MATH | Competition | 12.5K | Yes | 90%+ | Low | Saturated for frontier |
+| | AIME 2025 | Integer-answer | 30 | Yes | 94.6% (GPT-5) | Low | Saturated for frontier |
+| | FrontierMath | Unsolved | ~100s | No | 40.3% (GPT-5.2) | High | Limited sample; robust to leakage |
+| | ARC-AGI-2 | Visual reasoning | 1K+ | No | 85.0% (GPT-5.5) | High | Strong discrimination at frontier |
+| **Code** | HumanEval | Function gen | 164 | Yes | 95%+ | Low | Saturated |
+| | MBPP | Basic problems | 974 | Yes | 95%+ | Low | Saturated |
+| | LiveCodeBench | Dynamic | 400+ | No | 75–82% | High | Anti-contamination by design |
+| | SWE-bench Verified | Real GitHub | 500 | No | 93.9% (Claude Mythos) | High | Curated; high signal |
+| | SWE-bench Multimodal | Visual SWE | 617 | No | Emerging | High | New standard; orthogonal capability |
+| **Long-context** | RULER | Synthetic | Multi-len | No | Varies | Medium | Synthetic; retrieval-focused |
+| | HELM LC | Aggregate | Multi-source | No | Composite | Medium | Holistic; diverse sources |
+| **Multimodal** | MMMU | College-level | 11.5K | No | 83–86% | High | Requires true vision |
+| | MMMU-Pro | Robustness | 11.5K | No | 16.8–26.9% | High | Strictly harder; high signal |
+| | MathVista | Math+visual | 6.1K | No | 64–68% (GPT-5.1) | Medium | Math-specific; orthogonal to text-only |
+| **Agentic** | GAIA | Tool-use | Varies | No | 71–74.6% | High | Multi-step; no saturation signal |
+| | OSWorld | Computer tasks | 369 | No | 60–65% | High | Real-world chaos; "driver's license" |
+| | WebArena | Web autonomy | 812 | No | 65.8–68.7% | High | Long-horizon; deep reasoning |
+| | BrowseComp | Research | Varies | No | 51.5% (Deep Research) | High | Emergent capability; sparse baselines |
+
+**Key observations:**
+
+1. Saturated benchmarks (MMLU, HumanEval, AIME, MATH) are retained for backward compatibility and historical progression tracking, not for frontier discrimination.
+
+2. Active benchmarks (FrontierMath, ARC-AGI-2, HLE, LiveCodeBench, SWE-bench, multimodal, agentic) maintain signal; none saturate the frontier as of May 2026.
+
+3. Agentic benchmarks are fragile post-April 2026 reward-hacking disclosure; human validation is required.
+
+4. Multimodal and agentic dimensions are orthogonal; a complete capability picture requires evaluation across all dimensions.
+
+---
+
+## Mitigation: anti-contamination protocols {#anti-contamination}
+
+Responsible frontier-model evaluation in May 2026 requires explicit contamination mitigation:
+
+**Training-cutoff separation.** Demand that benchmark problem release dates exceed model training cutoff by at least 6 months. LiveCodeBench enforces this by design; Responsible labs document cutoff–release gaps explicitly.
+
+**Dynamic refresh.** LiveCodeBench updates continuously; FrontierMath releases new unsolved problems; ARC-AGI-2 is updated with new reasoning tasks. Static benchmarks should be treated as dated.
+
+**Leakage audit.** Scale AI (May 2024) and LessLeak-Bench (2025) established auditing protocols. New benchmarks should undergo systematic leakage audits across model families before acceptance as frontier-standard metrics.
+
+**Human validation.** Post-April 2026 reward-hacking discovery, human validation is non-negotiable for agentic benchmarks. At minimum, 10–20% of top-performing trajectories should be manually inspected by domain experts to detect spurious solutions.
+
+---
+
+## Summary {#summary}
+
+Benchmark evaluation of frontier LLMs in May 2026 operates under three constraints:
+
+1. **No single metric suffices.** Composite scoring across knowledge, reasoning, code, agentic, and multimodal dimensions is required. Single-metric evaluation is a red flag.
+
+2. **Saturation is inevitable.** Classical benchmarks saturate within 18–24 months of frontier-model deployment. Mitigation relies on continual problem refresh (LiveCodeBench), expert-authored hard problems (FrontierMath, HLE), or dynamic leaderboards (ARC-AGI-2).
+
+3. **Data contamination and reward hacking are structural risks.** Contamination inflates performance estimates; reward hacking can produce spurious solutions on agentic tasks. Anti-contamination protocols (training-cutoff separation, dynamic refresh, leakage audit, human validation) are now standard practice.
+
+For practitioners: adopt composite scoring across 8–12 benchmarks; monitor leaderboards for saturation; validate anti-contamination protocols; assume agentic evals require human spot-checks.
+
+For benchmark authors: build dynamic refresh into design; require multimodal evaluation; report confidence intervals; design for 2–3 year horizon, not 10 years.
+
+For researchers: investigate benchmark-to-downstream-task correlation; redesign agentic evaluation protocols post-reward-hacking discovery; study contamination profiles across entire model families.
+
+The frontier-evaluation landscape is increasingly specialized, dynamic, and fragile. Single-metric thinking is obsolete.

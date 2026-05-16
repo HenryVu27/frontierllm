@@ -1,0 +1,118 @@
+---
+slug: 05-eval-alignment-interp
+title: Evaluation, alignment, and interpretability — orientation
+description: How to read this module, the dependency chain across chapters, the notation conventions, and what the 2026 eval / alignment / interpretability stack looks like.
+order: 45
+chapter: 45
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 18
+depends_on: [04-inference]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## About this module {#about}
+
+Modules 0–4 cover the *building* of frontier large language models: architecture, pretraining, distributed training, post-training, inference and serving. This module covers the *measurement and understanding* of them. It is the textbook's treatment of the third arm of the frontier-LLM lifecycle: how do we know what a model can do, how do we read what it is doing internally, and how do we keep it doing what we intended?
+
+After the eight chapters, a reader should be able to take any 2024–2026 evaluation paper, interpretability blog post, or safety report and place every claim into a coherent map: which benchmark family, which oversight protocol, which interpretability technique, which red-team or deception-evaluation methodology.
+
+This module does **not** teach the training-side material (Modules 0–3) or the serving-side material (Module 4); cross-references point back to those modules whenever a method appears. The next planned module (Module 6) covers the frontier-lab case studies — the artefacts that consume everything in Modules 0–5.
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier eval, alignment, and interpretability practice as of May 15, 2026. The conceptual frameworks (sandwiching, debate, sufficiency-vs-necessity, contamination detection methodology) are durable. The benchmark leaderboards, the specific Arena methodology, the SAE training recipes, and the published red-teaming protocols age fastest. The deceptive-alignment evaluation literature is the most volatile section — both the threat model and the protocols are under active development.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+**[Chapter 46 — Benchmark families for frontier LLMs](/textbook/05a-benchmarks)**
+Knowledge (MMLU, GPQA, HLE), reasoning (MATH, AIME, FrontierMath, ARC-AGI-2), code (HumanEval, LiveCodeBench, SWE-bench), long-context (RULER), multimodal (MMMU-Pro, MathVista), and agentic (GAIA, BrowseComp) benchmark families. The 2024–2026 saturation timeline and the move to expert-authored, dynamic, and composite scoring.
+
+**[Chapter 47 — Test-set contamination](/textbook/05b-contamination)**
+N-gram and embedding-based detection. Min-K% probability detection (Shi 2023). Paraphrase contamination. LiveBench's monthly-refreshed protocol. The 2025 ICML result that no mitigation strategy achieves both fidelity and contamination-resistance.
+
+**[Chapter 48 — LMSYS Chatbot Arena and ELO methodology](/textbook/05c-arena-elo)**
+Bradley-Terry-Luce derivation. Pairwise preference at scale. Style-controlled ELO. Arena-Hard-Auto. The Llama-4 Maverick gaming incident. The 2025 "Leaderboard Illusion" critique.
+
+**[Chapter 49 — Sparse autoencoders](/textbook/05d-saes)**
+Bricken 2023 (Toy Models of Superposition, Monosemanticity). Templeton 2024 (Scaling Monosemanticity, Golden Gate Claude). Gemma Scope. TopK / JumpReLU / BatchTopK / Matryoshka variants. Feature absorption and splitting pathologies.
+
+**[Chapter 50 — Circuit analysis](/textbook/05e-circuit-analysis)**
+Induction heads (Olsson 2022), the IOI circuit (Wang 2022), activation and attribution patching (Nanda 2023; Heimersheim 2024), function vectors (Todd 2023), transcoders (Dunefsky 2024), sparse-feature circuits (Marks 2024), and the 2025 attribution-graph programme (Lindsey, Anthropic).
+
+**[Chapter 51 — Scalable oversight](/textbook/05f-scalable-oversight)**
+Debate (Irving 2018), iterative amplification (Christiano 2018), recursive reward modelling (Leike 2018), weak-to-strong generalisation (Burns 2023), deliberative alignment (Guan 2024), and the sandwiching empirical programme.
+
+**[Chapter 52 — Red-teaming and jailbreaks](/textbook/05g-red-teaming)**
+Automated red-teaming (Perez 2022), GCG (Zou 2023), PAIR (Chao 2023), AutoDAN, many-shot jailbreaking, HarmBench, JailbreakBench, and the Anthropic ASL / OpenAI Preparedness / DeepMind FSF pre-deployment frameworks.
+
+**[Chapter 53 — Deceptive alignment evaluations](/textbook/05h-deceptive-alignment-evals)**
+Sleeper Agents (Hubinger 2024), Alignment Faking (Greenblatt 2024), Apollo Research scheming evaluations, agentic-misalignment benchmarks, and the Situational Awareness Dataset.
+
+---
+
+## Notation conventions {#notation}
+
+- $\mathcal{D}$ — evaluation dataset; $|\mathcal{D}|$ — its cardinality.
+- $\text{Acc}(\pi, \mathcal{D})$ — accuracy of policy $\pi$ on $\mathcal{D}$.
+- $r_\theta(x, y)$ — reward model; $\pi_\phi$ — policy under evaluation.
+- $\text{ELO}(\pi)$ — Bradley-Terry-Luce rating for policy $\pi$.
+- $f_i$ — sparse-autoencoder feature $i$; $a_i$ — its activation.
+- $\Delta(\ell)$ — patching effect at location $\ell$.
+- $C$ — written constitution / specification.
+- $\text{PGR}$ — performance gap recovered (weak-to-strong generalisation).
+- $\alpha$ — attack success rate (red-teaming).
+- Module-wide notation inherits from Modules 0–4: $N$ (parameters), $D$ (tokens), $L$ (layers), $H$ (heads), $d_h$ (head dim), $\pi$ (policy), $r$ (reward).
+
+---
+
+## Reading order recommendations {#reading-order}
+
+### First time through
+Chapters 46–53 in order. Evaluation methodology (46–48) → interpretability (49–50) → alignment protocols (51) → safety stress-tests (52–53). The dependency is conceptual: you need a benchmark vocabulary before you can read a safety report.
+
+### For a research engineer focused on alignment
+Chapters 51, 52, 53, then 46–48 for the eval-methodology background. The alignment protocols make most sense when you already know what scalable oversight is trying to scale past.
+
+### For an interpretability researcher
+Chapters 49, 50, 53. SAEs and circuit analysis are the technical core; deceptive-alignment evaluations are where the interpretability programme is most stress-tested.
+
+### For an evaluation engineer
+Chapters 46, 47, 48, with side-glances at 52 (red-teaming benchmarks). Saturation, contamination, and pairwise-preference statistics are the production concerns.
+
+### For a safety / governance reader
+Chapters 52, 53, 51, then 46–48. Pre-deployment safety frameworks, deception evaluations, and scalable-oversight protocols are the load-bearing concepts; benchmarks are the measurement substrate.
+
+---
+
+## How this module connects to the rest of the textbook {#connections}
+
+- **Module 1 (Pretraining):** contamination detection (§ 05b) sits on top of pretraining data filtering (§ 01a). N-gram overlap detection is the same machinery used in both.
+- **Module 3 (Post-training):** Constitutional AI (§ 03d), RLAIF, RLVR (§ 03e), and PRMs (§ 03g) are all production instantiations of scalable-oversight ideas covered in § 05f. Deliberative alignment (Module 5 § 05f) is the o-series' lineal descendant of CAI.
+- **Module 4 (Inference and serving):** the structured-output and constrained-decoding stack (§ 04g) intersects red-teaming protocols (§ 05g) — many jailbreaks exploit decoding-time behaviour.
+- **Module 6 (Frontier labs, planned):** consumes everything in this module. Each lab's safety posture (Anthropic RSP / ASL, OpenAI Preparedness, DeepMind FSF) is a deployment of the methodologies surveyed in §§ 05g–05h.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module a reader should be able to:
+
+1. Choose a benchmark family appropriate to a capability claim, and recognise contamination, saturation, and reward-hacking failure modes.
+2. Read an Arena leaderboard score and articulate what it does and does not measure.
+3. Identify SAE features and circuits in a published interpretability paper, and judge the evidential strength of the causal claims.
+4. Describe a scalable-oversight protocol (debate, amplification, weak-to-strong, deliberative alignment) and argue about its tradeoffs.
+5. Design a red-team protocol against a frontier model, including automated attacks and the responsible-disclosure process.
+6. Read a deceptive-alignment evaluation and place its threat model into the published taxonomy.
+
+<Sources items={[
+  { authors: "Module 1 — Pretraining at scale", year: 2026, title: "Frontier-LLM textbook, Module 1", url: "/textbook/01-pretraining" },
+  { authors: "Module 3 — Post-training and reasoning", year: 2026, title: "Frontier-LLM textbook, Module 3", url: "/textbook/03-post-training" },
+  { authors: "Module 4 — Inference and serving", year: 2026, title: "Frontier-LLM textbook, Module 4", url: "/textbook/04-inference" },
+  { authors: "Olsson, C. et al. (Anthropic)", year: 2022, title: "In-context Learning and Induction Heads", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html", note: "Foundational anchor for the interpretability programme." },
+  { authors: "Bai, Y. et al. (Anthropic)", year: 2022, title: "Constitutional AI: Harmlessness from AI Feedback", venue: "arXiv:2212.08073", url: "https://arxiv.org/abs/2212.08073", note: "Production-scale scalable-oversight anchor." },
+  { authors: "Bowman, S. R. et al.", year: 2022, title: "Measuring Progress on Scalable Oversight for Large Language Models", venue: "arXiv:2211.03540", url: "https://arxiv.org/abs/2211.03540", note: "Sandwiching protocol; anchor for empirical evaluation of scalable oversight." },
+]} />

@@ -1,0 +1,268 @@
+---
+slug: 05e-circuit-analysis
+title: Circuit analysis
+description: Induction heads, the IOI circuit, activation and attribution patching, function vectors, transcoders, sparse-feature circuits, and 2024–2026 attribution graphs.
+order: 49
+chapter: 49
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 32
+depends_on: [05d-saes]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+The previous chapter (§ 05d) developed the dictionary-learning view of model internals: sparse autoencoders decompose dense activations into a wider basis of approximately monosemantic features. A *feature* is the unit; a *circuit* is the unit of computation. A circuit is a small, sparse subgraph of the network — typically a handful of attention heads, MLP neurons, or sparse features connected by causally validated edges — whose joint operation implements an identifiable algorithm. The goal of circuit analysis is to identify these subgraphs, validate them with causal interventions, and read off the algorithm the network has learned.
+
+The chapter is organised by case study and by tool. Two canonical case studies — induction heads (Olsson et al. 2022) and the IOI circuit (Wang et al. 2022) — fix the methodology. Two experimental tools — activation patching and its scalable cousin attribution patching (Nanda 2023; Heimersheim & Nanda 2024) — fix the evidentiary standard. Three representational refinements — function vectors (Todd et al. 2023), transcoders (Dunefsky et al. 2024), and sparse-feature circuits (Marks et al. 2024) — move circuit analysis from head-level to feature-level granularity. The closing sections cover attribution graphs (Lindsey et al. 2024–2025), the 2025–2026 "biology-style dissection" framing, and what circuit analysis can and cannot tell us.
+
+<Callout variant="note" title="Why circuits, and not just SAEs">
+SAEs (§ 05d) tell us *what* features a model represents. Circuits tell us *how* features are combined into computations. A feature is an interpretable noun; a circuit is an interpretable verb. The two programmes are complementary and have converged in practice: modern circuit analysis is increasingly conducted on a feature basis rather than on raw activations or attention heads.
+</Callout>
+
+A circuit is a directed subgraph $G = (N, E)$ where nodes $N$ are activations (residual-stream positions, attention-head outputs, MLP outputs, SAE features) and edges $E$ are causal dependencies. The standard evidentiary distinction (Dunefsky et al. 2024) separates three claims:
+
+1. **Sufficiency.** Patching $N$ from a "clean" forward pass into a "corrupt" forward pass restores clean behaviour. The circuit *contains enough information* to produce the behaviour.
+2. **Necessity.** Ablating $N$ (zeroing, mean-substituting, or noising) degrades the behaviour. The circuit *matters*.
+3. **Faithfulness.** Running the model with only $N$ active (and everything else either ablated or replaced by a baseline distribution) reproduces the behaviour. The circuit is *the whole story*.
+
+Sufficiency is the workhorse claim — most circuit papers establish it. Necessity is harder because real models contain redundancy. Faithfulness is the gold standard and is rarely achieved without further work.
+
+The distinctions matter because they separate circuit analysis from two weaker things it is often confused with. **Attribution** (gradient saliency, attention-weight visualisation) ranks inputs or activations by association with the output but does not establish causation. **Probing** trains a linear classifier on intermediate activations to predict a label and shows information is *present*, not that the model *uses* it. A circuit claim requires both identification and causal validation.
+
+---
+
+## Induction heads {#induction-heads}
+
+Olsson et al. (2022, Transformer Circuits Thread, "In-context Learning and Induction Heads") is the canonical circuit discovery. The paper argues that the dominant mechanism of in-context learning (ICL) in modern transformers is a two-layer composition called the **induction head**.
+
+**The mechanism.** Given a sequence $\ldots\,A\,B\,\ldots\,A\,?$, an induction head predicts $B$ as the next token. It does so by composition of two heads:
+
+- A **previous-token head** at an earlier layer attends each position $t$ to position $t-1$ and writes the previous token's information into position $t$'s residual stream.
+- An **induction head proper** at a later layer attends position $t$ to position $s < t$ where the *previous-token-shifted* representation at $s$ matches the *current token* at $t$. It then reads off whatever was at position $s$ (which is $B$, because $s$ is the position immediately after the earlier occurrence of $A$) and writes $B$ into the residual stream.
+
+The composition implements one-shot in-context pattern matching. Read in matrix form: if $W_{QK}$ is the query-key product of the induction head, then $W_{QK}$ must be "shifted by one" against the previous-token-head's output for the matching to land on the right position.
+
+**The phase change.** During training, ICL ability (measured as loss improvement over the first $\sim$256 tokens of a context) improves *suddenly* in a narrow training-step window, a phenomenon Olsson et al. call the **induction bump**. The formation of induction heads coincides with the bump: heads that look nothing like induction heads at step $t$ look like induction heads at step $t+\Delta$, and ICL ability tracks. The two-stage composition is non-trivial — a single attention head cannot implement induction — which explains why the capability emerges later than first-order token-frequency learning.
+
+**Six lines of evidence.** Olsson et al. assemble unusually thorough evidence:
+
+1. Induction heads appear during the same training window as the ICL bump.
+2. Architectural interventions that prevent two-layer composition (e.g., one-layer models) eliminate the bump.
+3. Ablating identified induction heads at test time degrades in-context learning by 30–50% on naturalistic text and more on synthetic copy tasks.
+4. The mechanism is interpretable as the previous-token/match composition.
+5. The phenomenon scales smoothly from 2-layer toy models to GPT-3 scale.
+6. The circuit appears in nearly every transformer trained on natural language.
+
+**Prevalence.** Induction heads have been identified in models from 2-layer toys ($d_{\text{model}}=128$) through GPT-2 small, GPT-2 medium, GPT-3, Pythia variants, and on into Llama 7B and beyond, with the head positions and exact circuit specifics varying but the qualitative mechanism persisting.
+
+**Why this is the canonical case study.** The induction-head paper sets the methodological template: identify a behaviour, hypothesise a mechanism, validate causally via ablation and architectural intervention, and show generalisation across scales. Every subsequent circuit paper is in dialogue with this template.
+
+---
+
+## The IOI circuit {#ioi-circuit}
+
+Wang et al. (2022, "Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small") reverse-engineered the largest end-to-end natural-language circuit characterised to date.
+
+**The task.** Sentences of the form "When Mary and John went to the store, John gave a bottle of milk to ___" — predict the indirect object ("Mary"). The model must (i) identify the two names, (ii) identify which name is the subject (the one repeated), and (iii) output the *other* name. Wang et al. constructed 1,000+ templatic prompts and measured GPT-2 small's IOI performance (close to ceiling on the templates).
+
+**The circuit.** 28 attention heads in GPT-2 small (out of 144 total) organised into seven functional classes:
+
+- **Name Mover Heads** (3 heads, layer 9): attend to the IO token in the context and copy it to the output position.
+- **Backup Name Mover Heads** (4 heads, layer 10): redundant Name Movers that activate when the primary ones are ablated — direct evidence of the model's redundancy.
+- **Negative Name Mover Heads** (2 heads, layer 10): *decrease* the logit for the IO token in some configurations; calibration counter-balance.
+- **S-Inhibition Heads** (4 heads, layers 7–8): suppress attention to the subject (S) token by writing into the residual stream at the END token. Without them, Name Movers would copy whichever name is more attended-to, often the subject.
+- **Induction Heads** (3 heads, layer 5–6): identify the duplicated name by induction-style matching.
+- **Duplicate Token Heads** (3 heads, layer 3): detect that one name appears twice — the duplicate signal feeds the S-Inhibition heads.
+- **Previous Token Heads** (2 heads, layer 2): standard previous-token attention; feeds the induction heads.
+
+**The algorithm.**
+
+1. Previous-Token + Duplicate-Token heads identify that one name appears twice (the subject).
+2. Induction Heads relay the duplicated identity.
+3. S-Inhibition Heads write a "do not attend to S" signal into the END position's residual stream.
+4. Name Mover Heads attend (now biased away from S) to the IO token and copy it to the output.
+5. Backup Name Movers and Negative Name Movers fine-tune calibration.
+
+**Validation.** Wang et al. evaluate the circuit against three quantitative criteria:
+
+- **Faithfulness.** Running the model with only the 28 circuit heads active (every other head mean-ablated) reproduces $\geq 87\%$ of full-model IOI accuracy.
+- **Completeness.** Knockouts of the 28 heads (mean-ablate just them) reduce IOI accuracy from $\sim 95\%$ to chance-level. The circuit is *necessary*.
+- **Minimality.** Knocking out subsets within each class produces graded degradation; the seven classes are individually meaningful.
+
+These three metrics — faithfulness, completeness, minimality — became the standard evaluative trio for subsequent circuit papers.
+
+**Backup heads as a methodological warning.** Wang et al.'s discovery that ablating primary Name Movers activates backup heads complicates the standard "ablation = necessity" reasoning. The same head can be necessary in the base configuration and unnecessary when its backup is available; circuit boundaries depend on the counterfactual set. This is one of the empirical findings that motivated the move toward more careful evidentiary standards (sufficiency vs necessity vs necessity-over-a-reachable-set).
+
+**Scope limits.** The circuit is GPT-2 small specific; later work has identified analogous circuits in GPT-2 medium, Pythia variants, and small Llama models, but with quantitative differences. The IOI circuit's value is methodological — it demonstrated that a non-trivial naturalistic circuit can be characterised end-to-end with strong causal validation.
+
+---
+
+## Activation and attribution patching {#activation-patching}
+
+Patching is the dominant experimental technique of circuit analysis. The core idea predates language models — *causal mediation analysis* (Pearl 2001) in statistics — but the language-model formulation was sharpened by Meng et al. (2022) under the name **causal tracing** and refined by Nanda (2023) and Heimersheim & Nanda (2024).
+
+**Activation patching.**
+
+1. Pick a **clean input** $x_\text{clean}$ on which the model produces the desired behaviour (e.g., the IOI prompt "When Mary and John went... John gave a bottle of milk to ___" → "Mary").
+2. Pick a **corrupted input** $x_\text{corrupt}$ on which the model produces a different behaviour while sharing structural form (e.g., names swapped to break the answer).
+3. Forward-pass both inputs and cache all internal activations.
+4. **Patch:** forward-pass $x_\text{corrupt}$ again, but at a chosen location $\ell$ (e.g., head $h$'s output at position $t$), overwrite the activation with the cached clean-run value.
+5. Measure how the output changes: if patching at $\ell$ restores the clean-run output, the activation at $\ell$ is *sufficient* for the behaviour, conditional on the rest of the corrupt-run context.
+
+The patching effect $\Delta(\ell)$ is the change in some output statistic (the logit difference between "Mary" and "John", typically) when location $\ell$ is patched. Locations with large $\Delta(\ell)$ are circuit candidates.
+
+**Counterfactual choice matters.** A common error is to use $x_\text{corrupt} = $ random noise or unrelated text. This typically produces a patching map where every location matters slightly — because *everything* differs between random text and the clean input. The art of patching is choosing the *minimal* corruption that flips the target behaviour while leaving the rest of the prompt structure intact. For IOI, swapping the two names is minimal; for factual recall, swapping the subject entity is minimal. Heimersheim & Nanda (2024) is the standard practical guide.
+
+**Attribution patching.** Activation patching is expensive: validating $k$ locations requires $k$ forward passes. **Attribution patching** (Nanda 2023; Syed et al. 2024) is a first-order approximation that runs in two passes total. Given the activation $a_\ell$ at location $\ell$ on the clean and corrupt runs, the attribution-patching estimate of the patching effect is
+
+$$\hat{\Delta}(\ell) \;\approx\; \big(a_\ell^\text{clean} - a_\ell^\text{corrupt}\big) \cdot \nabla_{a_\ell} \mathcal{L}\Big|_\text{corrupt}$$
+
+where $\mathcal{L}$ is the metric of interest (typically the logit difference) and the gradient is computed on the corrupt run. This is one forward + one backward pass and gives a linear-order Taylor approximation to the true patching effect — accurate enough to rank locations and select circuit candidates, and inaccurate enough that one usually validates the top-$k$ candidates with proper activation patching afterwards.
+
+**Path patching.** A more targeted version of activation patching that patches not just the activation at $\ell$ but specifically the path from $\ell$ to the output, severing other downstream effects. Path patching disentangles *direct* effects (where the patched activation matters for the output via a short causal route) from *indirect* effects (where it matters by setting up a downstream activation that does the work). Path patching was essential to Wang et al.'s IOI analysis for separating S-Inhibition heads' direct effect from Name Mover heads' direct effect.
+
+**ACDC (Automated Circuit Discovery).** Conmy et al. (2023) automate the patching-based discovery loop: iteratively remove edges from a candidate circuit until further removals hurt performance. The procedure produces a minimal connected subgraph that retains the behaviour. ACDC was an important proof-of-concept but is computationally expensive; in practice attribution-patching-based rankings are usually used instead, with selective ACDC-style refinement on small candidate subgraphs.
+
+**What patching does not prove.** Patching tests sufficiency under a counterfactual: the patched activation is enough to produce the clean output *given* the corrupt context. It does not prove necessity (the model could have multiple redundant paths), it does not prove faithfulness (other locations might also contribute), and it does not establish that the patched location plays the same role on inputs outside the patching pair. The IOI backup-head finding is the standard cautionary tale.
+
+---
+
+## Function vectors {#function-vectors}
+
+Todd et al. (2023, "Function Vectors in Large Language Models", ICLR 2024) studies in-context learning through the lens of causal mediation. Given an ICL prompt with $k$ demonstrations of a task $f$ (e.g., "english:cat fr:chat, english:dog fr:chien, english:bird fr:?"), the model's behaviour on the final query depends on a compact information packet carried by a small number of attention heads. Todd et al. show that this packet is approximately a single vector — the **function vector (FV)** — in the model's hidden dimension.
+
+**Construction.**
+
+1. Run the model on a set of ICL prompts that all encode the same task $f$.
+2. At a chosen residual-stream position (typically the final token before the answer) and layer, extract the activation.
+3. Average across prompts to produce $v_f$, the function vector for task $f$.
+
+**Properties.**
+
+- **Compactness.** $v_f$ lives in the residual-stream dimension (e.g., 768 in GPT-2 medium, 4096 in Llama 7B). It is a *single vector*, not a tensor.
+- **Causal sufficiency.** Adding $v_f$ to the residual stream of a *new* prompt (without ICL demonstrations) causes the model to behave as if the demonstrations had been provided. The vector is therefore a sufficient causal carrier of the task identity, not just a correlate.
+- **Robustness and transfer.** $v_f$ extracted from one set of demonstrations transfers to new inputs of the same task, including out-of-distribution inputs. The vector encodes the task abstractly, not the specific demonstrations.
+- **Head decomposition.** $v_f$ is approximately the sum of the outputs of a small number of attention heads (~3–10 in the models studied). These heads can be identified by causal mediation: removing each head's contribution and measuring the effect on ICL accuracy.
+- **Compositionality.** Function vectors for related tasks (e.g., translation to French, translation to Spanish) have inner-product structure that reflects task similarity. Linear combinations of function vectors sometimes produce sensible mixed behaviours.
+
+**Why function vectors matter for circuit analysis.** They demonstrate that high-level task representations are *transportable* — they can be extracted from one context and injected into another, in vector form. This is closer to "model behaviour as algebra" than the head-level circuit view: a circuit identifies the *infrastructure* that processes function vectors, but the function vector itself is the *data* the circuit operates on. This is also a useful steering primitive: editing $v_f$ edits the task representation.
+
+**Connection to task arithmetic and steering vectors.** Function vectors are conceptually close to the *task vectors* of Ilharco et al. (2022, "Editing Models with Task Arithmetic") and to *activation-steering vectors* (Turner et al. 2023, Rimsky et al. 2023). Task vectors are weight-space deltas; steering vectors are activation-space deltas; function vectors are activation-space deltas inferred from ICL demonstrations. All three frame model behaviour as approximately linear in some space, and all three exploit that linearity for editing.
+
+---
+
+## Transcoders and feature-level circuits {#transcoders-and-features}
+
+Standard SAEs (§ 05d) decompose the residual stream into features. To do circuit analysis at the feature level, however, you need feature-level decompositions of every component the circuit touches — including MLPs. The naive approach (train an SAE on the MLP output) loses information about *how* the MLP computed the output.
+
+**Transcoders (Dunefsky et al. 2024).** A transcoder is a sparse approximation of an entire MLP layer. Where a standard MLP computes $\text{MLP}(x) = W_{\text{down}}\,\sigma(W_{\text{up}}\,x)$, a transcoder computes
+
+$$\widetilde{\text{MLP}}(x) = W_{\text{dec}}\,\sigma\big(W_{\text{enc}}\,x\big)$$
+
+with a sparsity penalty on the hidden activations $\sigma(W_{\text{enc}}\,x)$ — exactly an SAE imposed on the MLP's input–output mapping rather than on a single layer's activations. The result is a transcoder feature dictionary where each feature has both an input-side and output-side semantics: it activates on a particular feature of the input and writes a particular feature into the residual stream.
+
+**Why transcoders enable circuit analysis.** Two reasons. First, transcoder features sit at the same level of abstraction across MLP and attention components, so a circuit can be expressed uniformly in terms of features without distinguishing "this node is an SAE feature, that node is an MLP neuron". Second, the input/output semantics of transcoder features support natural circuit edges: "transcoder feature $i$ at layer $\ell+1$ depends on transcoder feature $j$ at layer $\ell$" is well-defined because both features have residual-stream-readable encoder vectors.
+
+**The greater-than circuit example.** Dunefsky et al. reverse-engineered the "greater-than" comparison circuit in GPT-2 small (the model that, given "1 + 5 = ", answers "6") using transcoders. The transcoder-level circuit was ~10 sparse features wide, considerably smaller and more interpretable than the underlying neuron count. Each feature had a clear semantic role (digit magnitude detection, comparison direction, output formatting), enabling a feature-level walk-through of the comparison.
+
+**Sparse feature circuits (Marks et al. 2024).** Marks et al. ("Sparse Feature Circuits: Discovering and Editing Interpretable Causal Graphs in Language Models", ICLR 2025) generalise the construction. They train SAEs on every component of every layer (residual stream, attention output, MLP output), then run automated discovery: given a target behaviour, attribution-patch every feature in every layer, prune to the top causally implicated subset, and assemble the resulting graph. The result is a *sparse feature circuit* — a directed graph of features, often hundreds of nodes wide and tens of layers deep, supplying a full feature-level account of the behaviour.
+
+**SHIFT (Sparse Human-Interpretable Feature Trimming).** One downstream application Marks et al. demonstrate: human annotators inspect the discovered features, mark those judged spurious (e.g., "this feature represents the labeller's gender, not the task content"), and the model's sensitivity to those features is zeroed by a small intervention. SHIFT improves out-of-distribution generalisation on tasks with known spurious correlations. The technique connects circuit analysis to alignment in a concrete way: the model is debugged by editing the circuit graph, not by retraining.
+
+---
+
+## Attribution graphs {#attribution-graphs}
+
+The 2024–2025 frontier of circuit analysis is **attribution graphs** — per-prompt rather than per-task computational dissections, scaled to frontier models. The line is led by Anthropic (Lindsey, Ameisen, Pearce, Gurnee et al., "Circuit Tracing: Revealing Computational Graphs in Language Models" and the companion essay "On the Biology of a Large Language Model", 2025).
+
+**Per-task vs per-prompt circuits.** Induction heads, IOI, the greater-than circuit, and sparse feature circuits all characterise a circuit *averaged* across many examples of a task. Attribution graphs instead characterise the circuit *used on one specific prompt*. The unit of analysis is a single forward pass; the output is a graph of which features wrote into which subsequent features. This is closer in spirit to neuroscience-style instance recording than to characterising "the IOI circuit in general".
+
+**Crosscoders.** Per-layer SAEs scale poorly because each layer requires a separate training run and feature alignment across layers is non-trivial. Lindsey et al. develop **crosscoders** — sparse dictionaries that map multiple layers simultaneously to a shared feature basis. A crosscoder can be applied to layers $\ell_1, \ldots, \ell_k$ at once, producing a feature representation in which "the same feature" has consistent identity across the layers. This makes multi-layer circuit drawing tractable.
+
+**The Claude 3.5 Haiku case studies.** Anthropic applied attribution graphs to Claude 3.5 Haiku and published several illustrative case studies in 2025. Two themes recurred:
+
+- **Forward and backward planning in word prediction.** On rhyming or constrained word-prediction tasks, the model sometimes *commits to* a candidate answer many layers before the output position requires it, then *backward propagates* constraints from that candidate to shape earlier intermediate computations. The pattern reads like the kind of planning humans do when finishing a rhyme — pick the target word first, then construct the line to land on it.
+- **Multi-path computation.** Different prompts on the same task activated qualitatively different circuit paths. There is no single "the circuit" for a task; there is a family of circuits, and the model dispatches across them depending on prompt-specific cues. This complicates the per-task circuit picture from earlier work.
+
+**Methodology.**
+
+1. Run the model on the target prompt; cache activations.
+2. Apply crosscoders to extract sparse features across the layers of interest.
+3. Compute attribution-patching scores between feature pairs (feature $i$ at layer $\ell$ causally affects feature $j$ at layer $\ell+\delta$).
+4. Threshold and prune to produce a directed graph of feature dependencies.
+5. Annotate features by inspecting their activation patterns on a labelled corpus.
+
+**What attribution graphs are for.** They produce *legible* per-prompt computational accounts at frontier scale. The motivation is partly scientific (understanding what frontier models do) and partly safety (catching deception requires reading the model's actual reasoning, not its rationalisation). The case studies are also a calibration on the dictionary-learning programme: the features discovered by crosscoders prove rich enough to support recognisable computational structure in a frontier production model, which is the empirical claim the SAE programme was promising.
+
+---
+
+## The 2025–2026 frontier {#frontier-26}
+
+Several lines have crystallised across 2024–2026.
+
+**Feature-first circuit analysis is now dominant.** Where 2022–2023 work primarily characterised circuits at the level of attention heads (induction heads, IOI), 2024–2026 work primarily characterises circuits at the level of SAE features, transcoder features, or crosscoder features. Heads remain the substrate, but the explanatory grain is finer.
+
+**Scaling to frontier production models.** Anthropic's attribution-graph case studies on Claude 3.5 Haiku, OpenAI's interpretability work on the o-series, DeepMind's Gemma-Scope and follow-up programme — all of these target production-scale models rather than the 100M–1B-parameter open models that dominated 2022–2023 work. The methodology has held up; the open question is whether it continues to hold at 10× to 100× more parameters.
+
+**Open-weights enables the academic line.** Independent research at MIT, Boston University, Stanford, and elsewhere has been able to do circuit analysis at meaningful scale because Llama, Gemma, Pythia, and other model families have been released with weights. The "biology of the model" framing — treat a frontier model as a research organism, characterise it at multiple scales — depends on this access.
+
+**The biology framing.** Lindsey et al.'s companion essay "On the Biology of a Large Language Model" (2025) reframes interpretability as a cellular/tissue/whole-organism research programme analogous to neuroscience. Features are cells, circuits are tissue, model behaviour is whole-organism phenotype, and interventions (ablation, steering, editing) are the experimental tools. The framing is rhetorical, but it organises the methodological menu and signals the field's shift from toy-model studies to model-organism studies of production systems.
+
+**Cross-feature interactions and composition.** Recent work (2025) explores circuits whose feature interactions are non-linear at the feature level — a feature *gates* another feature, or two features *jointly* activate a downstream feature only when both are present. This breaks the linear-circuit picture and is currently an active research area.
+
+**Multimodal circuits.** Circuit analysis on vision-language models (LLaVA-style architectures, Gemini 2 Pro-style multimodal stacks) is nascent. The mechanisms by which visual features integrate with language features have begun to receive serious attention in 2025; full feature-level circuit characterisations are still ahead.
+
+---
+
+## Limitations {#limitations}
+
+Circuit analysis has real evidential power, but its scope is bounded.
+
+**Superposition.** Elhage et al. (2022) and subsequent work show that models pack more features than there are neurons via *superposition*: features are represented by overlapping linear directions, and individual neurons or dimensions activate for multiple unrelated features. This is the very phenomenon SAEs and transcoders were designed to undo, but the undoing is approximate. Circuits identified at the feature level inherit the residual ambiguity of the dictionary.
+
+**Polysemanticity at the feature level.** SAE and transcoder features are *more* monosemantic than neurons but not perfectly. A feature trained on a 70M-parameter model with a particular sparsity penalty may represent "names of European cities" cleanly; the same feature on a 70B model may turn out to mix several near-related concepts. Interpretation is still a human judgment, and human judgment varies.
+
+**Sufficiency does not imply necessity.** Most circuit claims are sufficiency claims (patching the circuit restores behaviour). Real models contain redundancy, so the same behaviour can be sustained by alternative pathways when the primary circuit is ablated. The IOI backup-head finding is the textbook case. Establishing necessity requires more elaborate ablation protocols.
+
+**Sensitivity to counterfactual choice.** Patching results depend on the corrupt-input counterfactual. A different counterfactual produces a different patching map, and the "circuit" identified can shift. Heimersheim & Nanda (2024) discuss this at length and recommend reporting results across multiple counterfactuals.
+
+**Generalisation across model sizes.** Circuit-level findings on 100M-scale models often have qualitative analogues at 7B–70B scale, but quantitative details (which exact heads, which features, the exact algorithm) shift. Whether the *structure* of a circuit transfers across scales — or whether each scale grows its own analogous-but-distinct mechanism — is empirically open.
+
+**Closed-model internals.** The most capable models — frontier GPT-5, Claude Opus 4.x, Gemini 3 — are closed. Circuit analysis on them happens only inside the labs. Public circuit science is biased toward smaller open-weight models, and we should be careful in extrapolating to closed frontier systems.
+
+**Alignment implications are still speculative.** It is often claimed that interpretability is a prerequisite for alignment because we cannot oversee what we cannot inspect. The empirical track record of circuit analysis producing concrete alignment improvements is real but limited — SHIFT improves OOD generalisation under known spurious correlations, attribution-graph methods help catch some hidden-reasoning patterns. Whether circuit analysis scales to detecting *novel* misalignment in superhuman systems is the central open question, and it has no published answer.
+
+---
+
+## Summary {#summary}
+
+A circuit is a small, causally validated subgraph of the model that implements an identifiable algorithm. The methodological template was set by induction heads (Olsson 2022) and the IOI circuit (Wang 2022): identify a behaviour, hypothesise a mechanism, validate causally with ablation and patching, and quantify with faithfulness/completeness/minimality.
+
+Activation patching and its scalable approximation, attribution patching, are the dominant experimental tools. Patching tests sufficiency under a counterfactual; necessity, faithfulness, and generalisation require additional protocols. The 2023–2024 representational refinement moved circuit analysis from the level of attention heads to the level of features: function vectors (Todd 2023) show task representations are transportable in vector form, transcoders (Dunefsky 2024) extend SAE-style sparse dictionaries to MLP layers, and sparse feature circuits (Marks 2024) scale automated discovery to thousands of features. The 2024–2025 attribution-graph programme (Lindsey, Anthropic) scales these methods to frontier production models with per-prompt rather than per-task granularity.
+
+The 2026 state of practice is feature-first, frontier-scale, and increasingly biology-style — the model is treated as a research organism characterised at the cellular, tissue, and behavioural levels simultaneously. The open problems are the obvious ones: scaling to the most capable closed models, distinguishing redundant from genuinely necessary structure, distinguishing approximate from exact monosemanticity, and connecting circuit-level findings to alignment outcomes that matter. The field has not solved interpretability — but it now has a coherent, evidence-driven methodology and a fast-growing catalogue of model organisms.
+
+<Sources items={[
+  { authors: "Olsson, C. et al. (Anthropic)", year: 2022, title: "In-context Learning and Induction Heads", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html", note: "Foundational circuit paper; induction-head mechanism and the ICL phase change." },
+  { authors: "Wang, K., Variengien, A., Conmy, A., Shlegeris, B., Steinhardt, J.", year: 2022, title: "Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small", venue: "arXiv:2211.00593", url: "https://arxiv.org/abs/2211.00593", note: "28-head IOI circuit; faithfulness/completeness/minimality; backup heads." },
+  { authors: "Meng, K., Bau, D., Andonian, A., Belinkov, Y.", year: 2022, title: "Locating and Editing Factual Associations in GPT (ROME)", venue: "NeurIPS 2022", url: "https://arxiv.org/abs/2202.05262", note: "Causal tracing; the patching paradigm in its earliest precise form." },
+  { authors: "Elhage, N. et al. (Anthropic)", year: 2022, title: "Toy Models of Superposition", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2022/toy_model/index.html", note: "Foundational analysis of why features overlap; basis for the SAE programme." },
+  { authors: "Conmy, A., Mavor-Parker, A. N., Lynch, A., Heimersheim, S., Garriga-Alonso, A.", year: 2023, title: "Towards Automated Circuit Discovery for Mechanistic Interpretability (ACDC)", venue: "NeurIPS 2023", url: "https://arxiv.org/abs/2304.14997", note: "Automated edge-removal discovery procedure." },
+  { authors: "Nanda, N.", year: 2023, title: "Attribution Patching: Activation Patching at Industrial Scale", venue: "Personal blog / Alignment Forum", url: "https://www.neelnanda.io/mechanistic-interpretability/attribution-patching", note: "Linear-Taylor approximation of patching; scalable to large models." },
+  { authors: "Syed, A. et al.", year: 2024, title: "Attribution Patching Outperforms Automated Circuit Discovery", venue: "BlackboxNLP 2024", url: "https://arxiv.org/abs/2310.10348", note: "Empirical comparison of attribution patching against ACDC." },
+  { authors: "Heimersheim, S., Nanda, N.", year: 2024, title: "How to Use and Interpret Activation Patching", venue: "arXiv:2404.15255", url: "https://arxiv.org/abs/2404.15255", note: "Practical methodology guide; counterfactual choice; pitfalls." },
+  { authors: "Todd, E., Li, M. L., Sharma, A. S., Mueller, A., Wallace, B. C., Bau, D.", year: 2023, title: "Function Vectors in Large Language Models", venue: "ICLR 2024 / arXiv:2310.15213", url: "https://arxiv.org/abs/2310.15213", note: "Task representations as transportable vectors; head-decomposition." },
+  { authors: "Ilharco, G. et al.", year: 2022, title: "Editing Models with Task Arithmetic", venue: "ICLR 2023 / arXiv:2212.04089", url: "https://arxiv.org/abs/2212.04089", note: "Weight-space task vectors; companion concept to function vectors." },
+  { authors: "Turner, A. et al.", year: 2023, title: "Activation Addition: Steering Language Models Without Optimization", venue: "arXiv:2308.10248", url: "https://arxiv.org/abs/2308.10248", note: "Activation-space steering vectors; runtime intervention." },
+  { authors: "Dunefsky, J., Chlenski, P., Nanda, N.", year: 2024, title: "Transcoders Find Interpretable LLM Feature Circuits", venue: "NeurIPS 2024 / arXiv:2406.11944", url: "https://arxiv.org/abs/2406.11944", note: "Sparse MLP approximation; greater-than circuit at the feature level." },
+  { authors: "Marks, S., Rager, C., Michaud, E. J. et al.", year: 2024, title: "Sparse Feature Circuits: Discovering and Editing Interpretable Causal Graphs in Language Models", venue: "ICLR 2025 / arXiv:2403.19647", url: "https://arxiv.org/abs/2403.19647", note: "SAE-based feature circuits at scale; SHIFT application." },
+  { authors: "Lindsey, J., Ameisen, E., Pearce, A., Gurnee, W. et al. (Anthropic)", year: 2025, title: "Circuit Tracing: Revealing Computational Graphs in Language Models", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2025/attribution-graphs/methods.html", note: "Attribution graphs; crosscoders; methodology for per-prompt analysis." },
+  { authors: "Ameisen, E., Lindsey, J. (Anthropic)", year: 2025, title: "On the Biology of a Large Language Model", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2025/attribution-graphs/biology.html", note: "Companion biology framing; Claude 3.5 Haiku case studies including forward/backward planning." },
+  { authors: "Bricken, T., Templeton, A., Batson, J. et al. (Anthropic)", year: 2023, title: "Towards Monosemanticity: Decomposing Language Models With Dictionary Learning", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2023/monosemantic-features/", note: "Foundational SAE programme; prerequisite for feature-level circuit analysis." },
+  { authors: "Templeton, A. et al. (Anthropic)", year: 2024, title: "Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet", venue: "Transformer Circuits Thread", url: "https://transformer-circuits.pub/2024/scaling-monosemanticity/", note: "Production-scale SAE feature extraction." },
+  { authors: "Bereska, L., Gavves, E.", year: 2024, title: "Mechanistic Interpretability for AI Safety — A Review", venue: "arXiv:2404.14082", url: "https://arxiv.org/abs/2404.14082", note: "Comprehensive review of the field." },
+  { authors: "Somvanshi, S. et al.", year: 2025, title: "Bridging the Black Box: A Survey on Mechanistic Interpretability in AI", venue: "ACM Computing Surveys", url: "https://dl.acm.org/doi/10.1145/3787104", note: "Up-to-date taxonomy; covers SAEs, circuits, attribution, applications." },
+]} />

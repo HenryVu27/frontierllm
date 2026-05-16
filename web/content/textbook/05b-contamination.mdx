@@ -1,0 +1,333 @@
+---
+slug: 05b-contamination
+title: Test-set contamination
+description: N-gram detection, Min-K%, paraphrase contamination, LiveBench, and the 2025 ICML finding that no mitigation strategy achieves both fidelity and contamination-resistance.
+order: 47
+chapter: 47
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 28
+depends_on: [05a-benchmarks, 01a-data-pipeline]
+provides: [contamination, n-gram-overlap, min-k-prob, livebench, paraphrase-contamination, decontamination]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Test-set contamination—the unintended overlap between a model's training data and the datasets used to evaluate it—has become a first-order failure mode of LLM evaluation infrastructure. As of May 2026, the static benchmarks that powered the 2020–2024 evaluation era are widely understood to be compromised. MMLU, HumanEval, HellaSwag, and GSM8K, once the canonical instruments for measuring capability, now produce unreliable rankings for frontier models. The reported top-end accuracy on these benchmarks—often ≥90%—likely reflects memorization or superficial pattern matching from training data overlap rather than genuine generalization.
+
+The core problem is structural: benchmarks released for transparency *inevitably* leak into public training corpora. When a 70 B-parameter model is trained on hundreds of billions of tokens of web text, mathematics problems, and code repositories, major public evaluation sets are statistically guaranteed to appear. Once a benchmark is published, it becomes the focus of research work, appears in papers, is discussed in forums, and gets indexed by web crawlers. The boundary between "the training data pipeline included public benchmarks" and "the model was explicitly fine-tuned on the benchmark" becomes murky; the causal effect is contamination either way.
+
+This chapter surveys five detection paradigms, the three case studies that drove the contamination crisis, the evasion techniques that make detection harder, and the mitigation strategies that have emerged. The key finding from a rigorous 2025 ICML assessment is that no mitigation strategy achieves *both* fidelity (preservation of the original benchmark's intent) *and* contamination resistance (effective protection against data overlap). The field's response is an architectural shift: away from static public benchmarks toward dynamic evaluation (LiveBench), inference-time decontamination, and private holdout approaches. Understanding contamination detection is thus not an optional topic in the evaluation chapters—it is the foundation for reading a frontier-model evaluation claim critically.
+
+---
+
+## Definition and scope {#definition}
+
+Test-set contamination occurs when samples from an evaluation benchmark appear in a model's pretraining or fine-tuning data. The contamination may be:
+
+- **Exact-match contamination**: The test sample appears verbatim in training data.
+- **Paraphrase contamination**: The test sample is semantically equivalent to a training sample but expressed differently (e.g., a math problem with different variable names, or a text passage reworded by GPT-4).
+- **Hierarchical contamination**: Training data contains reasoning patterns, solution templates, or knowledge structures that are sufficient to solve the benchmark without explicit sample overlap (e.g., a model trained on thousands of solved math-competition problems can solve superficially novel GSM8K items).
+
+The *impact* of contamination is measured as the performance gap between a contaminated and an uncontaminated model on a benchmark. For GSM8K, the empirical lower bound is a 13% accuracy drop when models are evaluated on a distinct private holdout (GSM1K) designed to be out-of-distribution from the public GSM8K. The true effect is likely larger, since the private holdout may still contain some semantic overlap.
+
+Contamination is distinct from data leakage in experimental design (where a test set is accidentally included during cross-validation) and from privacy breaches. It is a *signal problem*: the benchmark ceases to measure what it was designed to measure because the measurement instrument has been compromised by the object being measured.
+
+---
+
+## Detection methods {#detection-methods}
+
+### N-gram overlap (white-box, string-level)
+
+The simplest contamination detector is string matching. Count the fraction of test samples that contain exact substrings (typically 8-grams, 10-grams, or longer) that also appear in the pretraining or fine-tuning corpus.
+
+**Strengths**:
+- Straightforward to implement; requires only access to training data or a whitebox model checkpoint.
+- Used by every major frontier lab to report approximate contamination rates in technical reports (GPT-3, PaLM, Llama, Llama-2).
+- Provides an unambiguous false-negative rate: if an n-gram matches, contamination is confirmed.
+
+**Limitations**:
+- Extremely high false-negative rate on paraphrased samples. On a benchmark paraphrased with GPT-4, n-gram overlap achieves an F1 score of only 0.165—detecting fewer than 1 in 6 contaminated examples.
+- Fails entirely when benchmark items are translated, decomposed, or reframed (e.g., "What is the sum of 3 + 4?" vs. "Compute $3 + 4$").
+- Cannot distinguish between genuine contamination and coincidental substring overlap (e.g., a mathematical derivation that appears in multiple papers).
+
+The LMSYS LLM Decontaminator work, which produced the tool used by HuggingFace and other organizations to screen training corpora, confirmed that n-gram methods are necessary but far from sufficient.
+
+### Embedding similarity search (white-box, semantic)
+
+A refinement over n-grams is to embed both test and training samples using a dense representation (e.g., a sentence transformer, an LLM embedding API, or a sparse BM25 retriever) and flag high-similarity pairs.
+
+**Strengths**:
+- F1 ≈ 0.49 on paraphrased samples, a substantial improvement over n-gram overlap.
+- Captures semantic overlap even when surface-level strings diverge.
+- Applies to any modality that can be embedded (text, code, images via CLIP-style embeddings).
+
+**Limitations**:
+- Threshold selection is brittle. A threshold set to maximize precision (few false positives) will have many false negatives; a threshold set for recall introduces many false alarms.
+- Vulnerability to deliberate paraphrase augmentation: if a model is trained on a mix of exact samples and heavily paraphrased versions, embedding similarity will flag some paraphrases as belonging to the training set, but the detector cannot distinguish between "this is a paraphrase" and "this is a novel sample that happens to be semantically close."
+- Evasive Augmentation Learning (EAL) demonstrates that fine-tuning a model on GPT-4-paraphrased benchmark samples embeds the contamination into learned representations without surface-level or semantic-embedding overlap. Detection thus becomes impossible without access to the model's internals.
+
+### Min-K% probability (gray-box, black-box-oriented)
+
+A fundamentally different approach leverages only the model's token-probability output. The intuition is that unseen examples contain outlier words—words with low probability under the model—while seen examples have higher average probability on their low-probability tokens. This is because models overfit slightly to their training distribution; seen examples contain no genuine surprises.
+
+**Method**: For each test sample, compute the probability $P(t_i | \text{context}_i)$ for each token $t_i$. Sort the tokens by probability, select the bottom k% (typically k=5), and compute the average probability of those low-probability tokens. High average probability indicates likely training data.
+
+**Strengths**:
+- Reference-free: no need for a shadow model or a separate corpus. Only the target model's token probabilities are needed.
+- Black-box compatible: requires only probability API access, not weight access.
+- ROC-AUC ≈ 0.72 on the WikiMIA membership-inference benchmark, a 7.4% improvement over prior approaches.
+- Works reliably on GPT-3.5 and GPT-4o; has been validated in production at scale.
+
+**Limitations**:
+- Does not account for token frequency distribution in the benchmark itself. Common tokens (e.g., "the", "a") will have higher probabilities by default.
+- Weak at fine-grained comparison across different models. A model trained on 1 T tokens will have sharper probability distributions than a model trained on 10 T tokens, confounding the comparison.
+- Strong on proprietary models (GPT-series) for which the training distribution is opaque; unreliable for distinguishing contamination between open-source models where training data is known or partially disclosed.
+
+### Statistical black-box test (no model access)
+
+A sophisticated approach requires no access to model internals or training data. The method exploits the exchangeability principle: under a null hypothesis of no contamination, all orderings of a benchmark are equally likely *a priori*. A contaminated model, however, will assign higher probability to the canonical (public) ordering—the specific sequence in which questions appear in the published benchmark.
+
+**Method**:
+1. Compute the joint log-probability of the benchmark under the canonical (public) ordering.
+2. Compute the joint log-probability of the benchmark under random shuffled orderings.
+3. Aggregate the difference across the dataset with a statistical test (e.g., a shard-based approach for efficiency).
+4. Flag contamination if the canonical-vs-shuffled difference exceeds a threshold, with a provably controlled false-positive rate.
+
+**Strengths**:
+- Exact false-positive guarantees: the detector can be tuned to guarantee that no more than 5% of uncontaminated models trigger a false alarm, regardless of model size or training data.
+- Detects contamination even on models as small as 1.4 B parameters and datasets with as few as 1,000 examples.
+- Works when data appears only a handful of times in pretraining, not requiring wholesale memorization.
+- Shard-based test design is computationally efficient for large benchmarks.
+
+**Limitations**:
+- Requires full probability-rank access to the model for all orderings. Computationally expensive for very large benchmarks.
+- Assumes exchangeability. Benchmarks with natural ordering (e.g., a story where sequence matters) may trigger false positives.
+
+This method was formalized in "Proving Test Set Contamination in Black-Box Language Models" (ICLR 2024) and represents the state-of-the-art for detection without model cooperation.
+
+### In-context learning detection (CoDeC)
+
+An emerging approach measures how in-context learning (ICL) affects performance. The insight is that memorized examples and out-of-distribution examples respond differently to few-shot conditioning. A contaminated sample may show high few-shot sensitivity (performance collapses or improves dramatically with shot count), while a genuinely generalized sample shows stable few-shot behavior.
+
+**Method**: Vary the number of in-context examples (0-shot, 1-shot, 3-shot, 5-shot) and measure performance variance. Flag samples whose performance is highly sensitive to shot count as likely contaminated.
+
+**Strengths**:
+- Distinguishes between memorization and distributional shift—a key distinction for understanding why a model fails on a benchmark.
+- Applicable to any task where in-context learning is possible.
+
+**Limitations**:
+- Assumes that generalized knowledge is more robust to ICL variation, which may not hold (e.g., a model may fail on both 0-shot and few-shot if the task requires genuinely novel reasoning).
+- Requires multiple forward passes per sample, multiplying inference cost.
+
+---
+
+## Case studies: High-profile contamination incidents {#case-studies}
+
+### GSM8K and the 13% accuracy drop
+
+GSM8K—a benchmark of 8,500 grade-school math word problems—became a canonical measure of mathematical reasoning for LLMs from 2022 to 2024. Nearly every major model reported GSM8K accuracy as a headline result. By late 2023, researchers noticed saturation: top models were scoring ≥95% on GSM8K, while performing far worse on unseen math benchmarks.
+
+Scale AI, the organization that released GSM8K, undertook a rigorous analysis. They created GSM1K—a private holdout benchmark of 1,000 mathematically equivalent but linguistically distinct math problems, never published. When top models were evaluated on GSM1K, accuracy dropped by approximately 13% relative to GSM8K. The log-likelihood of the model reproducing exact GSM8K text strongly correlated with the GSM8K–GSM1K performance gap, providing direct evidence that the gap was driven by memorization or near-memorization rather than reasoning capability.
+
+**Implications**:
+- 4.7 million benchmark samples across 263 distinct public benchmarks were exposed in closed-source pretraining corpora, according to subsequent analysis.
+- The lower-bound contamination effect for GSM8K is 13%. The true effect is likely larger, since GSM1K, despite being private, may still contain semantic overlap with problem-solving examples in the pretraining data.
+- GSM8K was retired from frontier evaluation; Scale's response was to establish GSM1K as a private benchmark, setting a precedent for private holdout evaluation.
+
+### SkyworkMath and paraphrase-based evasion
+
+A second major case study involved the SkyworkMath and similar math benchmarks. Public math benchmarks (GSM8K, MATH dataset, synthetic problem collections) were absorbed wholesale into pretraining corpora. Because math problems can be trivially paraphrased—change variable names, reword the setup, modify numbers—n-gram detection failed to identify the overlap.
+
+Subsequent work showed that even simple paraphrasing with GPT-4 (without access to the original problems) could bypass string-matching decontamination in GPT-3, Llama, and Llama-2. Benchmark creators responded by developing paraphrase-resistant evaluation: MR-GSM8K reframed the task from *generate a solution* to *score a solution's correctness*. By shifting the evaluation target, the benchmark became less vulnerable to paraphrase-based transfer (a model that has memorized many problem solutions still might not reliably judge whether a proposed solution is correct).
+
+### Retired benchmarks: MMLU, HumanEval, HellaSwag, and original GSM8K
+
+The contamination crisis has led to the retirement—or severe deprecation—of four canonical benchmarks:
+
+1. **MMLU** (Massive Multitask Language Understanding): A 14,000-question multiple-choice benchmark covering 57 tasks from STEM to humanities. Top models now score ≥90%, a ceiling that suggests widespread memorization. MMLU remains published but is no longer used for frontier model ranking.
+
+2. **HumanEval** (Codex): A 164-problem code-generation benchmark. Top models achieve near-perfect accuracy, with no ranking signal among frontier models. The benchmark is retired for differentiation purposes.
+
+3. **HellaSwag** (Contextual Commonsense Reasoning): A benchmark of 10,000 sentence-completion tasks. Top-model accuracy is ≥90%; the benchmark provides no ranking signal.
+
+4. **Original GSM8K** (before GSM1K): The original 8,500 problems remain published and widely cited, but are no longer trusted for evaluation of new frontier models.
+
+These benchmarks are not deleted from the literature; they remain valuable for studying earlier-generation models (GPT-3, Llama-1) and for measuring how contamination evolves. But for frontier evaluation, they are considered compromised.
+
+---
+
+## Paraphrase evasion and advanced contamination {#paraphrase-evasion}
+
+### Paraphrase-based contamination and GPT-4 augmentation
+
+A key vulnerability is that paraphrasing—particularly with a capable model like GPT-4—can bypass simple string-matching detection while preserving the essential reasoning content. Research has shown:
+
+- Benchmark items paraphrased with GPT-4 bypass n-gram detectors in GPT-3, Llama, and Llama-2.
+- Translation (e.g., a problem translated to another language) can mask contamination while preserving task structure.
+- Context modification (wrapping a problem in a fictional narrative, or fragmenting a long context) defeats embedding-similarity detectors.
+
+The implication is that unintentional contamination is not limited to exact-match overlap. If a pretraining corpus includes papers that discuss benchmark problems (even in rephrased form), or code repositories that show alternative solutions, the model may learn the problem structure without memorizing the exact question.
+
+### Evasive Augmentation Learning (EAL)
+
+An adversarial refinement is for a model developer to intentionally fine-tune a model on paraphrased benchmark samples, embedding the contamination into learned representations rather than surface-level overlap. EAL defeats even oracle-access (white-box) contamination detection because the overlap is not in the n-grams or the embeddings; it is in the model's internal reasoning.
+
+Detection of EAL-style contamination requires either (1) access to model internals (neuron activations, attention patterns) or (2) behavioral detection (e.g., Min-K% probability, in-context learning sensitivity). The existence of EAL demonstrates that the *arms race* in contamination is not static: detection and evasion improve together.
+
+### Hierarchical and semantic contamination
+
+Beyond paraphrase, models may absorb benchmark reasoning *patterns* without explicit sample overlap. If a model is trained on thousands of solved AMC/AIME problems, it learns the meta-strategies (e.g., "try substitution", "look for invariants") that generalize to superficially novel problems. This hierarchical contamination is difficult to measure because the model is not memorizing; it is learning a skill that the benchmark is designed to measure.
+
+The distinction between "generalization to related tasks" and "hierarchical contamination" is philosophically thorny. At what point does training on a related domain (e.g., Olympiad problems) constitute contamination of a benchmark (e.g., GSM8K) that is designed to measure similar skills? The field has not settled on a clear operational definition.
+
+---
+
+## Mitigation strategies and their effectiveness {#mitigation}
+
+### LiveBench and dynamic evaluation
+
+The simplest mitigation is to stop releasing static benchmarks and instead continuously refresh evaluation instruments. LiveBench (Anthropic, 2024) adds new questions monthly, drawn from:
+
+- Recent mathematics competitions (IMO, USAMO, competitions from 2024–2026).
+- ArXiv papers (newly published papers with answers derivable from the paper itself).
+- News articles and current events (requiring knowledge of events after model training cutoff).
+- Newly released datasets and problems.
+
+LiveBench maintains an objective ground-truth evaluation (no LLM judge; answers are verifiable by computation or citation). Published results are delayed: the newest batch of LiveBench questions is not immediately released to the public, reducing the lag between evaluation and potential recontamination.
+
+**Strengths**:
+- Provides a moving target that is hard to memorize during pretraining.
+- Objective scoring (no judge variance).
+- Transparent timeline (when questions were added, when results published).
+
+**Limitations**:
+- Requires continuous engineering and curation effort.
+- New questions may have different difficulty distributions (e.g., "IMO problem from 2025" is not directly comparable to "GSM8K from 2022").
+- Questions from recent papers may become public and thus potentially contaminated before the next evaluation round.
+
+### AntiLeak-Bench and knowledge-cutoff-based evaluation
+
+An alternative is to use knowledge-cutoff dates as a proxy for contamination resistance. AntiLeak-Bench queries about events and knowledge that emerged after a model's documented training cutoff, guaranteeing that the model could not have seen the information during pretraining.
+
+**Strengths**:
+- Absolute protection against deliberate inclusion of the benchmark in training.
+- Transparent (tied to public events and dates).
+
+**Limitations**:
+- Still vulnerable to incidental overlap (e.g., a pretraining corpus include a paper written after the cutoff but before the model's actual end-of-training date, a common issue with rolling data pipelines).
+- Limited scope (only knowledge-based tasks, not reasoning or skill-based tasks).
+
+### Private holdout benchmarks
+
+Scale's GSM1K approach—keeping evaluation data private and never publishing it—is the gold standard for contamination resistance. If a benchmark is never released, it cannot leak into training.
+
+**Strengths**:
+- Absolute protection from public leakage.
+- Allows fair ranking of models on the same benchmark without contamination.
+
+**Limitations**:
+- Reduces transparency. The evaluation methodology is opaque to the research community.
+- Benchmarks evaluated only on private data do not benefit from collective scientific scrutiny (e.g., if a benchmark is flawed, only the benchmark creators will know).
+- May harm a model's actual capability on tasks where public data exposure is beneficial (e.g., if a task requires exposure to diverse solution approaches, a model trained on a filtered corpus might underperform, and the private benchmark would measure that gap as a capability deficit rather than a data-pipeline choice).
+
+### Benchmark regeneration: From solution generation to solution scoring
+
+A methodological mitigation is to redesign the benchmark itself. MR-GSM8K (Meta-Reasoning) shifts the task from:
+
+- **Generation**: "Solve this math problem; output the final answer."
+- **Scoring**: "Is this proposed solution to the problem correct? Yes or no."
+
+By moving from generation to binary classification, the benchmark becomes resistant to paraphrase-based transfer. A model that memorized solutions to GSM8K problems might not reliably judge whether a different proposed solution is correct.
+
+**Strengths**:
+- Regenerated benchmarks can maintain semantic similarity to the original while shifting the evaluation target.
+- The shift from generation to scoring changes the skill being measured (correctness judgment vs. end-to-end reasoning).
+
+**Limitations**:
+- The regenerated benchmark may not preserve the difficulty or cognitive demand of the original. Judging a solution may be easier than generating one, or vice versa.
+- Semantic drift: the benchmark may shift from measuring "mathematical reasoning" to measuring "understanding of mathematical correctness", which is related but not identical.
+
+### The 2025 ICML assessment: No mitigation achieves both fidelity and contamination resistance {#2025-icml-finding}
+
+A comprehensive study ("The Emperor's New Clothes in Benchmarking? A Rigorous Examination of Mitigation Strategies for LLM Benchmark Data Contamination", ICML 2025) evaluated 20 distinct mitigation strategies across:
+
+- 10 LLMs (varying in size and training data)
+- 5 benchmarks (across reasoning, knowledge, and coding tasks)
+- 2 contamination scenarios (direct and paraphrase-based)
+
+The study introduced two key metrics:
+
+1. **Fidelity**: How well does the modified benchmark preserve the original benchmark's intent? This is measured by comparing the ranking of models on the original benchmark with the ranking on the regenerated/modified benchmark. High fidelity means the benchmark still measures what it was designed to measure.
+
+2. **Contamination Resistance**: How effectively does the strategy prevent contamination? This is measured by applying known contamination methods and checking whether they succeed.
+
+**The central finding**: No existing mitigation strategy achieves both high fidelity and high contamination resistance.
+
+- **Semantic-preserving strategies** (paraphrase, translation, question rewording) preserve the original task structure and thus have high fidelity. However, they offer minimal contamination resistance; a model trained on paraphrases or translations of the benchmark can still perform well.
+
+- **Semantic-altering strategies** (task reframing like MR-GSM8K, regeneration with different variable names, or benchmark reimplementation) gain contamination resistance at the cost of fidelity. The modified benchmark measures a different capability or has a different difficulty distribution.
+
+**Implication**: Mitigation is a tradeoff. Benchmark creators must choose between:
+
+1. Trusting that their regenerated benchmark measures the same capability (low confidence), or
+2. Accepting that their benchmark is semantically different and thus not directly comparable to the original (reducing the interpretability of results).
+
+This finding is sobering: it suggests that contamination is not a problem that can be "solved" with a single technical approach. Instead, the field must accept that evaluation will be an ongoing arms race, with dynamic benchmarks requiring continuous curation and updates.
+
+---
+
+## LiveBench: Practical implementation of dynamic evaluation {#livebench}
+
+LiveBench exemplifies the architectural shift away from static benchmarks. The system consists of:
+
+1. **Continuous curation**: New questions are added monthly, sourced from mathematical competitions, recent papers, and newly published datasets.
+
+2. **Objective ground truth**: All questions have verifiable answers (no reliance on LLM judges, which can be gamed or biased). Answers are computed from mathematical derivations, code execution, or citation-based verification.
+
+3. **Public delay**: The most recent batch of LiveBench questions is held private for a window (typically 1–2 months) before being released, reducing the opportunity for recontamination before the next evaluation round.
+
+4. **Polyglot and multimodal**: LiveBench covers multiple languages, multiple problem domains, and (as of 2026) includes some image-based reasoning problems.
+
+5. **Transparency timeline**: Each batch is released with metadata about when questions were created, when results were computed, and when the batch was published.
+
+LiveBench is the primary benchmark used by Anthropic, DeepSeek, and several other frontier labs for 2024–2026 model evaluation. It is not free from contamination (new papers and competition problems can leak into training corpora), but the rolling refresh makes large-scale systematic contamination much harder than with static benchmarks.
+
+---
+
+## Comparison of detection and mitigation approaches {#comparison}
+
+The following table summarizes the tradeoffs across detection and mitigation methods:
+
+| Approach | Detection/Mitigation | Contamination Coverage | False Positive Rate | Requires Model Access | Requires Training Data | Implementation Cost | Status |
+|---|---|---|---|---|---|---|---|
+| N-gram overlap | Detection | Exact match only (F1 ≈ 0.17 on paraphrases) | Low | No (optional) | Yes | Low | Standard; insufficient |
+| Embedding similarity | Detection | Semantic overlap (F1 ≈ 0.49) | Threshold-dependent | No (optional) | No | Medium | Useful supplement to n-grams |
+| Min-K% probability | Detection | Generalized patterns (ROC-AUC ≈ 0.72) | Depends on model scale | Yes (probability API only) | No | Medium | Production-ready for GPT-series |
+| Statistical black-box test | Detection | Any overlap level with guarantees | Controlled (e.g., 5%) | No | No | High (per-model run) | State-of-art; ICLR 2024 |
+| In-context learning (CoDeC) | Detection | Memorization vs. generalization | Unknown | Yes | No | Medium | Emerging; limited data |
+| LiveBench | Mitigation | Ongoing (moving target) | N/A | No | No | Very high (continuous) | Best practice; Anthropic standard |
+| Private holdout (e.g., GSM1K) | Mitigation | Absolute for public leakage | N/A | No | No | Medium | Gold standard; reduces transparency |
+| Benchmark regeneration (MR-GSM8K) | Mitigation | Moderate (paraphrases only) | N/A | No | No | Medium | Partial solution; fidelity tradeoff |
+| AntiLeak-Bench | Mitigation | Knowledge-cutoff-based | Low | No | No | Medium | Limited scope (knowledge only) |
+| Paraphrase mitigation (EAL defense) | Detection | Partial (representation-level) | High | Yes (full access) | No | Very high | Research-stage; no production use |
+
+*Note: All rows include references to papers or public implementations in the LMSYS Decontaminator repository, Scale AI's GSM1K writeup, Anthropic's LiveBench documentation, and the ICML 2025 assessment.*
+
+---
+
+## Summary and frontier practice {#summary}
+
+The contamination crisis of 2024–2025 has fundamentally reshaped LLM evaluation. The field has learned three hard lessons:
+
+1. **Static benchmarks cannot be both public and trustworthy.** The moment a benchmark is released for transparency, it becomes part of the public corpus and will eventually leak into training data. No detection method is perfect; no mitigation is free.
+
+2. **Detection is necessary but not sufficient.** N-gram overlap is the baseline; Min-K% probability and statistical black-box tests provide complementary signals. But detection lags behind evasion; paraphrase-based contamination and hierarchical-pattern absorption are hard to measure. Developers should assume contamination is real and use multiple detection methods.
+
+3. **Mitigation requires architectural change.** The answer is not a better decontamination algorithm; it is dynamic evaluation (LiveBench), private holdouts (GSM1K), or inference-time decontamination. Frontier labs are converging on a hybrid approach: public dynamic benchmarks for transparency and community engagement, and private holdouts for rigorous internal evaluation.
+
+The 2025 ICML finding—that no mitigation achieves both fidelity and resistance—is important because it reframes contamination from a "technical problem to be solved" to a "structural tension to be managed." Benchmark designers will continue to innovate, but the era of a single canonical static benchmark (like MMLU or GSM8K) is over.
+
+For practitioners: use LiveBench and similar rolling benchmarks for public reporting. Maintain private holdouts for serious internal ranking. Apply Min-K% probability detection as a screening step. And when reading a frontier-model evaluation claim, ask: "What benchmark was used, when was it released, and what evidence is there that it was not contaminated?" The answer will increasingly be "LiveBench, updated this month" or "private holdout, not disclosed." Both are defensible; neither provides full transparency. That is the current frontier-practice state as of May 2026.
+

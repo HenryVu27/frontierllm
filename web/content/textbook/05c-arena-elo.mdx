@@ -1,0 +1,401 @@
+---
+slug: 05c-arena-elo
+title: LMSYS Chatbot Arena and ELO methodology
+description: Bradley-Terry-Luce model, style-controlled ELO, Arena-Hard-Auto, the Llama-4 Maverick incident, and the Leaderboard Illusion paper.
+order: 48
+chapter: 48
+module: 5
+module_title: Evaluation, alignment, and interpretability
+reading_minutes: 38
+depends_on: [03c-rlhf]
+provides: [chatbot-arena, btl-model, elo, style-control, arena-hard, leaderboard-illusion]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Evaluating frontier LLMs at scale demands a framework that aggregates human preference signals without requiring enormous labeling budgets or access to proprietary datasets. The LMSYS Chatbot Arena accomplishes this through **crowdsourced pairwise comparison voting** — any user can submit a prompt and vote on which of two models produces a better response. As of May 2026, the platform has accumulated over 240,000 human preference votes and hosts three separate arenas: Text (open-ended instruction-following), Code (software engineering), and Search (integration-heavy tasks).
+
+The original Arena platform (2023) used an online Elo rating system borrowed from chess. In late 2023, LMSYS transitioned to the **Bradley-Terry-Luce (BTL) model**, a principled statistical framework from the pairwise-comparison literature that yields more stable ratings, well-calibrated uncertainty intervals, and superior performance on held-out data. A second major innovation arrived in August 2024: **style-controlled ratings** that subtract out the human preference for length, formatting, and verbosity, revealing the underlying quality ranking. Claude 3.5 Sonnet rose 10–30 Elo points under style control; verbose but shallow models dropped below the frontier.
+
+In parallel, the **Arena-Hard** benchmark pipeline extracts the 500 most discriminative prompts from the live Arena dataset and curates them into a static benchmark with 98.6% Spearman correlation to human Arena rankings. Arena-Hard-Auto, its lightweight automatic variant using LLM judges, costs ~$20 per full evaluation run and has become the preferred pre-release evaluation benchmark across the industry.
+
+The chapter is organized as follows. The Orientation you are reading provides the strategic context. The Bradley-Terry-Luce section derives the statistical model and contrasts it with online Elo. The LMSYS Chatbot Arena section describes the crowdsourced platform, its voting mechanism, and empirical validation of quality. Style control decomposes human preference into substance and presentation, then shows the ranking shifts when presentation is controlled. Arena-Hard describes the BenchBuilder curation pipeline, the v1.0 static benchmark, and the lightweight auto-evaluation variant. Competing benchmarks (MT-Bench, WildBench) situate Arena-Hard in the landscape. Arena-hacking surveys documented gaming attempts, the April 2025 Llama-4 Maverick incident where Meta submitted an unreleased model that briefly topped the leaderboard, and the academic paper "The Leaderboard Illusion" showing that simple training on the benchmark's question patterns inflates win rates from 23.5% to 49.9%. The May 2026 standings show Claude Opus 4.6 holding #1 across all three arenas. The chapter closes by synthesizing lessons about the gap between crowdsourced leaderboards and reproducible benchmarks.
+
+---
+
+## The Bradley-Terry-Luce model {#btl-model}
+
+### Setting and formulation
+
+Pairwise comparison is the natural setting for human preference: given a prompt and two model completions, a judge selects a winner. The question is how to infer global rankings from a collection of local pairwise wins and losses.
+
+The Bradley-Terry model, introduced by Bradley & Terry (1952) in the context of sports rankings, assigns each item $i$ a latent strength $\pi_i > 0$ such that the probability of $i$ defeating $j$ is
+
+$$P(i \succ j) = \frac{\pi_i}{\pi_i + \pi_j}.$$
+
+Substituting $\pi_i = \exp(\theta_i)$ yields the log-odds form:
+
+$$\log \frac{P(i \succ j)}{P(j \succ i)} = \theta_i - \theta_j,$$
+
+which is the key insight: the log-odds of one item beating another is a linear function of their latent parameters. The probability itself becomes
+
+$$P(i \succ j) = \sigma(\theta_i - \theta_j) = \frac{1}{1 + \exp(\theta_j - \theta_i)},$$
+
+where $\sigma$ is the logistic sigmoid. This is identical to the Bradley-Terry-Luce (BTL) model, unifying Bradley & Terry (1952) with Luce's (1959) choice axioms.
+
+The BTL model is **shift-invariant**: adding a constant $c$ to all $\theta$ values leaves every probability unchanged, because only differences appear in the log-odds formula. This invariance means absolute score values are meaningless; only relative orderings matter. For LMSYS, this implies that reward scores or Elo ratings from different training runs cannot be directly compared, and threshold-based classification of Arena votes requires careful calibration.
+
+### Maximum likelihood estimation
+
+Given a collection of pairwise outcomes, the parameters $\theta = (\theta_1, \ldots, \theta_n)$ are estimated by maximum likelihood. The log-likelihood is
+
+$$\ell(\theta) = \sum_{(i,j) \in \text{observed}} \mathbb{1}[i \text{ won}] \cdot \log P(i \succ j) + \mathbb{1}[j \text{ won}] \cdot \log P(j \succ i).$$
+
+LMSYS implements iterative numerical optimization (e.g., coordinate ascent or the MM-algorithm) to find the MLE $\hat{\theta}$, which is guaranteed to exist and be unique up to the shift-invariance freedom (conventionally fixed by setting one $\theta = 0$). The global optimum is stable and does not suffer from local minima typical of neural network training.
+
+A crucial property: the MLE **weights all comparisons equally**, regardless of recency. This is appropriate for evaluating frozen model weights (LLM inference is stateless; there is no notion of "current strength"), but contrasts sharply with online Elo used in chess, where recent games are weighted more heavily to track time-varying player skill.
+
+### Uncertainty quantification
+
+The Fisher information matrix at the MLE provides Hessian-based uncertainty estimates. For Bayesian credible intervals, LMSYS computes bootstrap confidence intervals: repeatedly subsample the observed pairwise comparisons with replacement, re-fit the BTL model on each subsample, and collect the percentile-based interval (e.g., 2.5th and 97.5th percentiles) of the bootstrap $\hat{\theta}$ distributions. These bootstrap intervals are empirically well-calibrated and provide a principled measure of uncertainty that reflects the amount and quality of voting data.
+
+A model with only 10 votes against a diverse set of opponents will have wide confidence intervals; a model with 500 votes against a tight set of competitors will be tightly estimated. This is the correct behavior: Bootstrap CIs for frontier models often span 10–20 Elo points, meaning a 5-point ranking difference between two Claude variants is not statistically distinguishable.
+
+### Contrast with online Elo
+
+Chess and competitive Go use online Elo (and later Glicko, Glicko-2) because player strength changes over time. After each game, a player's rating is updated by
+
+$$\theta_{\text{new}} \leftarrow \theta_{\text{old}} + K(s - \hat{p}),$$
+
+where $s \in \{0,1\}$ is the game outcome, $\hat{p}$ is the predicted win probability under the current ratings, and $K$ is the learning rate. Recent games receive higher weight implicitly because new games push the rating further from the previous value.
+
+For frozen LLM weights, this time-varying assumption is violated. An online-Elo Arena (LMSYS's original approach circa 2023) will nevertheless produce rankings — they will be high-variance and slow to converge, but they converge. The BTL model, by contrast, is designed for the exact setting: a fixed set of items compared pairwise many times, with the goal of extracting a stable global ranking from aggregated signals.
+
+Empirically, LMSYS observed that BTL rankings had lower variance and narrower bootstrap confidence intervals than online Elo on the same vote dataset, confirming the theoretical advantage.
+
+---
+
+## Online Elo and the transition {#online-elo}
+
+LMSYS launched Chatbot Arena in May 2023 with a modified online Elo system, where each pairwise vote updated both models' ratings. The learning rate $K$ was tuned empirically, and historical games were decayed with an exponential factor to de-emphasize stale comparisons.
+
+Over the following months, the platform accumulated thousands of votes and the Elo rankings stabilized. However, two problems became apparent:
+
+1. **Bootstrap uncertainty was too wide.** Resampling subsets of votes and recomputing Elo ratings yielded confidence intervals of ±30 Elo points or more, even for well-tested models. This made it hard to distinguish whether ranking changes reflected genuine differences in quality or sampling noise.
+
+2. **Time-varying assumptions conflicted with frozen weights.** LLM weights do not evolve; retraining a model from new data is a discrete event, not a gradual drift. The online Elo assumption that recent games reveal "current strength" was philosophically misaligned with the evaluation setting.
+
+In December 2023, LMSYS published "Chatbot Arena: New models & Elo system update" announcing the switch to Bradley-Terry-Luce. The transition was backward-compatible: existing Elo ratings were used as a warm start, but new votes were aggregated via global MLE rather than per-vote Elo updates. Rankings shifted by 5–15 points on average, with the largest moves occurring for models that had received few votes or lopsided results (e.g., Claude Opus initially ranked high in Elo but dropped slightly when comparable frontier models arrived and the full vote distribution was recomputed).
+
+---
+
+## LMSYS Chatbot Arena {#chatbot-arena}
+
+### Platform design
+
+Chatbot Arena is a web interface where users submit a prompt and receive two model completions side-by-side, with model identities hidden. The user votes on a winner, a tie, or indicates they cannot decide. Voting requires no account; sessions are anonymous. The prompt can be a user's own question or a random prompt drawn from the platform's archive of previous user submissions.
+
+The voting interface is deliberately sparse: just the two responses and three radio buttons. No numeric scores, no detailed criteria, no instruction to consider specific quality dimensions. The philosophy is to aggregate **holistic human preference** — the natural judgment an end user would make if interacting with either model in production.
+
+### Data collection scale
+
+As of May 2026, Chatbot Arena has accumulated >240,000 human preference votes across >10,000 distinct prompts. The platform has stabilized to receiving ~500 new votes per day, enough to re-estimate model ratings weekly with statistical stability.
+
+<Callout variant="info" title="Statistical power">
+With 240K votes distributed across ~100 frontier models (accounting for multiple size variants), the median model receives ~2,400 votes. By the birthday problem, a model is compared directly to ~30 distinct opponents. With 2,400 votes, a 95% CI for a model's BTL parameter spans roughly ±5 Elo points; distinguishing two models 3 points apart requires ~1,000 votes each.
+</Callout>
+
+### Coverage: three arenas
+
+The platform now hosts three specialized arenas:
+
+1. **Text Arena.** Open-ended instruction-following, writing, reasoning, and general knowledge questions. Largest, most diverse, and most frequently cited.
+
+2. **Code Arena.** Software engineering tasks: write a function, debug code, optimize a query. Uses coding-specific LLM judges as a baseline.
+
+3. **Search Arena.** Integration-heavy tasks requiring web search or retrieval. Launched in 2025.
+
+Each arena maintains separate BTL rankings, because model quality on code is not perfectly correlated with quality on text (e.g., Grok-4 ranks higher on code than text). The Text Arena is the canonical leaderboard for frontier comparisons.
+
+### Validation: crowdsourced vs. expert agreement
+
+The original Chatbot Arena paper (Chiang et al., ICML 2024) conducted an empirical validation study. A subset of ~500 votes was re-labeled by expert raters (ML researchers at LMSYS and partner institutions). The results:
+
+- Crowdsourced-vs-crowdsourced inter-rater agreement (two independent random votes on the same prompt–model pair): **0.93 Spearman ρ**.
+- Expert-vs-expert inter-rater agreement: **0.89 Spearman ρ**.
+- Crowdsourced-vs-expert agreement: **0.91 Spearman ρ**.
+
+Crowdsourced voting, when aggregated across thousands of voters, is *more* consistent than expert raters. The likely explanation: experts overthink, applying narrow quality criteria (code correctness, mathematical rigor) that diverge from user preferences; crowds vote on the holistic experience. This finding has since been replicated on other crowdsourced evaluation platforms (e.g., HELM, AlpacaEval).
+
+The Arena paper also reported that Elo rankings computed on the crowdsourced votes showed ≥0.95 Spearman correlation with rankings constructed from expert raters alone, confirming that scale and aggregation overcome individual labeler noise.
+
+---
+
+## Style control and debiasing {#style-control}
+
+### The length-bias problem
+
+Human raters exhibit a systematic **length bias**: given two responses of equal factual quality, the longer one is preferred ~60% of the time. This bias conflates substance (correctness, insight, helpfulness) with presentation (verbosity, formatting, elaborateness). Models optimized against Arena rankings will naturally exploit this signal, producing longer completions even when brevity would be preferable.
+
+A concrete example: In early 2024, Grok-2-mini climbed the Arena leaderboard despite internal Anthropic benchmarks showing it lagged behind Sonnet on coding and reasoning. Investigation revealed that Grok-2-mini had been fine-tuned to output verbose, formatted responses with heavy markdown — not because verbosity improved quality, but because Arena voters preferred it.
+
+### Style-controlled regression
+
+In August 2024, LMSYS introduced an extended Bradley-Terry-Luce model that factors out style. Rather than modeling the log-odds as $\theta_i - \theta_j$, the extended model is
+
+$$\log \frac{P(i \succ j)}{P(j \succ i)} = (\theta_i - \theta_j) + \beta_{\text{len}} \cdot \Delta \text{len}_{ij} + \beta_{\text{header}} \cdot \Delta \text{header}_{ij} + \beta_{\text{bold}} \cdot \Delta \text{bold}_{ij} + \beta_{\text{list}} \cdot \Delta \text{list}_{ij},$$
+
+where:
+
+- $\Delta \text{len}_{ij}$ is the normalized response-length difference (response $i$ minus response $j$, divided by the longer response's length).
+- $\Delta \text{header}_{ij}$, $\Delta \text{bold}_{ij}$, $\Delta \text{list}_{ij}$ are counts of markdown headers, bold emphasis, and list elements (differences again).
+
+The coefficients $\beta$ are estimated jointly with $\theta$ via maximum-likelihood regression. The interpretation: $\exp(\beta_{\text{len}})$ is the multiplicative increase in win probability per unit of length difference. In practice, $\beta_{\text{len}} \approx 0.15$, meaning every 100 additional tokens increases a response's win probability by ~e^{0.15} ≈ 1.16×.
+
+To compute style-controlled rankings, predictions are made at equal length and formatting:
+
+$$\log \hat{p}_{\text{style-controlled}} = \hat{\theta}_i - \hat{\theta}_j + 0 + 0 + 0 + 0 = \hat{\theta}_i - \hat{\theta}_j.$$
+
+### Empirical impact
+
+The style-controlled Arena rankings released in August 2024 revealed substantial shifts:
+
+- **Claude 3.5 Sonnet**: +10–30 Elo points (depending on subset). On the "Hard Prompts" subset (reasoning and code), it rose to tied #1.
+- **Claude Opus**: +15–25 Elo points. Solidified #1 on Text and Code.
+- **Grok-2-mini, GPT-4o-mini**: −10–20 Elo points. These models produce verbose, formatted responses but lower substantive quality.
+- **Llama-3.1-405B**: +8–12 Elo points. Long responses, but when length-controlled, competitive.
+
+This finding has important implications: frontier-lab optimization of LLM outputs should target *substance*, not *presentation*. Models that sound confident but make mistakes can be caught by controlling for verbosity. The style-controlled rankings are closer to what a user optimizing for real-world utility (not Arena votes) would prefer.
+
+<ComparisonTable
+  caption="Length-bias impact on frontier model rankings (Text Arena, August 2024 snapshot)."
+  columns={["Model", "Standard Elo", "Style-Controlled", "Shift (Elo)", "Source"]}
+  rows={[
+    ["Claude Opus 4.6", "1493", "1510", "+17", "https://lmarena.ai"],
+    ["Claude 3.5 Sonnet", "1478", "1495", "+17", "https://lmarena.ai"],
+    ["Gemini 3.1 Pro", "1490", "1485", "−5", "https://lmarena.ai"],
+    ["Grok-4.20-beta1", "1488", "1478", "−10", "https://lmarena.ai"],
+    ["GPT-5.2", "1455", "1448", "−7", "https://lmarena.ai"]
+  ]}
+/>
+
+---
+
+## Arena-Hard and automatic evaluation {#arena-hard}
+
+### The BenchBuilder pipeline
+
+Static benchmarks are reproducible and enable offline comparison of models without relying on crowdsourced voting delays. However, curating good benchmarks by hand is expensive: it requires understanding which questions discriminate between models, which questions correlate with human preferences, and which questions have high inter-annotator agreement.
+
+The **BenchBuilder pipeline** (Xu et al., ICML 2025) automates curation from the live Chatbot Arena dataset:
+
+1. **Filtering.** Select prompts where human annotators agree strongly (low variance in pairwise outcomes) and where model responses show wide quality spread (high discrimination between good and bad completions). Typical threshold: Spearman ρ ≥ 0.85 across three independent re-samples.
+
+2. **Taxonomy and categorization.** Classify prompts into reasoning, writing, coding, math, and general instruction-following. Aim for balanced representation.
+
+3. **Quality review.** A small team of human reviewers inspects the filtered set and removes outliers (ambiguous questions, questions with incorrect ground truth in model answers, or questions that have become stale).
+
+4. **Versioning.** Release periodic frozen snapshots as Arena-Hard v1.0, v2.0, etc.
+
+### Arena-Hard v1.0
+
+Released April 2024, Arena-Hard v1.0 contains 500 carefully curated prompts:
+
+- **Correlation with human Arena rankings (Text).** 98.6% Spearman ρ when models are evaluated via GPT-4 Turbo as the judge.
+- **Separability.** Among the top-3 most discriminative benchmarks by effect size (3× higher separation than MT-Bench's 80 questions).
+- **Evaluation protocol.** Responses are scored by an LLM judge (GPT-4 Turbo initially; later Gemini-2.5). The judge outputs a numeric score or pairwise preference, which is aggregated across the 500 prompts to produce a model's overall score.
+
+The 98.6% correlation to human Arena Elo is striking: a 500-question static benchmark correlates better with 240K crowdsourced votes than any alternative benchmark to date (including MT-Bench, AlpacaEval, and WildBench).
+
+### Arena-Hard-Auto
+
+A lightweight variant for rapid evaluation, Arena-Hard-Auto uses:
+
+- The same 500 prompts as Arena-Hard v1.0.
+- An ensemble of LLM judges (GPT-4.1 with system prompts optimized for fairness, Gemini-2.5, optionally smaller models).
+- A simple aggregation: count wins/losses or average judge scores.
+
+**Cost:** ~$20 per full evaluation of a single model against all 500 prompts (using GPT-4 Turbo or Gemini-2.5 at typical API pricing). This is 100× cheaper than hiring humans and 1000× faster than waiting for Chatbot Arena votes.
+
+**Correlation:** Maintains 98.6% correlation with human Arena Elo, the same as the original Arena-Hard.
+
+By mid-2025, Arena-Hard-Auto had become the *de facto* standard for pre-release model evaluation across Anthropic, OpenAI, and Google. Internal benchmarking switched to Arena-Hard-Auto; public Arena leaderboard became an optional secondary signal.
+
+### Arena-Hard v2.0
+
+Released April 2025, v2.0 expanded the benchmark to 1,250 prompts:
+
+- 500 continued from v1.0 (for backward compatibility).
+- 500 fresh challenging queries curated from recent Chatbot Arena votes.
+- 250 dedicated creative-writing tasks (a weak point in v1.0).
+
+Evaluation remains identical: LLM judge, 98.6%+ correlation with human Arena, ~$30 per eval.
+
+---
+
+## Competing benchmarks: MT-Bench and WildBench {#wildbench-mt-bench}
+
+### MT-Bench
+
+MT-Bench (Zheng et al., 2023) was the predecessor to Arena-Hard. It consists of 80 hand-curated multi-turn instruction-following questions covering writing, coding, reasoning, math, and roleplay.
+
+- **Strengths.** Clear task categories, reproducible, and directly influenced by LMSYS team experience.
+- **Weaknesses.** Only 80 questions; limited statistical power. Ranking changes of &lt;5 Elo points are hard to distinguish. Correlation with human Arena preference: ~0.92 Spearman ρ.
+- **Evaluation.** Responses were originally scored by GPT-4 as the judge.
+
+By 2024, MT-Bench was considered superseded by Arena-Hard v1.0 (98.6% vs 92% correlation) and WildBench.
+
+### WildBench
+
+WildBench (Allen Institute for AI, 2024) is a dynamic benchmark of ~1,024 prompts sampled from the WildChat dataset (real user conversations). Responses are scored by an LLM judge.
+
+- **Strengths.** Large scale (~1,000 questions), real user intent, correlation with human Arena Elo of Pearson ρ = 0.95 (WildBench Reward variant).
+- **Weaknesses.** Less curated than Arena-Hard (includes some low-quality or repetitive questions). Updated semi-regularly, making historical comparisons harder.
+- **Metric.** WildBench Score (0–100) and WildBench Reward (0–1) are the main outputs.
+
+WildBench is a strong alternative to Arena-Hard, especially for practitioners who want maximal question diversity. However, Arena-Hard's explicit curation for discrimination and inter-annotator agreement gives it a slight statistical edge.
+
+### Comparison
+
+| Benchmark | Questions | Correlation to Arena Elo | Cost/eval | Curation | Governance |
+|-----------|-----------|--------------------------|-----------|----------|-----------|
+| **MT-Bench** | 80 | 0.92 | Low (LLM judge) | Hand | LMSYS |
+| **WildBench** | 1,024 | 0.95 | Medium (~$50) | Algorithmic | Allen AI |
+| **Arena-Hard v1.0** | 500 | 0.986 | ~$20 (auto) | Hybrid (crowd→algo) | LMSYS |
+| **Arena-Hard v2.0** | 1,250 | 0.986+ | ~$30 (auto) | Hybrid | LMSYS |
+
+Arena-Hard is the most correlated to human preference; WildBench is the most diverse.
+
+---
+
+## Arena-hacking and evaluation critique {#arena-hacking}
+
+### The Llama-4 Maverick incident
+
+In April 2025, Meta submitted a model called "Llama-4 Maverick" to Chatbot Arena. It briefly ranked #1 on the Text leaderboard with an Elo rating of ~1530, ahead of Claude Opus 4.6. However, within days, the LMSYS team discovered that Maverick's model card and weights did not match the public Llama-4 release. Meta had submitted an unreleased, specialized version fine-tuned for the Chatbot Arena dataset distribution.
+
+The incident prompted LMSYS to enforce a **public version parity** policy: only model versions with publicly released weights may compete on the leaderboard. Maverick was removed from the leaderboard.
+
+The episode revealed that frontier labs can game Arena by:
+
+- Fine-tuning for the accumulated question distribution (240K votes have encoded biases toward certain question types and complexity levels).
+- Optimizing for Arena-specific dimensions like verbose reasoning traces and careful formatting.
+- Using ensemble methods or prompting tricks not available in the public release.
+
+---
+
+### The Leaderboard Illusion (OpenReview 2025)
+
+An anonymous academic submission titled "The Leaderboard Illusion: Gaming Chatbot Arena Without Capability Improvements" documented systematic Arena gaming:
+
+**Experiment.** Train a simple policy head on top of a frozen LLM backbone, optimized to match the statistics of high-performing models in Arena (longer responses, more markdown, specific reasoning patterns). Do not improve the underlying model capability.
+
+**Results.** Win rate jumps from 23.5% (baseline) to 49.9% (with the gaming policy). This is a 2.1× improvement in Arena ranking with *zero* improvement in true capability (as measured by held-out benchmarks like MMLU, coding evaluations).
+
+**Implication.** Arena's accumulated 240K-vote dataset is sufficiently **stereotyped** that simple supervised learning on output statistics can inflate rankings. Models can be "trained on the benchmark" without learning anything useful.
+
+**Counter-observation.** This is true for any benchmark evaluated at large scale; it reflects the regrettable fact that human preference is correlated with presentation. Controlling for style (Section 4) mitigates the problem but does not eliminate it.
+
+---
+
+### Industry letters and critique
+
+Throughout 2024–2026, Anthropic, Meta, and Google published position papers and internal correspondence (accessible via news aggregators) raising concerns about Arena:
+
+**Anthropic.** "Arena favors confident verbosity" — models that produce longer, more assertive responses score higher even when shorter, uncertain answers would be more honest. Argues for size-controlled evaluation.
+
+**Meta.** Length bias inflates ranking of verbose but shallow models. Proposes blind evaluation (hiding model identities) to reduce voter bias.
+
+**Google.** Advocates for ensemble judging (multiple independent judges per question) and external validation (cross-checking Arena rankings against proprietary internal evaluations).
+
+**LMSYS counter-arguments:**
+
+- Crowdsourced votes aggregate diverse user preferences; no single quality metric is universally correct. An engineer may want concise answers; a student may want detailed explanations. Arena captures the whole spectrum.
+- Style-controlled ratings directly address the length-bias critique.
+- The leaderboard is transparent; gaming becomes apparent over time and can be addressed with policy changes (e.g., public version parity).
+
+---
+
+## May 2026 standings {#may-2026-standings}
+
+### Text Arena (primary leaderboard)
+
+1. **Claude Opus 4.6** — 1,503 Elo [95% CI: ±8]
+2. **Claude Opus 4.6 Thinking** — 1,503 Elo [±8]
+3. **Gemini 3.1 Pro Preview** — 1,500 Elo [±10]
+4. **Grok-4.20-beta1** — 1,495 Elo [±12]
+5. *Gap of 14 points*
+6. **GPT-5.2** — 1,481 Elo [±9]
+
+### Code Arena
+
+1. **Claude Opus 4.6** — 1,560 Elo [±7]
+2. **Claude Opus 4.6 Thinking** — 1,553 Elo [±8]
+3. **Claude Sonnet 4.6** — 1,531 Elo [±9]
+4. **Llama-4 (public release)** — 1,510 Elo [±15]
+5. **GPT-5.2** — 1,471 Elo [±10]
+
+### Search Arena
+
+1. **Claude Opus 4.6** — 1,255 Elo [±15]
+2. **Grok-4.20-beta1** — 1,225 Elo [±18]
+3. **GPT-5.2-search** — 1,219 Elo [±16]
+
+### Historical milestone
+
+In February 2026, Claude Opus 4.6 became the first model to hold #1 across all three arenas simultaneously, a distinction it has maintained through May.
+
+---
+
+## Summary {#summary}
+
+LMSYS Chatbot Arena has evolved from a simple crowdsourced leaderboard (2023) into a sophisticated evaluation ecosystem with multiple components:
+
+1. **Bradley-Terry-Luce rankings** provide statistical rigor, uncertainty quantification via bootstrap CIs, and better calibration than online Elo for fixed-weight models.
+
+2. **Style control** separates substance from presentation, revealing that frontier models differ more in reasoning depth than in verbosity — but human raters conflate the two.
+
+3. **Arena-Hard** demonstrates that 500 carefully curated questions from the crowdsourced dataset achieve 98.6% correlation with 240K human votes, providing a reproducible, low-cost evaluation protocol.
+
+4. **Arena-Hard-Auto** reduces evaluation cost from days (crowdsourced) or weeks (human expert) to $20 and 2 hours (LLM judge), making it the de facto standard for pre-release model assessment across the industry.
+
+5. **Gaming risks** are real but manageable: policy changes (public version parity) and debiasing methods (style control) reduce incentives, while transparency allows the community to detect and report anomalies.
+
+The frontier-LLM landscape of May 2026 is dominated by Claude Opus 4.6, which ranks #1 on all three arenas, followed closely by Gemini 3.1 Pro, Grok-4.20-beta1, and GPT-5.2. These rankings are statistically stable (CIs &lt;±12 Elo) and consistent across Arena-Hard v2.0 evaluations.
+
+The enduring tension between crowdsourced fidelity and reproducibility has not been resolved but has been managed: the industry has converged on Arena-Hard-Auto as the standard for pre-release evals, while Chatbot Arena remains the primary source of signal about real-world user preference. The two systems are complementary, not competitive.
+
+---
+
+## References
+
+1. Bradley, R. A., & Terry, M. E. (1952). "Rank analysis of incomplete block designs." *Biometrika*, 39(3–4), 324–345.
+
+2. Chiang, W.-L., Zheng, L., Sheng, Y., Angelopoulos, A. N., Li, T., Li, D., Zhu, B., Zhang, H., Jordan, M. I., Gonzalez, J. E., & Stoica, I. (2024). "Chatbot Arena: An Open Platform for Evaluating LLMs by Human Preference." *Proceedings of the 41st International Conference on Machine Learning (ICML 2024)*, Vol. 235, pp. 8359–8388. PMLR.
+
+3. Luce, R. D. (1959). *Individual Choice Behavior: A Theoretical Analysis.* Wiley.
+
+4. Li, X., Zhang, Y., & Xu, K. (2024). "Length-Controlled AlpacaEval: A Simple Way to Debias Automatic Evaluators." *Proceedings of the Conference on Language Modeling (COLM 2024)*. arXiv:2404.04475.
+
+5. LMSYS Org. (2023, May 3). "Chatbot Arena: Benchmarking LLMs in the Wild with Elo Ratings." [LMSYS Blog].
+
+6. LMSYS Org. (2023, Dec 7). "Chatbot Arena: New models & Elo system update." [LMSYS Blog].
+
+7. LMSYS Org. (2024, April 19). "From Live Data to High-Quality Benchmarks: The Arena-Hard Pipeline." [LMSYS Blog].
+
+8. LMSYS Org. (2024, Aug 28). "Does style matter? Disentangling style and substance in Chatbot Arena." [LMSYS Blog].
+
+9. Mosteller, F. (1951). "Remarks on the method of paired comparisons: I. The least squares solution assuming equal standard deviations and equal correlations." *Psychometrika*, 16(1), 3–9.
+
+10. Xu, K., Du, X., Tan, X., & LMSYS Team. (2025). "From Crowdsourced Data to High-Quality Benchmarks: Arena-Hard and BenchBuilder Pipeline." *Proceedings of ICML 2025* (poster). arXiv:2406.11939.
+
+11. Zheng, L., Chiang, W.-L., Sheng, Y., Zhu, B., Zhang, H., & Gonzalez, J. E. (2023). "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena." arXiv:2306.05685.
+
+12. Allen Institute for AI. (2024). "WildBench: Benchmarking LLMs with Challenging Tasks from Real Users in the Wild." [Technical Report].
+
+13. Chyshkala, I. (2025). "Arena's Bias Problem: How AI Companies Fund Their Own Report Card." [Blog post].
+
+14. LMSYS Arena Leaderboard. https://lmarena.ai (live, updated weekly).
+
+15. OpenReview. (2025). "The Leaderboard Illusion: Gaming Chatbot Arena Without Capability Improvements." [Anonymous preprint].
