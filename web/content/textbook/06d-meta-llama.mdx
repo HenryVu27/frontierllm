@@ -1,0 +1,161 @@
+---
+slug: 06d-meta-llama
+title: Meta — Llama 3 and Llama 4
+description: Llama 3 → 3.1 → 3.2 → 3.3 dense line, Llama 4 Scout / Maverick / Behemoth MoE family, the dense vs MoE strategy, the 405B training recipe (16K H100s, FP8 quantization), the iterative DPO post-training pipeline, and the Meta Community License.
+order: 58
+chapter: 58
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 24
+depends_on: [06c-google-deepmind]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Meta's Llama line is the frontier reference point for *open-weights* models — released with weights, weight-tying-permitted licenses (with restrictions), and the most transparent training-recipe disclosure of any frontier lab. Whereas OpenAI, Anthropic, and Google withhold parameter counts and training recipes, Meta publishes them. The Llama 3.1 Herd of Models technical report (arXiv:2407.21783) is the most-cited single artefact in 2024 frontier-LLM pretraining; subsequent Llama 4 disclosures continue the pattern with reduced but still meaningful detail.
+
+This chapter walks the Llama 3 dense line, the Llama 4 MoE family, and the disclosed training and post-training pipelines. Calibration: May 15, 2026.
+
+<Callout variant="note" title="What 'open-weights' means here">
+The Llama line ships with weights under the Meta Community License. The license permits commercial use up to a usage threshold (700M monthly active users), restricts use of outputs to train competing models, and is not OSI-compliant. The community treats Llama as "open weights" rather than "open source"; the distinction matters for production use and is part of Meta's strategic positioning.
+</Callout>
+
+---
+
+## The Llama 3 line {#llama-3-line}
+
+**Llama 3 (April 2024).** 8B and 70B dense transformers. Trained on 15T tokens with the standard transformer recipe (Module 0a), RoPE positional encoding (Module 0c), Grouped-Query Attention (Module 0b), SwiGLU MLP (Module 0e), and RMSNorm (Module 0d). The 70B variant reached competitive MMLU at ~82%; the 8B variant established the new small-model frontier at ~66%.
+
+**Llama 3.1 (July 2024).** Added the **405B** flagship — the largest open-weights model released to date — alongside 8B and 70B refreshes. The accompanying *Llama 3.1 Herd of Models* technical report disclosed: 15.6T training tokens, 16K H100 GPUs, 30.84M GPU-hours for pretraining (and a similar order for post-training), BF16 mixed-precision pretraining with FP8 used for quantization at inference. The 405B variant matched GPT-4 on most knowledge benchmarks (MMLU 87.3%, MATH 73.8%, HumanEval 89.0%, GPQA 50.7%) and substantially shifted the open-weights frontier.
+
+Context extension: Llama 3.1 supports 128K tokens via staged long-context extension (Module 1g for the technique).
+
+**Llama 3.2 (September 2024).** Multimodal expansion: 11B and 90B vision-language variants (text + image input) with a vision encoder bolted onto the base Llama 3.1 70B / Llama 3 11B. Small text-only variants at 1B and 3B for on-device deployment.
+
+**Llama 3.3 (December 2024).** A 70B-only release that effectively replaced the 405B at the cost of much smaller inference: Meta reported the 70B variant matched 405B on most production benchmarks. The release implied — and the Llama 4 strategy confirmed — that pure dense scaling beyond 70B was producing diminishing returns relative to the inference cost.
+
+The 3.x line is the canonical *dense* frontier model — no MoE, no mixture of capabilities, the classic Vaswani-Transformer recipe scaled. Module 1 (pretraining at scale) uses the 405B as its primary anchor for scaling-law calculations; this section is the released-artefact side.
+
+---
+
+## Llama 4 family {#llama-4-family}
+
+The Llama 4 line (announced April 2025) is Meta's pivot to **Mixture of Experts** at frontier scale. Three variants:
+
+**Llama 4 Scout (April 2025).** 109B total parameters, 17B activated per token, 16 experts, native 10M-token context. The 10M context — matching Gemini 1.5 — comes from a long-context training stage built on top of the base MoE. Scout is intended as the deployment workhorse of the line: low active-parameter count, frontier-class capability on knowledge benchmarks, very long context.
+
+**Llama 4 Maverick (April 2025).** 400B total, 17B activated, 128 experts. Native multimodal (text + image input). Maverick alternates dense and MoE blocks — a hybrid architecture Meta argues balances inference efficiency (MoE) against representation quality (dense). Marketing: "best in class for multimodal".
+
+**Llama 4 Behemoth (in training as of May 2025).** Reportedly ~2T total / ~288B activated, intended as a teacher model for distillation into Scout and Maverick rather than for production deployment. Behemoth's role echoes other labs' "frontier teacher / smaller student" patterns and the broader observation in Module 1 § 01h that very-large models can train better, smaller deployable models more reliably than the smaller models can train themselves.
+
+The Llama 4 architectural choice has implications across the textbook: MoE routing and capacity (Module 0h, 02d), expert parallelism in distributed training (Module 2d), wide-EP inference deployment (Module 4h). Llama 4's expert count is mid-range — 16 in Scout, 128 in Maverick — versus DeepSeek-V3's auxiliary-loss-free MoE with substantially more experts. Meta has not published a head-to-head architectural comparison.
+
+---
+
+## Dense vs MoE strategy {#mixture-vs-dense-strategy}
+
+The transition from Llama 3 (pure dense) to Llama 4 (MoE) is the strategic story of 2024–2025 for Meta. Two empirical motivations:
+
+1. **Dense scaling ceiling.** Llama 3.1 405B and Llama 3.3 70B reaching parity on many production benchmarks signalled diminishing returns for pure dense scaling past ~500B parameters. Meta's internal MoE scaling-law experiments (referenced in the Llama 4 launch announcements but not fully published) showed ~16% efficiency advantage of MoE at frontier scale.
+2. **Hardware alignment.** MoE matches the H100 / B200 hardware profile: sparse activation lets you scale total parameters without proportionally scaling active compute, exploiting interconnect bandwidth and memory hierarchy more effectively. Wide-expert-parallelism inference (Module 4h, DeepSeek-style) becomes the deployment pattern.
+
+The trade-off Meta accepted: MoE training is more brittle than dense (auxiliary losses, load balancing, expert collapse risks — Module 0h). The Llama 4 launch indicates Meta judged the inference-efficiency gain worth the training-complexity cost.
+
+The dense-to-MoE transition is the same architectural arc as DeepSeek (§ 06e) and Google's Gemini (§ 06c, MoE since 1.5). Llama 4 is Meta following the field's consensus on frontier architecture.
+
+---
+
+## Training recipe (405B) {#training-recipe-405b}
+
+The Llama 3.1 405B training recipe is the most detailed frontier-model training disclosure published as of May 2026. Selected highlights from the *Herd of Models* technical report:
+
+| Metric | Value |
+|---|---|
+| **Total parameters** | 405B (dense) |
+| **Training tokens** | 15.6T |
+| **GPU type** | NVIDIA H100 |
+| **GPU count** | 16,384 (16K) |
+| **Pretraining GPU-hours** | 39.3M |
+| **Precision** | BF16 (pretraining); FP8 (post-train quantization for inference) |
+| **Context** | 8K base → 128K via long-context extension |
+| **Architecture** | GQA, RoPE, SwiGLU, RMSNorm |
+| **Tokenizer** | 128K vocabulary (vs Llama 2's 32K) |
+
+The pretraining recipe followed the Chinchilla-compute-optimal trajectory (Module 1 § 01c), with inference-time overtraining beyond the Chinchilla point — a deliberate trade-off favouring inference cost over training cost (Module 1 § 01c on inference-aware scaling laws). FP8 was used in post-training quantization rather than pretraining itself; the contemporaneous DeepSeek-V3 line (§ 06e) was the first frontier model to use FP8 *during* pretraining.
+
+**Parallelism configuration.** Llama 3.1 405B used a 4D parallelism stack: data parallel × tensor parallel × pipeline parallel × context parallel. The exact configuration (TP=8, PP=16, CP=4, DP=32, approximately) is documented in the technical report. Cross-reference Module 2 § 02h for the 3D / 4D parallelism composition.
+
+**Data pipeline.** The Herd report describes the data pipeline (Module 1 § 01a) at length: multi-stage deduplication, quality filtering, multilingual rebalancing. Final pretraining data composition is approximately 50% web, 25% code, 12% math/reasoning, 8% multilingual, 5% other.
+
+---
+
+## Post-training pipeline {#post-training-pipeline}
+
+The Llama 3.1 405B post-training pipeline replaced PPO-based RLHF with **iterative DPO** (Module 3 § 03b). The pipeline:
+
+1. **SFT.** ~25M+ synthetic + human examples. Synthetic generation uses Llama 3.1 itself plus seed quality-filtered demonstrations.
+2. **Reward modelling.** A reward model trained on pairwise preference data.
+3. **Iterative DPO (2–4 rounds).** Each round: sample completions from the current policy, label with the reward model, run DPO. Re-initialize for the next round.
+4. **Multi-objective fine-tuning.** Optimization against multiple reward signals (helpfulness, harmlessness, calibration, instruction-following).
+
+Post-training GPU-hours: roughly 30.84M, an order of magnitude smaller than pretraining but still ~78% of pretraining cost — a high ratio reflecting Meta's investment in the post-training side of the recipe. The DPO-over-PPO choice (Module 3 § 03b on the algorithmic tradeoff) reflects Meta's reported finding that DPO is simpler to scale and equally effective at the 405B size.
+
+---
+
+## Open-weights licensing {#open-weights-license}
+
+The **Meta Community License** governs the Llama weights. Key terms:
+
+- **Commercial use permitted** up to 700M monthly active users (a threshold mostly affecting the largest tech companies).
+- **Output restrictions.** Outputs cannot be used to train competing models. This is the term that disqualifies the license from OSI compliance and is the most-cited constraint in production use.
+- **Attribution.** Required under most clauses.
+
+The license is more permissive than most "open" model licenses (Mistral's MRL, Cohere's CC-BY-NC-4.0 for weights) and less permissive than truly open licenses (Apache 2.0, MIT). Meta's positioning: Llama weights are available enough to drive adoption and ecosystem development (Hugging Face, llama.cpp, Ollama, the Llama 3.1 405B base for downstream fine-tunes) without entirely commoditising frontier model capabilities. Gemma (§ 06c, Apache 2.0) and DeepSeek (§ 06e, MIT) sit at the more-permissive end of the open-weights spectrum.
+
+The Llama community-license terms are the same across Llama 3 and Llama 4; updates have been minor.
+
+---
+
+## Disclosed evaluations {#evals-disclosed}
+
+| Model | MMLU | MMLU-Pro | MATH | HumanEval | GPQA Diamond | SWE-bench Verified |
+|---|---|---|---|---|---|---|
+| Llama 3.1 8B | 73.0% | — | 30.0% | 72.6% | — | — |
+| Llama 3.1 70B | 86.0% | — | 68.0% | 80.5% | — | — |
+| Llama 3.1 405B | 87.3% | — | 73.8% | 89.0% | 50.7% | — |
+| Llama 3.3 70B | 86% (matched 405B) | — | — | — | — | — |
+| Llama 4 Scout (109B/17B) | ~89% | — | — | — | ~55% | ~35% (claimed) |
+| Llama 4 Maverick (400B/17B) | ~91% | — | — | — | ~60% | ~45% (claimed) |
+| Llama 4 Behemoth | — | — | — | — | — | — (not yet released) |
+
+Llama 4 numbers are Meta's released-launch claims; third-party verification across the full benchmark suite remains in progress as of May 15 2026. The Llama 3.1 405B numbers are from the technical report and have been independently reproduced. Note that MMLU is saturated in this table (Module 5 § 05a) and the discrimination benchmarks for Llama 4 are SWE-bench, GPQA, and Llama-4-specific multimodal evaluations.
+
+**Vision benchmarks (Llama 3.2 vision variants and Llama 4 Maverick multimodal).** Meta has disclosed MMMU and DocVQA results but not full leaderboard positioning; the multimodal benchmark cross-reference is Module 5 § 05a.
+
+---
+
+## Summary {#summary}
+
+Meta's Llama line is the open-weights pillar of the frontier ecosystem. The Llama 3 line (April 2024 – December 2024) was the canonical dense-Transformer recipe scaled to 405B and detailed in the most cited frontier-model technical report of 2024. The Llama 4 line (April 2025 onward) pivots to MoE — Scout (109B/17B, 10M context), Maverick (400B/17B, multimodal), Behemoth (~2T/288B, teacher) — joining DeepSeek and Gemini at the MoE frontier.
+
+Cross-references for a reader of earlier modules: pretraining recipe ↔ Module 1 throughout (with § 01h annealing/FP8 as the closest specific cross-ref); 4D parallelism ↔ Module 2 § 02h; iterative DPO post-training ↔ Module 3 § 03b; MoE architecture ↔ Module 0h, Module 2d; multimodal vision encoders ↔ Module 0g (extended). Frontier-lab strategic comparison: Llama is the most-disclosed frontier line, the most-permissively-licensed of the major frontier labs, and now the most architecturally heterogeneous Western open-weights line.
+
+Two empirical anchors as of May 15 2026: Llama 3.1 405B (the canonical reference dense model, 87.3% MMLU, with the most detailed published recipe) and Llama 4 Scout (the production deployment workhorse with frontier-class 10M context at 17B active parameters). Open questions: Llama 4 Behemoth's release timeline and disclosed details, full third-party verification of Llama 4 benchmark claims, and the exact MoE-routing policy used in Maverick.
+
+<Sources items={[
+  { authors: "Meta AI", year: 2024, title: "The Llama 3 Herd of Models", venue: "arXiv:2407.21783", url: "https://arxiv.org/abs/2407.21783", note: "Definitive Llama 3.1 technical report; 405B training recipe in full detail." },
+  { authors: "Meta", year: 2024, title: "Introducing Llama 3.1: Our most capable models to date", venue: "ai.meta.com", url: "https://ai.meta.com/blog/meta-llama-3-1/", note: "405B / 70B / 8B release announcement." },
+  { authors: "Meta", year: 2024, title: "Llama 3.2: Revolutionizing edge AI and vision with open, customizable models", venue: "ai.meta.com", url: "https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/", note: "Vision-language variants; 1B/3B on-device variants." },
+  { authors: "Meta", year: 2024, title: "Llama 3.3 70B Instruct Model Card", venue: "huggingface.co", url: "https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct", note: "70B matches 405B on most production benchmarks." },
+  { authors: "Meta AI", year: 2025, title: "Introducing the Llama 4 herd: Scout, Maverick, and Behemoth", venue: "ai.meta.com", url: "https://ai.meta.com/blog/llama-4-multimodal-intelligence/", note: "Llama 4 family launch; MoE pivot." },
+  { authors: "Meta AI", year: 2025, title: "Llama 4 Scout model card", venue: "llama.com", url: "https://www.llama.com/docs/model-cards-and-prompt-formats/llama4", note: "Scout details; 10M context configuration." },
+  { authors: "Meta", year: 2025, title: "Llama 4: A Technical Overview", venue: "ai.meta.com", url: "https://ai.meta.com/blog/llama-4-technical-overview/", note: "Architecture comparison; Maverick alternating dense/MoE blocks." },
+  { authors: "NVIDIA Developer", year: 2024, title: "Llama 3.1 405B Optimization with TensorRT-LLM", venue: "developer.nvidia.com", url: "https://developer.nvidia.com/blog/llama-3-1-405b-optimization-tensorrt-llm/", note: "FP8 quantization; deployment perspective." },
+  { authors: "Meta", year: 2024, title: "Llama 3 Community License", venue: "llama.com", url: "https://www.llama.com/license/", note: "License terms; 700M-MAU threshold." },
+  { authors: "Open Source Initiative", year: 2024, title: "Why Llama's License is Not Open Source", venue: "opensource.org", url: "https://opensource.org/blog/llama-license", note: "Why the Meta Community License is not OSI-compliant." },
+  { authors: "Llama.cpp project", year: 2024, title: "Llama family models in llama.cpp", venue: "github.com/ggerganov/llama.cpp", url: "https://github.com/ggerganov/llama.cpp", note: "Reference inference implementation; ecosystem indicator." },
+  { authors: "Vellum", year: 2025, title: "Llama 4 vs frontier models benchmark roundup", venue: "vellum.ai", url: "https://www.vellum.ai/blog/llama-4-benchmarks", note: "Third-party benchmark aggregation." },
+  { authors: "Hugging Face", year: 2025, title: "Llama 4 model card collection", venue: "huggingface.co", url: "https://huggingface.co/meta-llama", note: "Public model card registry." },
+]} />

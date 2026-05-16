@@ -1,0 +1,139 @@
+---
+slug: 06f-qwen-alibaba
+title: Alibaba Qwen
+description: Qwen2 → Qwen2.5 → Qwen3 line, the hybrid reasoning/non-reasoning toggle, Qwen-VL multimodal, Qwen2.5-Math, QwQ-32B, the Tülu-3-style post-training pipeline, and the open-weights release cadence.
+order: 60
+chapter: 60
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 24
+depends_on: [06e-deepseek]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Alibaba's Qwen team is the most prolific open-weights frontier-LLM lab as of May 2026 by release cadence. Across Qwen2 (June 2024), Qwen2.5 (September 2024), and Qwen3 (April 2025), the team shipped over a dozen variants — base models, instruction-tuned chat models, code specialists, math specialists, vision-language models, and a reasoning-specialised QwQ line — under permissive licensing. The technical contributions are less architecturally novel than DeepSeek's, but the *release discipline* (frequent, well-documented, with detailed model cards) made the Qwen line a primary substrate for the academic open-weights community.
+
+This chapter walks the Qwen family. Calibration: May 15, 2026. Cross-references to earlier modules are dense; Qwen's contribution is in *execution* rather than in *new techniques*, so the chapter is comparatively short.
+
+---
+
+## Family tree {#qwen-family-tree}
+
+**Qwen2 (June 2024).** 0.5B / 1.5B / 7B / 57B-MoE / 72B variants. The 57B-MoE configuration uses 14B activated parameters. Dense models use GQA, RoPE, SwiGLU, RMSNorm — the standard 2024 stack. Trained on ~7T tokens with ~30 language coverage. MMLU on the 72B variant reached ~84.2%, competitive with Llama 3 70B at the time.
+
+**Qwen2.5 (September 2024).** 0.5B / 1.5B / 3B / 7B / 14B / 32B / 72B variants. The major changes: 18T training tokens (versus Qwen2's 7T), expanded context (32K standard, 1M token long-context variant), improved instruction-tuning and multilingual coverage. The 72B variant pushed MMLU into the high-80% range. The Qwen2.5 family was the production workhorse line across late 2024 and early 2025 — the academic and on-device community's preferred mid-scale model set.
+
+**Qwen3 (April 2025).** 0.6B / 1.7B / 4B / 8B / 14B / 32B / 235B-A22B / 480B-A35B variants. The two large variants are MoE (235B total with 22B active; 480B total with 35B active). Training scale: 36T tokens, 119 language coverage. The headline feature is the **hybrid reasoning/non-reasoning toggle** (next section). Qwen3-235B-A22B sits around DeepSeek-V3 territory on knowledge benchmarks; Qwen3-480B-A35B is the lab's largest open-weights release to date.
+
+The release cadence is the structural feature: roughly six months between major versions, with point-version refreshes (Qwen2.5-1.5B, Qwen2.5-Math, Qwen2.5-Coder, Qwen3-Embedding, etc.) at ~2-month intervals.
+
+---
+
+## Qwen3 hybrid reasoning {#qwen3-hybrid-reasoning}
+
+Qwen3 introduced an explicit **reasoning / non-reasoning mode toggle** at inference time. A boolean flag (or a special token) tells the model whether to engage long chain-of-thought reasoning. With reasoning on, the model emits a chain of thought and is calibrated for reasoning-heavy benchmarks (AIME, GPQA, code). With reasoning off, the model emits short responses and is calibrated for low-latency chat use.
+
+**Why a toggle.** The trade-off Module 5 § 05a and the GPT-5.2 mode design (§ 06a) both name: reasoning is expensive at inference time, and not every query benefits. Qwen3 is the most explicit open-weights instantiation of the trade-off — a single weight set, two inference behaviours, user-controllable.
+
+**Implementation hints.** Qwen3's hybrid mode is not documented in detail. Public evidence suggests it is trained via a curriculum that mixes reasoning-style and non-reasoning-style targets, with the mode signal acting as a condition on the response distribution. The architecture is the standard MoE Transformer; only the post-training is mode-aware.
+
+**Thinking budget.** Qwen3 also exposes a *thinking budget* parameter — the maximum length of the reasoning chain. The mechanism is the explicit version of the implicit budget OpenAI's o-series exposes via the o3-mini low/medium/high tiers.
+
+The toggle is the practical adaptation to a key tension across 2025–2026: production users want reasoning when it helps but pay-for-it latency and cost when it doesn't.
+
+---
+
+## Vision and math variants {#vision-and-math-variants}
+
+**Qwen-VL line.** Qwen-VL → Qwen2-VL → Qwen2.5-VL → Qwen3-VL. The Qwen-VL line adds a vision encoder atop the corresponding Qwen base model. Qwen2.5-VL introduced **dynamic FPS sampling** for video (Module 0g for the tokenization side) — frame rate adapts to video content rather than being fixed — and **temporal grounding** evaluations. Qwen3-VL has reportedly matched proprietary multimodal models on document understanding benchmarks (Chinese-language and English-language) at smaller scale.
+
+**Qwen2.5-Math.** A math-specialised variant of Qwen2.5 with tool-integrated reasoning (TIR): the model can emit a code-execution token to run a computation step before continuing the chain of thought. The TIR pattern is the same primitive Module 3 § 03h covers under tool-use post-training. Qwen2.5-Math reaches AIME-2024 ~35% at the 72B scale with TIR enabled, far surpassing the base Qwen2.5 72B's ~16%.
+
+**QwQ-32B.** A reasoning-specialised model trained from a Qwen2.5-32B base with outcome-reward RL (Module 3 § 03f). The release demonstrated that a 32B model with outcome RL could match DeepSeek-R1 (671B base) on several reasoning benchmarks — providing a smaller-footprint, open-weights alternative to R1 for academic and on-device reasoning. QwQ-32B is one of the most-cited open-weights reasoning models of 2025.
+
+---
+
+## QwQ line {#qwq-line}
+
+The **QwQ (Qwen-with-Questions) line** is the Qwen team's reasoning specialisation track:
+
+- **QwQ-32B (November 2024).** The original. 32B parameters; reasoning RL on a Qwen2.5-32B base. Headline numbers: AIME-2024 ~50%, MATH-500 ~90%, both competitive with DeepSeek-R1-Distill-Qwen-32B and substantially above QwQ's non-reasoning Qwen2.5 base.
+- **QwQ variants** continued into 2025 with Qwen3-Thinking — the reasoning-mode-enabled flagship Qwen3 — effectively absorbing the QwQ line into the Qwen3 mainline with the hybrid toggle.
+
+The QwQ → Qwen3-Thinking arc is the Qwen team's lineage decision: rather than maintain a separate reasoning model family long-term, integrate reasoning into the main line with a runtime toggle. Compare DeepSeek's V3 / R1 separation (still distinct lines as of V3.2) and OpenAI's GPT-5 absorption of o-series (GPT-5.2 mode toggle, § 06a).
+
+---
+
+## Post-training recipe {#post-training-recipe}
+
+The Qwen post-training pipeline is documented at greater detail than most frontier labs; the lab's adoption of **Tülu-3-style** training is explicit in the Qwen3 technical materials. The four-stage pipeline:
+
+1. **SFT.** Large supervised mixture combining helpfulness, code, math, and tool-use demonstrations.
+2. **DPO.** Direct Preference Optimization on a preference dataset. Module 3 § 03b for the algorithm.
+3. **RLVR.** Verifier-reward RL on math and code tasks where ground truth is available. Module 3 § 03e.
+4. **Multi-objective RL.** Combining helpfulness, harmlessness, instruction-following rewards.
+
+The pipeline is recognisably the same as Meta's Llama 3.1 iterative-DPO recipe (§ 06d), AI2's Tülu 3 (the published reference), and DeepSeek-R1's four-stage R1 recipe (§ 06e). The convergence of post-training recipes across labs is one of the dominant themes of the 2025–2026 frontier-LLM landscape — Module 3 covers this in detail.
+
+---
+
+## Open-weights cadence {#open-weights-cadence}
+
+Qwen ships under the Apache 2.0 license for most variants (some larger variants under a Qwen-specific license that is broadly Apache-compatible). The release cadence in 2024–2026:
+
+| Date | Release | Variants |
+|---|---|---|
+| Jun 2024 | Qwen2 | 0.5B/1.5B/7B/57B-MoE/72B |
+| Sep 2024 | Qwen2.5 | 0.5B/1.5B/3B/7B/14B/32B/72B base + Instruct |
+| Sep 2024 | Qwen2.5-Coder | 1.5B/7B/32B |
+| Nov 2024 | Qwen2.5-Math, QwQ-32B | math + reasoning specialists |
+| Jan 2025 | Qwen2.5-VL | vision-language refresh |
+| Apr 2025 | Qwen3 | 0.6B–480B-A35B |
+| 2025+ | Qwen3-VL, Qwen3-Embedding, point-version refreshes | continuous |
+
+Five major releases plus a dozen specialised variants in 12 months. Comparison: Meta released Llama 3.0, 3.1, 3.2, 3.3 across April–December 2024 (four releases) and Llama 4 in April 2025 (one major release in 2025). DeepSeek released V2 (May 2024), V3 (December 2024), R1 (January 2025), V3.2 (October 2025) — four major releases across 18 months. Qwen's cadence is faster than either, optimised for open-weights ecosystem velocity.
+
+---
+
+## Disclosed evaluations {#evals-disclosed}
+
+| Model | MMLU | GPQA Diamond | AIME-2024 | HumanEval | LiveCodeBench | Context |
+|---|---|---|---|---|---|---|
+| Qwen2 72B | 84.2% | — | — | — | — | 128K |
+| Qwen2.5 72B | 86.8% | ~46% | ~16% | ~83% | — | 128K (1M variant) |
+| QwQ-32B | — | ~58% | ~50% | — | ~62% | 128K |
+| Qwen3-235B-A22B | ~89% | ~62% | ~75% (Thinking) | ~88% | ~72% | 128K |
+| Qwen3-480B-A35B | ~90% | ~64% | ~78% (Thinking) | ~89% | ~75% | 128K |
+
+The Qwen3-Thinking variants are competitive with DeepSeek-R1 on AIME and surpass DeepSeek-V3 on knowledge benchmarks. The 480B-A35B flagship is the largest open-weights model from Qwen and sits in the same total-parameter range as DeepSeek-V3 (671B/37B) and Llama 4 Maverick (400B/17B).
+
+Cross-reference: Module 5 § 05a for benchmark families. The MMLU saturation observation applies here too.
+
+---
+
+## Summary {#summary}
+
+Alibaba's Qwen line is the open-weights frontier release with the fastest cadence (5+ major versions plus a dozen specialised variants in 12 months), the widest multilingual coverage (~119 languages in Qwen3), and the most explicit production-oriented design choices (hybrid reasoning toggle, thinking budgets, TIR for math). Architecturally, Qwen is conservative — standard MoE Transformer with the now-canonical GQA / RoPE / SwiGLU / RMSNorm stack — and trains at scales comparable to DeepSeek and Llama 4 (235B–480B MoE flagships). The team's contribution to the broader frontier-LLM field is *operational*: a sustained, fast-cadence open-weights release programme with detailed model cards and a comprehensive specialist-variant ecosystem.
+
+For a reader of earlier modules: Qwen's architecture ↔ Module 0 throughout; the hybrid-reasoning toggle ↔ Module 3 § 03f; the four-stage post-training pipeline ↔ Module 3 §§ 03a–03e; Qwen2.5-Math's TIR ↔ Module 3 § 03h. The Qwen line is one of the cleanest substrates on which to study modern open-weights frontier-LLM practice end-to-end.
+
+Two empirical anchors as of May 15 2026: Qwen3-480B-A35B (the production flagship, frontier-tier on knowledge and reasoning benchmarks) and Qwen3-32B with reasoning mode enabled (a small-footprint reasoning model widely used in academic interpretability work). Open questions: full training-data composition (Qwen has not published a full Llama-3.1-style technical report), the exact hybrid-toggle training procedure, and the relationship between Qwen3-Thinking and the discontinued QwQ line.
+
+<Sources items={[
+  { authors: "Qwen Team", year: 2024, title: "Qwen2 Technical Report", venue: "arXiv:2407.10671", url: "https://arxiv.org/abs/2407.10671", note: "Foundational Qwen2 report; architecture and benchmarks." },
+  { authors: "Qwen Team", year: 2024, title: "Qwen2.5: Foundation Models for Multilingual Tasks", venue: "arXiv:2412.15115", url: "https://arxiv.org/abs/2412.15115", note: "Qwen2.5 release; 18T-token training, expanded context." },
+  { authors: "Qwen Team", year: 2024, title: "Qwen2.5-Math Technical Report", venue: "arXiv:2409.12122", url: "https://arxiv.org/abs/2409.12122", note: "Math specialist with TIR." },
+  { authors: "Qwen Team", year: 2025, title: "Qwen2.5-VL Technical Report", venue: "arXiv:2502.13923", url: "https://arxiv.org/abs/2502.13923", note: "Vision-language refresh; dynamic FPS sampling, temporal grounding." },
+  { authors: "Qwen Team", year: 2025, title: "Qwen3 Technical Report", venue: "arXiv:2505.09388", url: "https://arxiv.org/abs/2505.09388", note: "Qwen3 release; hybrid reasoning mode; 36T-token training, 119 languages." },
+  { authors: "Qwen Team", year: 2024, title: "QwQ-32B: Reflect Deeply on the Boundary of Knowledge", venue: "qwenlm.github.io", url: "https://qwenlm.github.io/blog/qwq-32b-preview/", note: "QwQ-32B reasoning-RL release." },
+  { authors: "Qwen Team", year: 2025, title: "Qwen3 Hybrid Reasoning blog post", venue: "qwenlm.github.io", url: "https://qwenlm.github.io/blog/qwen3/", note: "Reasoning toggle mechanism." },
+  { authors: "AI2 (Allen Institute)", year: 2024, title: "Tülu 3: Pushing Frontiers in Open Language Model Post-Training", venue: "arXiv:2411.15124", url: "https://arxiv.org/abs/2411.15124", note: "Reference post-training pipeline; basis for Qwen's pipeline." },
+  { authors: "Qwen team / GitHub", year: 2025, title: "Qwen3 GitHub repository", venue: "github.com/QwenLM", url: "https://github.com/QwenLM/Qwen3", note: "Public weights, inference code, model cards." },
+  { authors: "Hugging Face", year: 2025, title: "Qwen3 model collection", venue: "huggingface.co", url: "https://huggingface.co/Qwen", note: "Public weights distribution." },
+  { authors: "vLLM project", year: 2025, title: "Qwen2/Qwen3 deployment in vLLM", venue: "blog.vllm.ai", url: "https://blog.vllm.ai/2025/04/qwen3-deployment", note: "Reference deployment integration." },
+  { authors: "Ollama", year: 2025, title: "Qwen3 on Ollama", venue: "ollama.com", url: "https://ollama.com/library/qwen3", note: "On-device deployment indicator." },
+  { authors: "Stanford CRFM", year: 2025, title: "Foundation Model Transparency Index: Qwen entries", venue: "crfm.stanford.edu", url: "https://crfm.stanford.edu/fmti/", note: "Independent transparency assessment." },
+]} />

@@ -1,0 +1,196 @@
+---
+slug: 06c-google-deepmind
+title: Google DeepMind — Gemini, Gemma, Veo, AlphaProof
+description: Gemini 1.5 → 3.1 frontier line, the Gemma open-weights family, Veo / Imagen multimodal stack, AlphaProof and AlphaGeometry, the Frontier Safety Framework, and Gemini Robotics.
+order: 57
+chapter: 57
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 28
+depends_on: [06b-anthropic]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Google DeepMind's frontier portfolio is the broadest of any lab. The flagship Gemini line (proprietary, frontier-scale, native multimodal), the Gemma open-weights line (Apache 2.0, on-device-deployable, frontier-tier at 31B), the specialised multimodal systems (Veo for text-to-video with native audio, Imagen for text-to-image), the formal-mathematics agents (AlphaProof, AlphaGeometry 2), the embodied-AI stack (Gemini Robotics), and the public Frontier Safety Framework governance document together span reasoning, perception, action, and policy. The cadence is fast — five major Gemini releases (1.5 → 2.0 → 2.5 → 3.0 → 3.1) across 2024–2026, roughly a 6-month rhythm — and the strategy pairs frontier proprietary models with permissively-licensed open weights at a scale Meta did not match.
+
+This chapter is calibrated to Google DeepMind's public disclosures through May 15, 2026.
+
+---
+
+## Gemini family tree {#gemini-family-tree}
+
+**Gemini 1.5 (February 2024)** was the watershed release: a 10M-token native multimodal sparse Mixture-of-Experts model. The headline capability was the context window — an order of magnitude longer than Claude 2.1's 200K and GPT-4 Turbo's 128K — with retrieval accuracy of $>$ 99% on needle-in-haystack probes at the full 10M. The architecture combined a sparse MoE backbone with RoPE-based long-context attention and modality-specific tokenizers (Module 0c attention variants; Module 0h MoE plumbing).
+
+**Gemini 2.0 (December 2024 – February 2025).** Three variants: 2.0 Flash Experimental (December 2024), 2.0 Flash GA (January 2025, the new default), 2.0 Pro (February 2025). The release emphasised agentic capabilities — real-time multimodal API (audio/video in, audio/video/text out), native image generation, integrated Google Search — and 2× speedup over 1.5 Pro. Context dropped from 10M back to 100K–200K standard; the 10M capability remained available but became a specialty endpoint. The shift signals DeepMind's read that 10M solved a real but niche use case.
+
+**Gemini 2.5 Pro (May 2025).** Rebalance: 1M-token context as production standard, ~90% MMLU, ~78% SWE-bench Verified. Pricing settled at $1.25 per million input tokens and $10 per million output — premium for the line, standard for the frontier tier. The 2M-token roadmap was disclosed but not yet shipped as of May 15 2026.
+
+**Gemini 3 series (November 2025 onward).** Three-phase rollout: Gemini 3 Pro (November 2025) introduced enhanced reasoning; Gemini 3 Flash (December 2025) became the new app default at $0.50/$3 per million tokens (undercutting 2.5 Flash); Gemini 3.1 Pro Preview and 3.1 Flash-Lite Preview followed in 2026. The headline benchmark shift: MMMU-Pro (multimodal reasoning) became the lead metric — Gemini 3 Flash scored 81.2% versus GPT-5.1's 76%. MMLU-Pro across the line plateaued at 88–91%, consistent with the saturation Module 5 § 05a documents.
+
+**Cadence summary.** ~6-month gap between major versions (1.5 → 2.0: 10 months, 2.0 → 2.5: 5 months, 2.5 → 3.0: 6 months), with minor variants (Flash-Lite, Pro, Experimental) at ~2-month intervals.
+
+---
+
+## Long context: 10M tokens {#long-context-10m}
+
+Gemini 1.5's 10M context remains the largest disclosed production context window as of May 2026. The combined techniques:
+
+1. **Sparse MoE.** Only ~10–20% of parameters activate per token, keeping compute roughly constant as total parameters grow. Module 0h covers the MoE landscape; Gemini's MoE is the canonical native-multimodal MoE deployment.
+2. **RoPE-based attention scaling**, including the proprietary iRoPE variant (interpolated/contextualised RoPE). The technique extends rotary embeddings beyond training length without retraining — the same family covered in Module 0c.
+3. **Block-local and strided attention** for the $O(n^2)$ scaling problem at the extreme context end.
+
+Empirical needle-in-haystack accuracy: $>$ 99% at 10M tokens. Comparable Claude 2.1 (200K) reports ~90–95% at the limit; GPT-4 Turbo (128K) degrades past 100K per OpenAI's own disclosures.
+
+**Production trade-offs.** 10M contexts incur ~2–3× inference latency versus 128K contexts and require streaming APIs. Most Gemini 2.0+ traffic uses 100K–1M contexts; the 10M capability is reserved for full-codebase reasoning, multi-hour video transcription, long-form legal/medical document analysis. By 2026 the headline-feature value had decayed and DeepMind's emphasis moved to *retrieval quality* (dense, relevant context) and *reasoning efficiency* (same answer with fewer tokens).
+
+**iRoPE.** No standalone paper has been published as of May 2026; the technique is partially disclosed in the Gemini 1.5 technical report (arXiv:2403.05530) and later blog posts. The essential idea — angle-scaling RoPE's phase-based distance encoding — is now standard practice across frontier labs.
+
+---
+
+## Multimodal stack: native fusion, Veo, Imagen {#multimodal-stack}
+
+Gemini's multimodal design uses **native modality fusion** rather than the text-as-lingua-franca pattern. Distinct tokenizers handle audio (learned vector quantization), video (3D spatiotemporal patches), images (2D patches + learned position embeddings), and text (BPE). All feed into the same sparse MoE Transformer, allowing interleaved sequences (text + image + text + audio) in a single forward pass. Attention masks enforce temporal/spatial coherence.
+
+**Audio.** Raw waveform → log-mel spectrogram → learnable VQ codec → tokens. Up to 107 hours of audio fit in the 10M context, an order of magnitude beyond what discrete audio tokenizers like Encodec deliver per second.
+
+**Video.** Frames sampled at 1–10 fps, patch-embed + temporal convolution → spatiotemporal tokens. 10.5 hours of video at ~1 token per 0.5 seconds — efficient relative to frame-by-frame processing.
+
+**Veo (text-to-video).**
+
+- **Veo (2024).** Text-to-video via latent diffusion (spatial-temporal latents) + guidance. ~30 seconds.
+- **Veo 2 (December 2024).** 4K resolution, 2+ minute duration, transformer-based latent diffusion.
+- **Veo 3 (May 2025).** Native audio synthesis in the same generation pass — dialogue, SFX, and ambient sound synchronised via joint audio-visual latent diffusion.
+
+**Imagen (text-to-image).**
+
+- **Imagen / Imagen 2 (2022 / 2023).** Diffusion text-to-image foundations.
+- **Imagen 3 (late 2024).** Deeper Gemini 2.0 integration, watermarking, safety classifiers.
+
+Both Veo and Imagen operate as specialised decoders within the Gemini ecosystem: Gemini emits text embeddings or latent codes, the decoder generates media. This modular architecture (vs end-to-end models like Sora that train video generation into the primary model) allows independent updates without retraining the core LLM.
+
+---
+
+## Gemma open-weights line {#gemma-open-weights}
+
+Gemma is DeepMind's Apache-2.0 open-weights line, released alongside Gemini to democratise frontier capabilities. Unlike Llama, Gemma integrates lessons from Gemini pretraining and maintains parity with frontier models at smaller scales.
+
+**Gemma 2 (June 2024).** 2B / 9B / 27B parameter variants. Trained on ~8T tokens. The 27B variant reached competitive MMLU at ~70–75%.
+
+**Gemma 3 (March 2025).** 1B / 4B / 12B / 27B variants. Multimodal (text + image input). 140+ language coverage. Gemma 3 27B at ~80% MMLU.
+
+**Gemma 4 (April 2026).** The most significant open-weights release of 2026 so far. Introduced both dense and MoE variants: 2B dense (E2B effective), 4B dense (E4B), 26B MoE, 31B dense. The 31B dense was ranked #3 on the Chatbot Arena leaderboard at release; the 26B MoE #6 — both with strong per-parameter performance claims relative to predecessors. Explicitly marketed for "reasoning" and "agentic workflows", signalling DeepMind's intent to compete with Llama 4 and the Qwen3 line. Context: 8K–16K (smaller than Gemini but standard for open weights).
+
+**Strategic purpose.** Gemma plays three roles. First, *research testbed* — publishing internals at small scale supports reproducibility. Second, *product feeder* — Gemma is deployed in Android, Chrome, and on-device systems. Third, *market positioning* — Gemma 4 31B competing with proprietary models at smaller scales reinforces Gemini's positioning at frontier scale.
+
+Gemma uses the same training infrastructure as Gemini (JAX/XLA, similar tokenizers) at smaller scale. The cross-reference is Module 1 (pretraining) for the training recipe side; this section is the released-artefact side.
+
+---
+
+## Frontier Safety Framework {#fsf-v2}
+
+The **Frontier Safety Framework (FSF)** is DeepMind's pre-deployment safety governance document. Three published versions to date: v1.0 (early 2024), v2.0 (February 2025), v3.0 (late 2025).
+
+**Critical Capability Levels (CCLs).** The framework defines per-risk-domain capability thresholds; reaching a CCL requires mitigation before further development or deployment. Domains tracked:
+
+- **CBRN.** Chemical, biological, radiological, nuclear weapons enablement.
+- **Cyber.** Cyberattack enablement, including malware authoring and zero-day discovery.
+- **ML R&D.** AI self-improvement: ability to materially accelerate ML research.
+
+**Mechanisms.**
+
+- **Early-warning evaluations.** Run regularly during training to detect approach to CCLs *before* the model reaches them, enabling intervention.
+- **Deployment mitigations.** Tiered access controls, real-time classifiers for adversarial inputs, output monitoring, post-incident analysis.
+- **External review.** v2.0 onward includes a commitment to external expert review on Critical-capability determinations.
+
+**v3.0 (late 2025).** Expanded risk domains; refined CCL thresholds; clarified the relationship between Critical Capability Levels and deployment authorisation.
+
+Comparison: OpenAI Preparedness Framework v2 (§ 06a) targets five risk categories with High/Critical thresholds; Anthropic RSP v3.2 (§ 06b) uses ASL levels; DeepMind FSF uses CCLs per-domain. The three frameworks converge on the same structure — capability thresholds + mitigation requirements + external review — under different vocabularies. Module 5 § 05g compares them in detail.
+
+---
+
+## AlphaProof and AlphaGeometry {#alphaproof-alphageometry}
+
+DeepMind's formal-mathematics line is the clearest demonstration that frontier reasoning need not be all-LLM. Both AlphaProof and AlphaGeometry 2 combine LLMs with symbolic engines.
+
+**AlphaProof (February 2025).** Reinforcement-learning agent for formal theorem proving in Lean. AlphaProof generates candidate proofs, the Lean kernel verifies them (exact, not probabilistic), and the policy is updated by RL on verified-vs-rejected proofs. The release demonstrated test-time RL — additional RL on the specific problem at inference — for hardest problems.
+
+**IMO 2024 result.** AlphaProof solved 3 of 6 problems at silver-medal level, with AlphaGeometry 2 contributing 1 additional problem, for a combined 4/6. The cutoff for an IMO silver medal in 2024 was ~28 points; the combined system scored at that threshold.
+
+**AlphaGeometry 2 (July 2024).** Hybrid LLM + symbolic geometry engine. The LLM produces auxiliary constructions and the symbolic engine verifies geometric deductions. Historical-IMO geometry-problem solve rate: ~83%, substantially exceeding the original AlphaGeometry's ~75%.
+
+**Pedagogical significance.** Both systems show that LLMs alone are not the only path to mathematical reasoning. The hybrid architecture (LLM proposes, symbolic engine verifies) achieves capabilities pure LLMs struggle with, while using LLMs precisely where they are strong (natural-language-style intuition for construction proposals). This is the formal-mathematics analogue of RLVR's verifier-reward pattern in Module 3 § 03e.
+
+---
+
+## Gemini Robotics {#robotics-gemini}
+
+**Gemini Robotics (March 2025 onward).** Vision-language-action (VLA) model line built on Gemini 2.0. The output modality is robot actions — joint angles, gripper commands — rather than text or images. Trained on the ALOHA 2 bimanual manipulation platform and Apollo humanoid demonstrations.
+
+**Capabilities.** Fine motor control on real-world tasks: origami, packing fragile items, folding laundry. The model reasons about the scene (vision) and the task (language) jointly, then emits actions.
+
+**On-device deployment (2025–2026).** Gemini Robotics models can run on-device — important for latency-sensitive robot control where round-trips to cloud inference are infeasible.
+
+**Gemini Robotics-ER (Embodied Reasoning).** A variant focused on the reasoning side rather than fine motor control. Used in research contexts for long-horizon planning.
+
+The robotics line is DeepMind's most concrete demonstration that frontier LLMs extend beyond text outputs. Cross-reference to RT-2 (2023) for the VLA precursor.
+
+---
+
+## Disclosed evaluations {#evals-disclosed}
+
+Headline benchmark numbers across the Gemini line as of May 2026:
+
+| Model | MMLU | MMLU-Pro | MMMU-Pro | SWE-bench Verified | LiveCodeBench | NIAH (long-context) |
+|---|---|---|---|---|---|---|
+| Gemini 1.5 Pro | ~85% | — | — | — | — | >99% @ 10M |
+| Gemini 2.0 Flash | ~80% | — | — | — | — | — |
+| Gemini 2.5 Pro | ~90% | ~85% | — | ~78% | — | — |
+| Gemini 3 Pro | — | ~90% | — | — | — | — |
+| Gemini 3 Flash | — | 88% | 81.2% | — | — | — |
+| Gemini 3.1 Pro Preview | — | 90.99% | — | — | — | — |
+
+**Gemma 4 (Arena).** 31B dense ranked #3, 26B MoE #6 on the Chatbot Arena leaderboard at release (April 2026).
+
+**Pricing (May 2026 snapshot).**
+
+| Model | $/M input | $/M output |
+|---|---|---|
+| Gemini 2.5 Pro | $1.25 | $10 |
+| Gemini 3 Flash | $0.50 | $3 |
+| Gemini 3 Pro | ~$2.50 | ~$15 |
+
+Cross-reference: Module 5 § 05a for the benchmark families themselves; § 05c for Arena methodology.
+
+---
+
+## Summary {#summary}
+
+Google DeepMind's frontier portfolio is the most architecturally diverse among the May 2026 labs. Native multimodal MoE Gemini at frontier scale (1.5 → 3.1), the Gemma open-weights family at smaller scale (2 → 4), specialised multimodal decoders (Veo, Imagen), formal-math hybrid systems (AlphaProof, AlphaGeometry 2), embodied VLA (Gemini Robotics), and a published Frontier Safety Framework. The cadence is ~6 months between major releases, and the strategy pairs proprietary frontier models with permissively-licensed open weights at a scale Meta's Llama line did not match in 2026.
+
+For a reader of earlier modules: Gemini's sparse MoE ↔ Module 0h and Module 2d (expert parallelism). 10M-context iRoPE ↔ Module 0c and Module 1g (long-context extension). Native multimodal tokenization ↔ Module 0g. AlphaProof's verifier-reward RL ↔ Module 3 § 03e (RLVR). Gemini Robotics ↔ Module 3 § 03h (agentic post-training, broadly). FSF ↔ Module 5 § 05g (red-teaming and safety frameworks).
+
+The two empirical anchors as of May 15 2026 are Gemini 3.1 Pro Preview (90.99% MMLU-Pro, frontier reasoning) and Gemini 3 Flash (81.2% MMMU-Pro, $0.50/$3 per million tokens). Open questions: full iRoPE parameterisation, Gemini's exact MoE configuration, and the unpublished training-data composition shared across Gemini and Gemma.
+
+<Sources items={[
+  { authors: "Google DeepMind", year: 2024, title: "Introducing Gemini 1.5", venue: "blog.google", url: "https://blog.google/technology/ai/google-gemini-next-generation-model-february-2024/", note: "10M-token release; native multimodal MoE." },
+  { authors: "Google DeepMind", year: 2024, title: "Gemini 1.5 Technical Report", venue: "arXiv:2403.05530", url: "https://arxiv.org/abs/2403.05530", note: "Long-context architecture; RoPE scaling; benchmark results." },
+  { authors: "Google", year: 2024, title: "Introducing Gemini 2.0", venue: "blog.google", url: "https://blog.google/technology/google-deepmind/google-gemini-ai-update-december-2024/", note: "2.0 Flash Experimental release; agentic capabilities." },
+  { authors: "Google", year: 2025, title: "Gemini 2.0 Pro and Flash", venue: "blog.google", url: "https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-january-2025/", note: "January 2025 default; 2× speedup over 1.5 Pro." },
+  { authors: "Google", year: 2025, title: "Gemini 2.5 Pro", venue: "blog.google", url: "https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-march-2025/", note: "1M-token production standard; SWE-bench 78%." },
+  { authors: "Google", year: 2025, title: "Gemini 3 Pro and Flash", venue: "blog.google", url: "https://blog.google/products/gemini/gemini-3-pro/", note: "Gemini 3 series launch; MMMU-Pro 81.2% on 3 Flash." },
+  { authors: "Google DeepMind", year: 2024, title: "Frontier Safety Framework v1.0", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/introducing-the-frontier-safety-framework/", note: "First public FSF; CCLs across CBRN, cyber, ML R&D." },
+  { authors: "Google DeepMind", year: 2025, title: "Frontier Safety Framework v2.0", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/frontier-safety-framework-v2/", note: "Refined CCLs; early-warning evaluation protocols." },
+  { authors: "Google DeepMind", year: 2025, title: "Frontier Safety Framework v3.0", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/frontier-safety-framework-v3/", note: "Expanded risk domains." },
+  { authors: "Google DeepMind", year: 2025, title: "AlphaProof: Solving IMO problems with Lean", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/ai-solves-imo-problems-at-silver-medal-level/", note: "Test-time RL on formal theorem proving; silver-medal IMO 2024." },
+  { authors: "Google DeepMind", year: 2024, title: "AlphaGeometry 2", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/alphageometry-an-olympiad-level-ai-system-for-geometry/", note: "Hybrid LLM + symbolic geometry; 83% historical IMO geometry solve rate." },
+  { authors: "Google DeepMind", year: 2025, title: "Gemini Robotics", venue: "deepmind.google", url: "https://deepmind.google/discover/blog/gemini-robotics-brings-ai-into-the-physical-world/", note: "VLA model line on Gemini 2.0; on-device deployment." },
+  { authors: "Google DeepMind", year: 2024, title: "Gemma 2", venue: "blog.google", url: "https://blog.google/technology/developers/google-gemma-2/", note: "2B / 9B / 27B open-weights release." },
+  { authors: "Google DeepMind", year: 2025, title: "Gemma 3", venue: "blog.google", url: "https://blog.google/technology/developers/gemma-3/", note: "Multimodal Gemma; 140+ language coverage." },
+  { authors: "Google DeepMind", year: 2026, title: "Gemma 4", venue: "blog.google", url: "https://blog.google/technology/developers/gemma-4/", note: "Dense + MoE variants; Arena #3 (31B dense) and #6 (26B MoE)." },
+  { authors: "Google DeepMind", year: 2024, title: "Veo: text-to-video", venue: "deepmind.google", url: "https://deepmind.google/technologies/veo/", note: "Latent-diffusion text-to-video." },
+  { authors: "Google DeepMind", year: 2025, title: "Veo 3 with native audio", venue: "deepmind.google", url: "https://deepmind.google/technologies/veo-3/", note: "Joint audio-visual latent diffusion." },
+  { authors: "Google", year: 2024, title: "Imagen 3", venue: "blog.google", url: "https://blog.google/technology/developers/imagen-3/", note: "Diffusion text-to-image; Gemini 2.0 integration." },
+]} />

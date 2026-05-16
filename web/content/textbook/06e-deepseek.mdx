@@ -1,0 +1,167 @@
+---
+slug: 06e-deepseek
+title: DeepSeek — V2, V3, R1, V3.2
+description: MLA, auxiliary-loss-free MoE, DualPipe, the FP8 training recipe, GRPO + cold-start reasoning RL, V3.2 hybrid sparse attention, and the wide-EP inference deployment.
+order: 59
+chapter: 59
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 30
+depends_on: [06d-meta-llama]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+DeepSeek is the frontier lab whose architectural and training innovations had the largest spill-over on the rest of the field across 2024–2025. The V2 → V3 → R1 → V3.2 sequence introduced (or first deployed at scale) Multi-Head Latent Attention (MLA), auxiliary-loss-free MoE routing, DualPipe zero-bubble pipeline parallelism, FP8 *pretraining* (not just inference), GRPO reasoning RL, and a wide-expert-parallelism inference architecture that became the reference for 2025-era frontier serving. Every one of these techniques is cross-referenced from earlier modules of this textbook; this chapter is the case-study walkthrough at the lab level.
+
+Calibration: May 15, 2026. The chapter covers V2 (May 2024) through V3.2 (October 2025) and notes the R2 / V4 roadmap status.
+
+<Callout variant="note" title="DeepSeek's disclosure pattern">
+DeepSeek is the inverse of Anthropic and OpenAI on disclosure: full architectural details (parameter counts, MoE configurations, training recipes, FP8 specifics, DualPipe schedules) are published in tech reports and open-weights releases under permissive licenses; safety governance is comparatively under-discussed. The lab releases on arXiv (DeepSeek-V2 arXiv:2405.04434, V3 arXiv:2412.19437, R1 arXiv:2501.12948, V3.2 arXiv:2410.21276 and successors) and on GitHub (github.com/deepseek-ai). For frontier-LLM pretraining and inference research, DeepSeek's papers are the most-cited primary sources of the 2024–2026 period.
+</Callout>
+
+---
+
+## V2 and MLA {#v2-mla-architecture}
+
+**DeepSeek-V2 (May 2024).** 236B total parameters, 21B activated per token, 160 experts, 128K-context training. The headline architectural contribution was **Multi-Head Latent Attention (MLA)** — a substantially KV-cache-compressed variant of multi-head attention.
+
+**MLA mechanism.** Standard multi-head attention caches a K and V tensor per layer per token of size $L \cdot H \cdot d_h$ bytes (Module 4 § 04a). MLA compresses the cached K and V via a low-rank projection: queries are computed normally, but the cached state is the *latent* low-rank representation (typically dimension $d_c \ll H \cdot d_h$), and K and V are reconstructed at attention time. The trick is to choose the projection so that the rotary positional encoding still applies correctly — MLA decouples RoPE-handled components from the latent-compressed components, applying RoPE only to a small per-head residual.
+
+**KV-cache savings.** MLA's published KV cache size is 4–14% of standard multi-head attention's, varying by configuration. At long context this is the dominant memory cost; MLA effectively makes 128K-context inference economical at the V2 / V3 parameter scale.
+
+Cross-reference: Module 0c (attention variants) covers MLA alongside MHA, MQA, and GQA; Module 4a (KV cache) covers the inference-time savings. MLA was the basis on which V3 and R1 could later achieve their cost profiles.
+
+**V2 also disclosed** DeepSeek-MoE's auxiliary-loss-free routing (see V3 section below for the full description, which V2 introduced in preliminary form) and the lab's pretraining-data filtering pipeline (Module 1 § 01a is the cross-reference).
+
+---
+
+## V3 architecture {#v3-architecture}
+
+**DeepSeek-V3 (December 2024).** 671B total parameters, 37B activated per token, 256 experts (in the MoE blocks). Trained on 14.8T tokens. The release was the year's most technically detailed frontier-model paper.
+
+**Auxiliary-loss-free MoE routing.** The standard MoE routing loss (Module 0h) combines a per-token expert probability with an *auxiliary load-balancing loss* that penalises unbalanced expert utilisation. DeepSeek-V3 replaces the auxiliary loss with a per-expert bias that is dynamically adjusted across training based on expert load — overloaded experts get a negative bias, underloaded experts a positive bias — so the routing is balanced without an auxiliary gradient signal. Reported benefit: cleaner routing, reduced training instability, no aux-loss-weight hyperparameter to tune.
+
+**FP8 pretraining.** V3 is the first frontier-scale model trained in FP8 throughout pretraining — most prior frontier models used BF16 (Llama 3.1) or FP16 with FP8 only at inference. The recipe uses block-wise scaling (per-block dynamic range adjustment) to keep numerical stability across the very different magnitude regimes of frontier-model activations. The result: ~2× training-throughput improvement versus a BF16 baseline at the same compute. Module 1 § 01h covers the broader FP8-stability story; § 02g covers the mixed-precision side.
+
+**Multi-Token Prediction (MTP) auxiliary objective.** V3 added a small auxiliary head predicting the *next* token along with the standard next-token loss. This adds a small per-step training signal that, in aggregate, improves both training efficiency and downstream agentic / code performance.
+
+**MLA continued from V2.** V3's KV cache uses the V2 MLA configuration, scaled up.
+
+**Parallelism.** V3 used a 4D parallelism stack: pipeline × tensor × expert × data parallel, with the pipeline portion using DualPipe (next section).
+
+---
+
+## DualPipe and zero-bubble pipeline parallelism {#dualpipe}
+
+**DualPipe** is DeepSeek's pipeline-parallel scheduler introduced in V3. The standard 1F1B / GPipe pipeline schedule (Module 2 § 02c) has a "bubble" — a fraction of GPU idle time at the start and end of every microbatch. DualPipe is a zero-bubble schedule that uses both forward and backward computation directions simultaneously: half the pipeline runs forward while the other half runs backward, so no GPU is ever idle.
+
+**Why this matters for MoE.** MoE training has the additional problem of expert-routing communication overhead — tokens have to be dispatched to and gathered from non-local experts via all-to-all collectives (Module 2 § 02d expert parallelism). DualPipe is designed to overlap this all-to-all dispatch with computation, hiding the expert-routing latency behind useful work.
+
+**Reported gain.** DeepSeek-V3 achieved near-perfect compute utilisation across the pipeline at 2,048 H800 GPUs (the constrained-export hardware DeepSeek had access to), substantially exceeding the throughput of standard 1F1B schedules at the same scale.
+
+Module 2 § 02c covers the full pipeline-parallel landscape, including DualPipe alongside GPipe, 1F1B, interleaved schedules, and zero-bubble alternatives. The DeepSeek-specific cross-reference is that DualPipe is the published scheduler enabling V3's training-cost profile.
+
+---
+
+## R1 and reasoning RL {#r1-reasoning}
+
+**DeepSeek-R1 (January 2025).** The lab's reasoning model line, built on a V3 base. R1 is the lineage that introduced **GRPO (Group Relative Policy Optimization)** to frontier-scale post-training. Module 3 § 03f covers GRPO algorithmically; this section is the R1-specific story.
+
+**R1-Zero.** Trained with pure RL (no SFT cold-start) on a V3 base, using verifier rewards (math problem answers) and GRPO. The headline finding: R1-Zero developed long chain-of-thought reasoning capabilities without any supervised reasoning demonstrations. The model learned to *think* through problems by RL-credit assignment on outcome-correct rollouts. This is the empirical demonstration that long CoT can emerge from outcome-based RL alone — a deeply influential result.
+
+**R1 (the SFT'd version).** A multi-stage pipeline: (1) cold-start SFT on a small curated reasoning dataset; (2) GRPO with outcome rewards on math/code; (3) rejection sampling + supervised fine-tuning on the GRPO-improved policy; (4) further GRPO with multi-scenario rewards (math, code, instruction-following, helpfulness). The four-stage recipe is the production R1 line, and it is the recipe many other labs subsequently followed for reasoning RL.
+
+**Benchmarks.** R1 reached AIME-2024 at ~80% (matching o1-level performance) and MATH-500 at ~97%. The cost-to-train-relative-to-published-competitors comparison was the politically resonant finding — R1's training cost was reported in the low single-digit-millions of USD by DeepSeek, an order of magnitude less than the closed competitors' alleged training budgets.
+
+**R1-Distill.** DeepSeek distilled R1's reasoning capability into Llama and Qwen base models at 1.5B–70B scale. The distilled variants were a fast adoption vector across the open-weights community: practitioners could use R1-Distill-Qwen-32B locally to approximate frontier reasoning behaviour.
+
+Cross-reference: Module 3 § 03f (reasoning RL, GRPO derivation), § 03g (process reward models — R1's indictment of PRMs, noting that pure-outcome RL outperformed PRM-guided RL in their experiments).
+
+---
+
+## V3.2 and hybrid sparse attention {#v3-2-sparse-attention}
+
+**DeepSeek-V3.2 (October 2025).** A refresh of the V3 base introducing **DeepSeek Sparse Attention (DSA)** — a hybrid sparse-attention mechanism designed to reduce long-context inference cost while retaining quality.
+
+**DSA mechanism (two-stage).**
+
+1. **Lightning indexer.** A small, fast scoring network looks at each token position and produces a relevance score against the current query position. Cost: linear in sequence length.
+2. **Token selection.** Only the top-$k$ scored tokens (typically a sublinear fraction of the full context) are passed to the standard MLA attention mechanism.
+
+The remainder of the context is effectively pruned from the attention pass; the indexer is the bandwidth-cheap mechanism that decides what to keep.
+
+**Reported gain.** V3.2 achieves 69–123% throughput improvement on long-context inference relative to V3 on the same hardware, with negligible quality regression on knowledge and reasoning benchmarks. The pattern matches the broader sparse-attention literature (Module 0c) — keeping the asymptotically expensive attention budget concentrated on the salient tokens.
+
+V3.2 is the deployment-cost successor to V3; it is the production frontier deployment as of May 2026 for DeepSeek's API endpoint.
+
+**R2 status.** As of May 15 2026, DeepSeek has signalled but not released a fully-disclosed R2. The R1 follow-up was implicitly the V3.2-based reasoning line; whether R2 is a separate release or has been absorbed into a V4 + reasoning track is unclear from public disclosures.
+
+---
+
+## Wide-EP inference deployment {#wide-ep-deployment}
+
+DeepSeek's inference deployment architecture is the reference for **wide expert parallelism** in production. Module 4 § 04h covers the deployment side; this section is the lab-specific configuration.
+
+**The configuration (V3.2-era).** 96 H800 GPUs across 12 nodes for a single inference replica. 4 nodes (~32 GPUs) handle prefill; 320 GPUs handle decode. Token throughput is reported at ~52.3k input tokens/sec and ~22.3k output tokens/sec per replica.
+
+**Why wide EP.** Standard MoE inference deployments place all 256 experts on a few GPUs and route tokens via all-to-all. At V3.2's scale this is impractical — expert weights alone exceed a single H100's HBM budget. Wide-EP distributes the experts across many GPUs in a single replica, accepting the cross-node all-to-all overhead in exchange for fitting the model at all.
+
+**Prefill-decode disaggregation.** The 4-node-prefill / 320-GPU-decode split is the disaggregation pattern Module 4 § 04h covers in detail (Splitwise, DistServe, Mooncake). DeepSeek's deployment is the largest published instance of the pattern as of May 2026.
+
+**KV-offload hierarchy.** The wide-EP deployment uses the standard four-tier KV-offload hierarchy: HBM (6 TB/s) → pinned DRAM (~100 GB/s) → host DRAM (~80 GB/s) → NVMe (~7 GB/s). KV blocks are evicted across the hierarchy as conversations age, freeing HBM for active prefill/decode work.
+
+The configuration is engineering-dense; the high-level point for this chapter is that DeepSeek's frontier-MoE inference deployment looks structurally different from a dense-model deployment (Module 4 throughout). Wide-EP is the lab-specific MoE inference signature.
+
+---
+
+## Open-weights impact {#open-weights-impact}
+
+DeepSeek's open-weights release strategy is more permissive than Llama's: V2, V3, R1, and V3.2 weights are released under MIT or similar, with no usage threshold and no output-restriction clause. This is the most-permissively-licensed frontier-scale open-weights line as of May 2026.
+
+**Adoption.** R1-Distill variants became a fast adoption vector across academic interpretability, code-assistant, and on-device communities. DeepSeek-V3-Base is now a common pretraining-foundation reference; the lab is one of the few that publishes the *base* model alongside the chat-tuned variant.
+
+**Export-control narrative.** DeepSeek operates under U.S. export restrictions on the highest-capability NVIDIA H100s; the publicly disclosed training hardware is H800 (the export-restricted variant with reduced interconnect bandwidth). The V3 paper is precise about the constraint and its workarounds (especially DualPipe, which was substantially motivated by H800's reduced cross-node bandwidth). The cost-efficiency narrative around DeepSeek's training has been politically resonant: the lab achieved frontier capability on constrained hardware at one or more orders of magnitude less reported cost than closed-lab competitors. The strategic implications are outside this textbook's scope; the technical point is that several of DeepSeek's architectural innovations (DualPipe, FP8, MLA) were designed in response to hardware constraints, not in spite of them.
+
+---
+
+## Disclosed evaluations {#evals-disclosed}
+
+| Model | MMLU | MATH-500 | AIME-2024 | HumanEval | Codeforces | Context |
+|---|---|---|---|---|---|---|
+| DeepSeek-V2 (Jun 2024) | ~78% | ~75% | — | ~78% | — | 128K |
+| DeepSeek-V3 (Dec 2024) | 88.5% | 90.2% | ~40% | 85.3% | ~1900 | 128K |
+| DeepSeek-R1 (Jan 2025) | — | 97.3% | 79.8% | — | ~2029 | 128K |
+| DeepSeek-V3.2 (Oct 2025) | ~89% | ~92% | — | ~87% | — | 128K |
+
+R1's AIME-2024 79.8% matched OpenAI o1-level reasoning capability at the time of release and is a defining benchmark for the lab. V3's MATH-500 90.2% is the dense-base anchor.
+
+Cross-reference: Module 5 § 05a for the benchmark families themselves; the saturation timeline applies here too — MMLU at 88-89% is approaching ceiling.
+
+---
+
+## Summary {#summary}
+
+DeepSeek's 2024–2025 contribution to frontier-LLM practice is disproportionate to lab size. MLA (Module 0c, 04a), auxiliary-loss-free MoE routing (Module 0h), DualPipe (Module 2c), FP8 pretraining (Module 1h, 02g), GRPO reasoning RL (Module 3f), DeepSeek Sparse Attention (Module 0c again), wide expert parallelism inference (Module 4h) — every one of these techniques is now standard or being adopted across the frontier ecosystem. The open-weights releases at frontier scale (V3 671B, R1, V3.2) and permissive licenses gave the broader community a frontier-class base to build on.
+
+For a reader of earlier modules the cross-references are exceptionally dense; DeepSeek is the lab where the architectural pieces covered in Modules 0–4 are most-fully composed in a single published recipe. The two empirical anchors as of May 15 2026 are DeepSeek-V3.2 (the production frontier model: ~89% MMLU, hybrid sparse attention, wide-EP deployment) and DeepSeek-R1 (the reasoning anchor: 79.8% AIME-2024, the first published GRPO recipe at frontier scale, the R1-Distill family widely deployed).
+
+Open questions: R2 release status and architectural details; how V4 (or a successor) will compose the V3.2 sparse-attention and R1 reasoning-RL lines; what fraction of DeepSeek's training-cost gap to closed competitors is hardware-constrained efficiency versus optimisation choices that closed labs have since adopted.
+
+<Sources items={[
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V2 Technical Report", venue: "arXiv:2405.04434", url: "https://arxiv.org/abs/2405.04434", note: "MLA introduction; 236B/21B MoE; foundational architecture paper." },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V3 Technical Report", venue: "arXiv:2412.19437", url: "https://arxiv.org/abs/2412.19437", note: "Most-cited 2024 frontier-LLM training paper; FP8, DualPipe, auxiliary-loss-free MoE." },
+  { authors: "DeepSeek-AI", year: 2025, title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning", venue: "arXiv:2501.12948", url: "https://arxiv.org/abs/2501.12948", note: "GRPO + cold-start recipe; R1-Zero finding on emergent long CoT." },
+  { authors: "DeepSeek-AI", year: 2025, title: "DeepSeek-V3.2 with Sparse Attention", venue: "arXiv:2511.xxxxxx", url: "https://github.com/deepseek-ai/DeepSeek-V3.2", note: "Hybrid sparse-attention (DSA); long-context inference throughput." },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-MoE: Towards Ultimate Expert Specialization", venue: "arXiv:2401.06066", url: "https://arxiv.org/abs/2401.06066", note: "Earlier MoE architecture paper; foundation for V2/V3 routing." },
+  { authors: "DeepSeek-AI", year: 2025, title: "Wide-EP inference deployment (V3.2 serving)", venue: "github.com/deepseek-ai", url: "https://github.com/deepseek-ai/DeepSeek-V3", note: "Reference inference architecture; prefill-decode disaggregation." },
+  { authors: "Shao, Z. et al.", year: 2024, title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning", venue: "arXiv:2402.03300", url: "https://arxiv.org/abs/2402.03300", note: "GRPO introduced; algorithm cross-reference to Module 3f." },
+  { authors: "vLLM project", year: 2025, title: "DeepSeek-V3 / R1 deployment in vLLM", venue: "vllm.ai", url: "https://blog.vllm.ai/2025/01/27/deepseek-v3.html", note: "Reference open-source deployment integration." },
+  { authors: "Hugging Face", year: 2025, title: "DeepSeek-R1 model collection", venue: "huggingface.co", url: "https://huggingface.co/deepseek-ai", note: "Public weights distribution; R1-Distill variants." },
+  { authors: "CSIS", year: 2025, title: "DeepSeek and U.S. Export Controls", venue: "csis.org", url: "https://www.csis.org/analysis/deepseek-and-us-export-controls", note: "Policy context; H800 hardware constraint." },
+  { authors: "TransMLA team", year: 2024, title: "Extended analysis of MLA's KV cache savings", venue: "arXiv:2407.07879", url: "https://arxiv.org/abs/2407.07879", note: "Independent analysis of MLA compression ratios." },
+  { authors: "Interconnects", year: 2025, title: "DeepSeek-R1 deep dive", venue: "interconnects.ai", url: "https://www.interconnects.ai/p/deepseek-r1-recipe", note: "Synthesis playbook treatment; multi-stage R1 recipe." },
+  { authors: "Macaron AI", year: 2025, title: "DeepSeek model lineage and benchmarks", venue: "macaron.ai", url: "https://macaron.ai/blog/deepseek-lineage/", note: "Third-party benchmark summary." },
+]} />

@@ -1,0 +1,143 @@
+---
+slug: 06-frontier-labs
+title: Frontier-lab survey — orientation
+description: How to read this module, the lab-by-lab dependency on Modules 0–5, and what the May 2026 frontier-lab landscape looks like across OpenAI, Anthropic, Google DeepMind, Meta, DeepSeek, Qwen, Mistral / Cohere / xAI / AI21, and the other Chinese labs.
+order: 54
+chapter: 54
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 16
+depends_on: [05-eval-alignment-interp]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## About this module {#about}
+
+Modules 0–5 covered the *methods* of frontier-LLM construction: architecture, pretraining, distributed training, post-training, inference and serving, evaluation, alignment, interpretability. This module covers the *artefacts*: a comparative survey of the 2024–2026 frontier-model families. Each chapter is the "what they actually did" deep dive for one lab or lab cluster.
+
+After the eight chapters, a reader should be able to take any frontier-lab technical report or tech blog and locate every engineering decision in the taxonomy of Modules 1–5. DeepSeek-V3's auxiliary-loss-free MoE routing? Module 0h. Llama 3.1's 405B parallelism stack? Module 2 § 02h. OpenAI's deliberative alignment? Module 5 § 05f. Anthropic's Computer Use? Module 4 § 04h. Gemini's iRoPE? Module 0c. Qwen3's hybrid reasoning toggle? Module 3 § 03f. The chapters here are case-study walkthroughs at the lab level rather than method-level reintroductions; nothing is re-derived.
+
+<Callout variant="note" title="Calibration and scope">
+Content is calibrated to public lab disclosures through May 15, 2026. Each chapter sticks to what the lab has actually disclosed in tech reports, system cards, model cards, peer-reviewed papers, official blog posts, or verified leaderboard entries. Rumours, leaks, and unverified third-party claims are out of scope. Where a number is hedged or inferred, this is flagged in the chapter text.
+</Callout>
+
+<Callout variant="note" title="A note on iteration cadence">
+One cross-cutting observation about lab structure deserves naming before the per-lab chapters. The cleanest open disclosure of how a *small focused team* iterates on a frontier-style recipe is the Hugging Face SmolLM3 playbook (Allal et al., 2025), which documents a two-to-three-person pretraining team running on a roughly quarterly recipe-iteration cadence — the BLOOM → StarCoder → StarCoder2 → SmolLM → SmolLM2 → SmolLM3 trajectory. The thesis the playbook makes explicit is that every recipe-improvement cycle compounds, so labs that train quarterly accumulate advantages relative to labs that train once per year, at fixed total compute. The closed-frontier labs (OpenAI, Anthropic, Google DeepMind, the closed Chinese frontier) are presumed to operate at substantially larger team scale, but their iteration cadence is not publicly disclosed. The contrast is not closed-vs-open; it is *cadence-disclosed-vs-not-disclosed*, and the per-lab chapters that follow inherit that disclosure asymmetry — Hugging Face's recipe is fully visible, most others are visible only as model artefacts and tech reports.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+**[Chapter 55 — OpenAI](/textbook/06a-openai)**
+GPT-4 → GPT-5.5 line, o-series (o1, o3-mini, o3, o4-mini, o3-pro), Operator and the Computer-Using Agent, Preparedness Framework v2, deliberative alignment, ARC-AGI-2 + HLE + AIME + GPQA + SWE-bench + Terminal-Bench + FrontierMath disclosed evaluations.
+
+**[Chapter 56 — Anthropic](/textbook/06b-anthropic)**
+Claude 3 → 4.7 lineage, Opus / Sonnet / Haiku tier system, Responsible Scaling Policy v3.2 with ASL levels, Constitutional AI lineage, deceptive-alignment research program (Sleeper Agents, Alignment Faking, Activation Oracles, attribution graphs), Computer Use, Model Context Protocol (donated to Linux Foundation).
+
+**[Chapter 57 — Google DeepMind](/textbook/06c-google-deepmind)**
+Gemini 1.5 → 3.1 frontier line, native multimodal MoE, 10M-token context with iRoPE, Veo / Imagen multimodal decoders, Gemma 2–4 open-weights line, Frontier Safety Framework v3.0, AlphaProof + AlphaGeometry 2, Gemini Robotics.
+
+**[Chapter 58 — Meta](/textbook/06d-meta-llama)**
+Llama 3 → 3.3 dense line, Llama 4 Scout / Maverick / Behemoth MoE family, dense vs MoE strategic transition, the 405B training recipe (16K H100s, 15.6T tokens, 39.3M GPU-hours, BF16 with FP8 quantization), iterative DPO post-training, Meta Community License.
+
+**[Chapter 59 — DeepSeek](/textbook/06e-deepseek)**
+V2 → V3 → R1 → V3.2 lineage, MLA, auxiliary-loss-free MoE routing, DualPipe zero-bubble pipeline parallelism, FP8 pretraining, GRPO + cold-start reasoning RL, V3.2 hybrid sparse attention, wide-EP inference deployment (4-node prefill + 320-GPU decode).
+
+**[Chapter 60 — Alibaba Qwen](/textbook/06f-qwen-alibaba)**
+Qwen2 → Qwen2.5 → Qwen3 family, Qwen3-235B-A22B and Qwen3-480B-A35B MoE flagships, hybrid reasoning/non-reasoning toggle, QwQ reasoning line absorbed into Qwen3-Thinking, Qwen-VL multimodal line, Qwen2.5-Math with tool-integrated reasoning, the Tülu-3-style four-stage post-training recipe.
+
+**[Chapter 61 — Mistral, Cohere, xAI, AI21, others](/textbook/06g-mistral-others)**
+Mistral Large 3 / Medium 3.5 / Small 3.1 / Magistral, Cohere Command-A enterprise/agentic specialisation, xAI Grok-3 / Grok-4.3, AI21 Jamba SSM-Transformer hybrid, the Inflection / Microsoft exit, and the open vs closed positioning question.
+
+**[Chapter 62 — Other Chinese frontier labs](/textbook/06h-china-frontier)**
+Moonshot Kimi K2 / K2.5, Zhipu GLM-4.5 (τ-Bench leader), 01.AI Yi, Baichuan domain specialists and Baichuan-Omni, Tencent Hunyuan (HY2 / HY3 / T1 hybrid), MiniMax M1 (Lightning Attention, 1M native context), iFlytek Spark, ByteDance Doubao (155M WAU).
+
+---
+
+## How this module connects to the rest of the textbook {#connections}
+
+Every chapter cross-references the relevant earlier-module section rather than re-deriving. A compact map:
+
+| Lab artefact | Cross-reference |
+|---|---|
+| Attention variants (MLA, GQA, MQA, Lightning) | Module 0c |
+| Positional encodings (RoPE, iRoPE, YaRN) | Module 0c |
+| MoE plumbing (routing, auxiliary loss, experts) | Module 0h |
+| Pretraining recipe (data, tokenizer, scaling) | Module 1 |
+| FP8 training stability | Module 1 § 01h, Module 2 § 02g |
+| 3D / 4D parallelism composition | Module 2 § 02h |
+| Pipeline parallelism (DualPipe, 1F1B, GPipe) | Module 2 § 02c |
+| Expert parallelism (wide-EP, all-to-all) | Module 2 § 02d |
+| SFT, DPO, iterative DPO recipes | Module 3 §§ 03a–03b |
+| RLHF, Constitutional AI, RLAIF | Module 3 §§ 03c–03d |
+| RLVR, reasoning RL (GRPO, R1) | Module 3 §§ 03e–03f |
+| Process reward models | Module 3 § 03g |
+| Tool-use and agentic post-training | Module 3 § 03h |
+| KV cache, paged attention, sparse attention | Module 4 § 04a |
+| Speculative decoding, continuous batching | Module 4 §§ 04c–04d |
+| Quantization (FP8, FP4, INT8/INT4) | Module 4 § 04e |
+| Inference engines (vLLM, SGLang, TRT-LLM) | Module 4 § 04f |
+| Deployment architectures (prefill/decode split, wide-EP) | Module 4 § 04h |
+| Benchmark families and saturation | Module 5 § 05a |
+| Contamination detection | Module 5 § 05b |
+| Arena ELO methodology | Module 5 § 05c |
+| Sparse autoencoders and feature analysis | Module 5 § 05d |
+| Circuit analysis and attribution graphs | Module 5 § 05e |
+| Scalable oversight, deliberative alignment | Module 5 § 05f |
+| Red-teaming, ASL/Preparedness/FSF | Module 5 § 05g |
+| Deceptive-alignment evaluations | Module 5 § 05h |
+
+A reader who has worked through Modules 0–5 already knows every method named in this module. The chapters here are about *which labs deployed what, when, and at what scale*.
+
+---
+
+## A frontier-lab snapshot (May 15, 2026) {#snapshot}
+
+For quick orientation, the comparative state across the major labs:
+
+| Lab | Current flagship | Architecture | Open weights? | Disclosure depth |
+|---|---|---|---|---|
+| OpenAI | GPT-5.5, o3-pro | Unified dense + reasoning | No | System cards, no tech reports |
+| Anthropic | Claude Opus 4.7, Mythos (restricted) | Closed; presumed dense | No | Detailed safety; no architecture |
+| Google DeepMind | Gemini 3.1 Pro, Gemma 4 31B | Native multimodal MoE | Gemma only (Apache 2.0) | Mixed; Gemini 1.5 report detailed |
+| Meta | Llama 3.1 405B; Llama 4 family | Dense (3.x), MoE (4.x) | Yes (Meta Community License) | Most detailed (Llama 3.1 Herd report) |
+| DeepSeek | DeepSeek-V3.2, R1 | MLA + MoE + DualPipe + DSA | Yes (MIT-style) | Most architectural detail |
+| Qwen | Qwen3-480B-A35B | MoE; hybrid reasoning | Yes (Apache 2.0) | Detailed model cards + tech reports |
+| Mistral | Large 3, Magistral | MoE flagship, dense reasoning | Partial (Small, Magistral Small) | Modest |
+| xAI | Grok-4.3 | Proprietary | Only Grok-1 (historical) | Minimal |
+| Cohere | Command-A | Proprietary, agentic-tuned | Partial (Command-R 35B) | Minimal |
+| AI21 | Jamba 1.5 (52B) | SSM-Transformer hybrid | Yes (Apache 2.0) | Detailed |
+| Moonshot | Kimi K2.5 (1.04T-MoE) | MLA + MoE | Partial | Modest |
+| Zhipu | GLM-4.5 (355B-MoE) | MoE + tool-use | Partial | Detailed |
+| MiniMax | M1 (456B/45.9B) | Lightning Attention + MoE | Partial | Detailed |
+
+Three high-level trends visible in this table:
+
+1. **MoE has won at frontier scale.** Every lab whose architecture is disclosed has shipped MoE flagships in 2025–2026 (OpenAI's exact GPT-5 architecture remains undisclosed, but the cost/throughput profile is consistent with MoE). The DeepSeek / Gemini / Qwen / Llama 4 lines all converged on the same architectural family.
+2. **Reasoning lines bifurcated, then re-converged.** o1 / R1 / QwQ / Magistral were initially separate reasoning model families; by mid-2025 the production trend was reasoning-mode toggles on a single weight set (GPT-5.2, Qwen3-Thinking, Doubao Seed 2.0's slow-thinking mode).
+3. **Open vs closed is bimodal.** Western frontier (OpenAI, Anthropic, Google) is closed; Western mid-frontier (Meta, Mistral, AI21, Cohere) ships partial open weights; Chinese frontier (DeepSeek, Qwen, Moonshot, Zhipu, MiniMax) is the most open-weights-prolific cluster. The open-weights frontier is increasingly Asian-led.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module a reader should be able to:
+
+1. Read a frontier-lab tech report and locate every method-level decision in the Module 0–5 taxonomy.
+2. Identify which architectural innovations originated where (MLA → DeepSeek-V2; iRoPE → Gemini 1.5; auxiliary-loss-free MoE → DeepSeek-V3; deliberative alignment → OpenAI o3; Computer Use → Anthropic Claude 3.5 → o3 Operator).
+3. Describe the safety-governance landscape across labs (OpenAI Preparedness Framework v2, Anthropic RSP v3.2, DeepMind FSF v3.0) and compare their threshold structures.
+4. Compare the lineage of post-training pipelines across labs and identify the recurring four-stage SFT → DPO → RLVR → multi-objective pattern.
+5. Place a frontier-lab release in the comparative landscape — knowing which benchmark numbers are credible, which are unverified, and which benchmarks are saturated.
+
+<Sources items={[
+  { authors: "Module 0 — Prerequisites", year: 2026, title: "Frontier-LLM textbook, Module 0", url: "/textbook/00-prerequisites" },
+  { authors: "Module 1 — Pretraining at scale", year: 2026, title: "Frontier-LLM textbook, Module 1", url: "/textbook/01-pretraining" },
+  { authors: "Module 2 — Distributed training", year: 2026, title: "Frontier-LLM textbook, Module 2", url: "/textbook/02-distributed" },
+  { authors: "Module 3 — Post-training and reasoning", year: 2026, title: "Frontier-LLM textbook, Module 3", url: "/textbook/03-post-training" },
+  { authors: "Module 4 — Inference and serving", year: 2026, title: "Frontier-LLM textbook, Module 4", url: "/textbook/04-inference" },
+  { authors: "Module 5 — Evaluation, alignment, and interpretability", year: 2026, title: "Frontier-LLM textbook, Module 5", url: "/textbook/05-eval-alignment-interp" },
+  { authors: "Allal, L. B. et al. (Hugging Face)", year: 2025, title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs", venue: "Hugging Face Spaces", url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook", note: "Source for the iteration-cadence callout in the orientation section. The BLOOM → StarCoder → SmolLM trajectory and the small-team, quarterly-cadence thesis are documented in full." },
+  { authors: "Allal, L. B. et al. (Hugging Face)", year: 2025, title: "SmolLM3: smol, multilingual, long-context reasoner", venue: "Hugging Face blog", url: "https://huggingface.co/blog/smollm3" },
+]} />

@@ -1,0 +1,161 @@
+---
+slug: 06g-mistral-others
+title: Mistral, Cohere, xAI, AI21, others
+description: Other Western frontier labs — Mistral (Large 3, Medium 3.5, Small 3.1, Magistral), Cohere Command-A, xAI Grok 3 / 4, AI21 Jamba (SSM-Transformer hybrid), and the open vs closed positioning question.
+order: 61
+chapter: 61
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 20
+depends_on: [06f-qwen-alibaba]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Outside the "Big Three" (OpenAI, Anthropic, Google DeepMind) and the open-weights leaders (Meta Llama, DeepSeek, Qwen), several other Western labs continue to ship at the frontier. Mistral remains the strongest European frontier lab and the largest open-weights European player. Cohere has pivoted to enterprise and agentic specialisation. xAI's Grok line has rapidly closed the gap to the leading frontier on reasoning benchmarks. AI21's Jamba is the most-cited SSM-Transformer hybrid in production. Inflection has effectively exited the frontier race via the Microsoft acquisition of March 2024.
+
+This chapter compactly surveys these labs. Calibration: May 15, 2026. The chapter is shorter than 06a–06f because the scope is broader and the disclosed technical detail per lab is shallower.
+
+---
+
+## Mistral {#mistral-line}
+
+**Mistral AI** is the strongest European frontier lab as of 2026. The line has bifurcated into proprietary closed models (Mistral Large, Mistral Medium) and permissive open-weights models (Mistral Small, Codestral, Magistral Small).
+
+**Mistral Large 3 (March 2025).** 675B-parameter MoE flagship, with reported active-parameter count in the low tens of billions. Closed-weight, API-only. The architecture follows the standard MoE Transformer pattern (Module 0h); Mistral has not published a technical report at Llama-3.1 / DeepSeek-V3 detail.
+
+**Mistral Medium 3.5 (October 2025).** 128B dense, marketed as the "agentic specialist" with longer-horizon planning and improved tool use. Knowledge cutoff and exact training scale are not publicly disclosed.
+
+**Mistral Small 3.1 (April 2025).** 24B multimodal (text + image input), open-weights under Apache 2.0. The Mistral Small line is the lab's primary contribution to the open-weights ecosystem after the early Mistral 7B / Mixtral 8×7B releases.
+
+**Magistral.** Mistral's reasoning model line:
+
+- **Magistral Small (June 2025).** 24B, Apache 2.0 open-weights, the first published European reasoning model. Trained with outcome-reward RL on a Mistral Small base. AIME-2024 reported ~70–73%.
+- **Magistral Medium (October 2025).** Closed-weight, larger, with reasoning capability comparable to mid-tier frontier reasoning models. GPQA Diamond reported around frontier baseline but behind Claude Opus 4.7 and DeepSeek-R1.
+
+**Codestral.** Code specialist line, released across multiple sizes (22B initial, refresh variants in 2025). Apache 2.0 open-weights. Used by enterprise customers as an open alternative to Claude Sonnet for code-focused workflows.
+
+**Strategic positioning.** Mistral's pricing and licensing are tuned to undercut closed competitors in EU and enterprise markets, with the open Mistral Small / Codestral / Magistral Small line serving as ecosystem on-ramps. The lab has not published the architectural detail of Mistral Large 3 in the same depth as DeepSeek or Meta.
+
+---
+
+## Magistral reasoning line {#magistral-reasoning}
+
+The Magistral line is the Mistral reasoning track. Magistral Small (June 2025) was the first European-labeled reasoning model with weights publicly available. The training recipe is reported as outcome-reward RL on top of a Mistral Small SFT base — the same general pattern as DeepSeek-R1 (§ 06e), QwQ-32B (§ 06f), and the o-series (§ 06a).
+
+**Benchmark positioning.** AIME-2024 ~70–73% on Magistral Small is competitive with DeepSeek-R1-Distill-Qwen-32B and meaningfully below DeepSeek-R1 (~80%) or the o-series. GPQA Diamond performance is behind frontier reasoning models. Magistral Medium (October 2025) closes some of the gap but remains behind Anthropic and OpenAI reasoning models.
+
+The line is a credible open-weights European reasoning option but not, as of May 2026, a frontier-leading one. The architectural and training recipe are not disclosed in detail.
+
+---
+
+## Cohere Command-R {#cohere-command-r}
+
+**Cohere** has positioned itself in 2024–2026 as the enterprise-and-agentic frontier lab. The line:
+
+- **Command-R (March 2024).** 35B; the first major Cohere release with explicit RAG-and-tool-use design.
+- **Command-R+ (April 2024).** 104B; multilingual, agentic, with strong tool-use capabilities.
+- **Command-A (2025).** 111B; agentic specialist with 256K context, claimed 150% throughput improvement over Command-R+, deployed in enterprise contexts.
+- **Command-A-Reasoning, Command-A-Vision, Command-A-Translate.** Specialist variants targeting reasoning, vision-language, and translation respectively.
+
+**Strategic positioning.** Cohere does not chase consumer benchmarks. Public eval disclosure is sparse compared to other frontier labs; the lab's marketing emphasises enterprise integrations (LangChain, Salesforce, enterprise data connectors) and the agentic / RAG specialisation. The Command line is the clearest example in the 2026 frontier landscape of a lab prioritising a vertical (enterprise + agentic) over leaderboard saturation.
+
+**Open vs closed.** Cohere releases weights for some variants (Command-R-08-2024 was released under a CC-BY-NC-4.0 research-only license); Command-A and the larger variants are API-only.
+
+---
+
+## xAI Grok {#xai-grok}
+
+**xAI** (founded 2023) has shipped a sequence of frontier-tier models with rapidly closing capability gaps to the leading labs.
+
+- **Grok-1 (November 2023, weights released March 2024).** 314B MoE; the initial release.
+- **Grok-2 (August 2024).** API-only; competitive with GPT-4-class models at the time of release.
+- **Grok-3 (February 2025).** Reasoning-capable variant; integrated with real-time X (Twitter) search.
+- **Grok-4 (mid-2025).** 256K context, integrated reasoning + search.
+- **Grok-4.3 (2026).** Current frontier. AIME-2024 ~88%, USAMO 2025 ~62%, Humanity's Last Exam ~50% (Pro mode), HLE roughly at the GPT-5.4 / Claude Opus 4.7 frontier.
+
+**Real-time search integration.** Grok's distinguishing feature versus other frontier models is real-time integration with X data — the model can pull current events from the platform during reasoning. This is the production analogue of tool-use covered in Module 3 § 03h, with X-platform data as the tool.
+
+**Disclosure.** xAI has not published detailed technical reports for Grok-3 and later. The capability claims are well-attested on third-party leaderboards (LMSys Arena, HLE leaderboard) but the architectural and training-recipe details are private.
+
+---
+
+## AI21 Jamba — SSM-Transformer hybrid {#ai21-jamba-ssm-hybrid}
+
+**AI21 Labs**' Jamba line is the most-cited production SSM-Transformer hybrid as of May 2026.
+
+**Architecture.** Jamba 1.5 (52B) interleaves Mamba (state-space model) blocks with Transformer blocks. The Mamba blocks have linear-in-sequence-length compute, breaking the Transformer's $O(n^2)$ attention scaling; the Transformer blocks retain the in-context-learning capability that pure SSM architectures had struggled to match. The hybrid achieves the headline 256K context window at roughly 2.5× the inference throughput of a comparable-scale dense Transformer.
+
+**Open-weights.** Jamba is released under Apache 2.0. Community adoption has been modest — the hybrid architecture is novel and requires custom inference infrastructure that vLLM and SGLang added support for during 2024–2025.
+
+**Why the SSM hybrid matters.** Jamba is the principal counter-example to the "Transformer-only" architectural orthodoxy that dominates the rest of this textbook. Module 0c (attention variants) covers SSM hybrids alongside MHA / MQA / GQA / MLA; Jamba is the production instantiation. The architecture's promise — sublinear context scaling with retained in-context-learning quality — has not yet been demonstrated at frontier scale, but Jamba 1.5 is the existence proof at mid-scale that the architecture is viable.
+
+The other SSM-hybrid line worth mentioning is MiniMax M1 (§ 06h) which uses Lightning Attention and transnormer blocks.
+
+---
+
+## Open vs closed positioning {#open-vs-closed-positioning}
+
+The labs in this chapter span the open–closed spectrum:
+
+| Lab | Largest weight-released model | Largest closed model | License |
+|---|---|---|---|
+| Mistral | Magistral Small 24B / Codestral 22B | Mistral Large 3 (675B MoE) | Apache 2.0 (open) / proprietary (closed) |
+| Cohere | Command-R 35B | Command-A 111B+ | CC-BY-NC-4.0 research (open) / proprietary (closed) |
+| xAI | Grok-1 (314B, March 2024 release) | Grok-4 / 4.3 | Apache 2.0 (Grok-1) / proprietary |
+| AI21 | Jamba 1.5 (52B) | — | Apache 2.0 |
+| Inflection (Microsoft) | — | Inflection 2.5 (licensing only) | proprietary, internal use |
+
+**Patterns.**
+
+1. Most Western frontier labs maintain *both* an open-weights line (smaller, ecosystem-on-ramp) and a closed proprietary frontier line (larger, revenue-generating).
+2. xAI's strategy is closest to OpenAI's: open the historical model when superseded (Grok-1's release happened after Grok-2 was already production), keep the frontier closed.
+3. AI21's strategy is closest to pure open-weights, which is also why it has the least production-API revenue and the most academic engagement.
+4. Inflection's exit (Microsoft acquired Inflection's team and licensed the Inflection 2.5 weights in March 2024; the consumer Pi product was discontinued) is the cautionary case for mid-sized labs without frontier-scale compute access.
+
+**Erosion of the open-weights Western moat.** A theme of the 2025–2026 period: DeepSeek and Qwen erode the Western open-weights moat on efficiency and capability. Mistral Small 3.1 24B (April 2025) is competitive with Qwen3-32B and Llama 3.3 70B in the size class, but Qwen3-235B-A22B (April 2025) substantially exceeds Mistral Large 3's openly verifiable benchmark numbers at lower cost and with public weights. The open-weights frontier is increasingly Asian-led.
+
+---
+
+## Disclosed evaluations {#evals-disclosed}
+
+A consolidated table of the headline benchmark numbers across this chapter's labs (all numbers May 15 2026; many are vendor-reported and unverified by third parties at the time of writing):
+
+| Model | MMLU-Pro / MMLU | AIME-2024 | GPQA Diamond | Context |
+|---|---|---|---|---|
+| Mistral Large 3 (675B MoE) | ~85% | ~30% (base) | ~50% | 128K |
+| Magistral Small (24B) | ~75% | ~73% (reasoning) | ~50% | 128K |
+| Magistral Medium | ~80% | ~80% (reasoning) | ~55% | 128K |
+| Cohere Command-A (111B) | ~83% | — | ~52% | 256K |
+| xAI Grok-4.3 | — | ~88% | ~70% | 256K |
+| AI21 Jamba 1.5 (52B) | ~75% | — | — | 256K |
+
+The labs in this chapter generally sit at the second-tier of the May 2026 frontier — behind GPT-5.5 / Claude Opus 4.7 / Gemini 3 Pro on most benchmarks, ahead of mid-tier closed models on cost, with xAI's Grok-4.3 closest to the leading frontier on reasoning.
+
+---
+
+## Summary {#summary}
+
+The Western frontier outside the Big Three and Meta is a smaller-volume, more specialised ecosystem in 2026. Mistral holds the European open-weights position with a bifurcated open–closed strategy. Cohere has pivoted to enterprise-agentic specialisation. xAI is closing the reasoning gap fastest of any non-leading-frontier lab. AI21's Jamba is the most-cited production SSM-Transformer hybrid. Inflection has exited.
+
+Cross-references to earlier modules: Mistral Large 3 MoE ↔ Module 0h; Magistral reasoning RL ↔ Module 3 § 03f; Command-A agentic specialisation ↔ Module 3 § 03h; Jamba SSM-Transformer hybrid ↔ Module 0c; Grok real-time-search integration ↔ Module 3 § 03h. For frontier-LLM students, this chapter is the "long tail" of the frontier landscape — the labs are credible production players but not, with the exception of xAI's Grok-4.3, currently competing for leaderboard-leading positions.
+
+<Sources items={[
+  { authors: "Mistral AI", year: 2025, title: "Mistral Large 3 announcement", venue: "mistral.ai", url: "https://mistral.ai/news/mistral-large-3/", note: "675B MoE flagship; closed-weight." },
+  { authors: "Mistral AI", year: 2025, title: "Magistral Small announcement", venue: "mistral.ai", url: "https://mistral.ai/news/magistral/", note: "European open-weights reasoning model." },
+  { authors: "Mistral AI", year: 2025, title: "Mistral Small 3.1", venue: "mistral.ai", url: "https://mistral.ai/news/mistral-small-3-1/", note: "24B multimodal open-weights." },
+  { authors: "Mistral AI", year: 2024, title: "Codestral 22B", venue: "mistral.ai", url: "https://mistral.ai/news/codestral/", note: "Code-specialist open-weights line." },
+  { authors: "Cohere", year: 2024, title: "Command-R+ release", venue: "cohere.com", url: "https://cohere.com/blog/command-r-plus-microsoft-azure", note: "104B agentic + RAG model." },
+  { authors: "Cohere", year: 2025, title: "Command-A: Enterprise-class generative AI", venue: "cohere.com", url: "https://cohere.com/blog/command-a", note: "111B agentic specialist; 256K context." },
+  { authors: "xAI", year: 2025, title: "Grok-3", venue: "x.ai", url: "https://x.ai/news/grok-3", note: "Reasoning + X integration." },
+  { authors: "xAI", year: 2025, title: "Grok-4 announcement", venue: "x.ai", url: "https://x.ai/news/grok-4", note: "256K context; integrated reasoning + search." },
+  { authors: "xAI", year: 2024, title: "Grok-1 weights release", venue: "github.com/xai-org", url: "https://github.com/xai-org/grok-1", note: "314B MoE; Apache 2.0 (historical model)." },
+  { authors: "AI21 Labs", year: 2024, title: "Jamba 1.5: Hybrid Mamba-Transformer", venue: "arxiv.org", url: "https://arxiv.org/abs/2408.12570", note: "SSM-Transformer hybrid; 52B; 256K context." },
+  { authors: "AI21 Labs", year: 2024, title: "Jamba release blog", venue: "ai21.com", url: "https://www.ai21.com/blog/announcing-jamba-1.5", note: "Hybrid architecture announcement." },
+  { authors: "Microsoft", year: 2024, title: "Microsoft hires Inflection team", venue: "blogs.microsoft.com", url: "https://blogs.microsoft.com/blog/2024/03/19/", note: "Inflection acquisition/team move." },
+  { authors: "LMSys", year: 2026, title: "Chatbot Arena Leaderboard", venue: "lmsys.org", url: "https://lmsys.org/blog/2026-05-15-leaderboard/", note: "Third-party ranking; xAI Grok-4.3 frontier position." },
+  { authors: "Vellum", year: 2026, title: "Frontier-LLM benchmark roundup", venue: "vellum.ai", url: "https://www.vellum.ai/blog/frontier-llm-benchmarks-2026", note: "Cross-lab benchmark aggregation." },
+  { authors: "IEEE Spectrum", year: 2025, title: "The European Frontier AI Landscape", venue: "spectrum.ieee.org", url: "https://spectrum.ieee.org/european-frontier-ai-2025", note: "Independent analysis of European labs." },
+]} />

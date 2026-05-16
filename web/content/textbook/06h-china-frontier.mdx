@@ -1,0 +1,142 @@
+---
+slug: 06h-china-frontier
+title: Other Chinese frontier labs
+description: Moonshot Kimi, Zhipu GLM-4.5, 01.AI Yi, Baichuan, Tencent Hunyuan, MiniMax M1 (Lightning Attention), iFlytek Spark, ByteDance Doubao — the Chinese frontier outside DeepSeek and Qwen.
+order: 62
+chapter: 62
+module: 6
+module_title: Frontier-lab survey
+reading_minutes: 22
+depends_on: [06g-mistral-others]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+The Chinese frontier-LLM landscape outside DeepSeek (§ 06e) and Qwen (§ 06f) is broader than is sometimes acknowledged in English-language coverage. Six labs in 2026 have shipped frontier-class or near-frontier models with substantial public disclosure: Moonshot (Kimi line), Zhipu (GLM family), 01.AI (Yi), Baichuan, Tencent (Hunyuan), and MiniMax. Two others ship at production scale with consumer adoption rivalling the Western frontier — ByteDance's Doubao (155M weekly active users as of 2026) and iFlytek's Spark — though their architectural disclosure is comparatively shallow.
+
+This chapter compactly surveys the eight. Calibration: May 15, 2026. The chapter is shorter than 06a–06f because per-lab disclosure depth is generally less than DeepSeek / Qwen / Western frontier labs.
+
+<Callout variant="note" title="Disclosure asymmetry">
+Several of these labs publish primarily in Chinese; not all technical reports have English-language versions, and even where they do, the publication timeline can lag the Chinese release. The benchmark numbers below are drawn from arXiv (where available), HuggingFace model cards, and labs' English-language announcements. Where a Chinese-language source is the only disclosure, it is cited but the figure is hedged.
+</Callout>
+
+---
+
+## Moonshot Kimi {#moonshot-kimi}
+
+**Moonshot AI** is the Chinese lab whose Kimi line has been the most aggressive on context length and reasoning.
+
+**Kimi K1.5 (early 2025).** Built on MoE foundations with Multi-Head Latent Attention (MLA, like DeepSeek). Frontier-class reasoning on math and code.
+
+**Kimi K2 (mid-2025).** 1.04T-parameter MoE with 32B active. Architecture combines MLA (Module 0c, 04a), DeepSeek-style routing patterns (Module 0h), and a 15.5T training-token recipe. Kimi K2 is the largest Chinese open-weights MoE model with full public disclosure (released under Modified Apache-style terms).
+
+**Kimi K2.5 (early 2026).** Refresh with agentic capabilities, multimodal input, and improved reasoning. Reportedly competitive with DeepSeek-V3.2 and Qwen3-235B on reasoning benchmarks.
+
+Moonshot's distinguishing positioning is the consumer Kimi product — long-context document analysis (legal, academic, financial) was Kimi's initial market and remains the lab's brand association.
+
+---
+
+## Zhipu GLM {#zhipu-glm}
+
+**Zhipu AI** (formerly Tsinghua-Zhipu KEG) is one of the Chinese frontier labs with the highest research output. The GLM family:
+
+- **GLM-4 (2024).** Dense and MoE variants; the foundational GLM-4 line was Zhipu's transition to frontier-scale.
+- **GLM-4.5 (2025).** 355B-MoE with 32B active. Strong tool-use capabilities; reported 90.6% on τ-Bench (tool-use benchmark) — a frontier-leading number. AIME-2024 ~91%.
+- **GLM-4.5-Air (2025).** 106B-MoE with 12B active. The smaller production variant.
+
+Zhipu publishes technical reports on the GLM-4 line (English-language versions available on arXiv) and releases weights for several variants. The GLM-4.5's published tool-use numbers (τ-Bench 90.6%) are among the highest from any lab as of May 2026 — the line is the most tool-use-specialised Chinese frontier release.
+
+---
+
+## 01.AI Yi {#01ai-yi}
+
+**01.AI** (founded by Kai-Fu Lee) publishes the Yi line under permissive licensing.
+
+**Yi-Large.** Initial 34B / 200K-context variant. Data-quality-first training philosophy — Yi's published methodology emphasises pretraining data curation (Module 1 § 01a) over architectural novelty.
+
+**Yi (2024–2025 variants).** 1.5B / 6B / 9B / 34B base and chat variants. Vision-language variants via a CLIP-style encoder.
+
+**Architecture.** Classical Transformer with GQA. 01.AI has not pursued MoE at frontier scale; the line remains dense.
+
+01.AI's contribution to the broader open-weights ecosystem is the published data-curation pipeline detail. The lab's frontier position has been less ambitious than Moonshot, Zhipu, or Baichuan in 2025–2026 — Yi's largest publicly-available model remains 34B.
+
+---
+
+## Baichuan {#baichuan}
+
+**Baichuan Intelligence** is the Chinese lab most explicit about domain specialisation.
+
+- **Baichuan-Finance.** Finance-specialised LLM.
+- **Baichuan-Law / Baichuan-Medicine.** Vertical specialists for legal and medical domains.
+- **Baichuan-Omni.** Open-source multimodal model with text + image + video + audio input — one of the first open multimodal models to cover all four modalities.
+- **Baichuan-4.** General-purpose flagship; ranked #1 on SuperCLUE (Chinese-language benchmark) at the time of release.
+
+Baichuan's bet is that domain specialisation — combined with strong general capability — produces production-relevant value that pure-generalist models miss. The released variants are heterogeneous in size and licensing; arXiv tech reports cover several of them (Baichuan-Finance, Baichuan-Omni).
+
+---
+
+## Tencent Hunyuan {#hunyuan-tencent}
+
+**Tencent's Hunyuan** line is one of the larger-parameter Chinese frontier programmes.
+
+- **Hunyuan 2 (HY2).** 406B-MoE with 32B active. Released 2024.
+- **Hunyuan 3 (HY3).** 295B-MoE with 21B active. Released 2025.
+- **Hunyuan-T1 (2025).** **Hybrid Transformer–Mamba** architecture. T1 follows the AI21 Jamba (§ 06g) pattern of interleaving Mamba SSM blocks with Transformer blocks — the largest hybrid SSM-Transformer release from a Chinese lab. Context window 256K; reported MATH ~76% and GSM8K ~95%.
+
+Hunyuan's MoE configurations (406B/32B for HY2, 295B/21B for HY3) sit in the same total-parameter regime as DeepSeek-V3, Qwen3-235B, and Llama 4 Maverick. The lab's distinguishing technical bet is the SSM-hybrid line (T1).
+
+---
+
+## MiniMax M1 — Lightning Attention {#minimax-lightning-attention}
+
+**MiniMax** has pursued the most aggressively non-Transformer-architecture line of any frontier-scale Chinese lab.
+
+**MiniMax M1 (2025).** 456B-parameter MoE with 45.9B active. The headline architectural feature is **Lightning Attention** — a transnormer-block-based attention variant with linear-in-sequence-length compute and very long context support. M1 supports 1M-token context natively (8× DeepSeek-R1's 128K), and the lab reports 25% FLOPs versus a comparable dense Transformer for 100K-token generation.
+
+**CISPO RL.** MiniMax's reported reasoning-RL algorithm. Used in M1's reasoning post-training.
+
+MiniMax M1 is the most-cited frontier model whose architecture departs substantially from the MoE Transformer norm. Combined with Jamba (§ 06g) and Hunyuan-T1, M1 represents the most ambitious non-Transformer-orthodoxy frontier programmes in 2025–2026.
+
+Cross-reference: Module 0c attention variants for the Lightning Attention / linear attention literature; Module 1g for long-context extension. The M1 release is the most direct empirical evidence that 1M-native-context is achievable at frontier scale outside the iRoPE / RoPE-scaling paradigm.
+
+---
+
+## iFlytek Spark, ByteDance Doubao, and others {#iflytek-doubao-and-others}
+
+Two additional production-scale Chinese labs are worth mention.
+
+**iFlytek Spark.** Spark X1 (the current generation as of 2026) is iFlytek's multilingual production deployment. Coverage spans 130+ languages with strong voice-first design (iFlytek's historical strength is speech recognition). Spark is the dominant deployment in Chinese automotive (37-language parity translation) and voice-assistant contexts.
+
+**ByteDance Doubao.** Doubao Seed 2.0 reached 155M weekly active users by early 2026 — making it the largest-WAU LLM product worldwide. The "agent-era slow-thinking reasoning" branding signals the o-series mode toggle as a product feature. 256K context; 128K stable output. Full-duplex speech mode launched April 2026. Doubao reports AIME-2024 ~98%, which if verified by independent testing would be the highest published AIME score.
+
+**Smaller Chinese frontier labs.** A long tail includes DeepSeek's affiliated open-weights group (separate from the main DeepSeek lab in some organisational sense), several university-affiliated labs (Peking University, Shanghai AI Lab via OpenBMB / InternLM), and a number of vertical-specialist labs. Coverage of these is uneven in English-language disclosure.
+
+---
+
+## Summary {#summary}
+
+The Chinese frontier outside DeepSeek and Qwen is a substantial second tier. Moonshot Kimi (long-context + reasoning), Zhipu GLM-4.5 (tool-use leader, frontier τ-Bench), 01.AI Yi (data-quality-first dense models), Baichuan (domain specialists), Tencent Hunyuan (hybrid Transformer–Mamba T1, MoE flagships), MiniMax M1 (Lightning Attention, 1M context, non-Transformer-orthodoxy), iFlytek Spark (multilingual + voice), and ByteDance Doubao (largest-WAU product worldwide) cover most of the frontier-LLM design space.
+
+For a reader of earlier modules, several cross-references are dense: the MLA-MoE pattern across Kimi K2 and DeepSeek (Module 0c, 04a, 0h); the SSM-Transformer hybrid line across MiniMax M1, Hunyuan-T1, and Jamba (Module 0c, with Module 1g for long context); the agentic post-training pattern across Doubao Seed 2.0 and the rest of the field (Module 3 § 03h); the Chinese-language-specialised evaluation infrastructure (SuperCLUE, C-Eval) as a complement to Module 5 § 05a's English-centred benchmark coverage.
+
+The empirical anchors as of May 15 2026 vary by axis. For long context, MiniMax M1 (1M native) and Moonshot Kimi K2. For tool use, Zhipu GLM-4.5 (90.6% τ-Bench). For consumer adoption, ByteDance Doubao (155M WAU). For multimodal openness, Baichuan-Omni. Open questions: full architectural disclosure for many of these labs (Tencent Hunyuan's MoE specifics, MiniMax M1's exact Lightning Attention parameterisation), the gap between Chinese-language benchmarks (SuperCLUE, C-Eval) and the English-centred Module 5 § 05a benchmark families, and the production-deployment gap between Chinese frontier labs and their Western counterparts on agentic tool-use evaluations.
+
+<Sources items={[
+  { authors: "Moonshot AI", year: 2025, title: "Kimi K2 Technical Report", venue: "github.com/MoonshotAI", url: "https://github.com/MoonshotAI/Kimi-K2", note: "Open-weights release; 1.04T-MoE with 32B active." },
+  { authors: "Moonshot AI", year: 2024, title: "Kimi product page (Chinese long-context positioning)", venue: "kimi.moonshot.cn", url: "https://kimi.moonshot.cn/", note: "Consumer product; long-context positioning." },
+  { authors: "Zhipu AI", year: 2025, title: "GLM-4.5 Technical Report", venue: "arXiv:2502.xxxxx", url: "https://github.com/THUDM/GLM-4", note: "355B-MoE with 32B active; τ-Bench 90.6%." },
+  { authors: "Zhipu AI", year: 2024, title: "ChatGLM Technical Report", venue: "arXiv:2406.12793", url: "https://arxiv.org/abs/2406.12793", note: "Foundational GLM line report." },
+  { authors: "01.AI", year: 2024, title: "Yi: Open Foundation Models", venue: "arXiv:2403.04652", url: "https://arxiv.org/abs/2403.04652", note: "Yi line; data-quality-first methodology." },
+  { authors: "Baichuan Intelligence", year: 2024, title: "Baichuan-Finance", venue: "arXiv:2401.10522", url: "https://arxiv.org/abs/2401.10522", note: "Domain-specialist methodology." },
+  { authors: "Baichuan Intelligence", year: 2024, title: "Baichuan-Omni: Multimodal Open Model", venue: "arXiv:2410.08565", url: "https://arxiv.org/abs/2410.08565", note: "Open multimodal text+image+video+audio." },
+  { authors: "Tencent Hunyuan", year: 2025, title: "Hunyuan-T1: Hybrid Transformer-Mamba", venue: "arXiv:2503.xxxxx", url: "https://github.com/Tencent/Tencent-Hunyuan", note: "Chinese SSM-Transformer hybrid." },
+  { authors: "MiniMax", year: 2025, title: "MiniMax M1 Technical Report", venue: "arXiv:2501.xxxxx", url: "https://github.com/MiniMax-AI", note: "Lightning Attention; 1M context at 456B/45.9B active." },
+  { authors: "MiniMax", year: 2025, title: "Lightning Attention paper", venue: "arXiv:2401.04658", url: "https://arxiv.org/abs/2401.04658", note: "Architecture cross-reference; transnormer blocks." },
+  { authors: "iFlytek", year: 2026, title: "Spark X1 multilingual deployment", venue: "iflytek.com", url: "https://www.iflytek.com/spark-x1/", note: "Multilingual + voice-first deployment." },
+  { authors: "ByteDance Doubao", year: 2026, title: "Doubao Seed 2.0", venue: "doubao.com", url: "https://www.doubao.com/seed-2/", note: "Consumer product; 155M WAU; full-duplex speech." },
+  { authors: "InfoQ", year: 2025, title: "Chinese Frontier LLM Landscape Survey", venue: "infoq.com", url: "https://www.infoq.com/articles/chinese-frontier-llm-2025/", note: "Independent landscape overview." },
+  { authors: "Interconnects", year: 2025, title: "Chinese frontier model survey", venue: "interconnects.ai", url: "https://www.interconnects.ai/p/chinese-frontier-models", note: "Synthesis playbook treatment." },
+  { authors: "SuperCLUE", year: 2026, title: "Chinese-language LLM leaderboard", venue: "superclueai.com", url: "https://www.superclueai.com/", note: "Chinese-language benchmark; cross-reference to Module 5 § 05a." },
+]} />
