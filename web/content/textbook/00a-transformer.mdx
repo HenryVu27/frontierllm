@@ -397,6 +397,14 @@ This chapter has introduced the transformer block as Vaswani et al. defined it i
 
 The skeleton — residual stream, scaled dot-product attention, MLP, residual addition — has remained unchanged throughout this progression. Modifications are layered on top of or swapped into specific positions within the skeleton. This modularity is why the field can share results across model families: GQA is a drop-in replacement for MHA at the projection level; RMSNorm is a drop-in replacement for LayerNorm at the normalisation level; SwiGLU is a drop-in replacement for ReLU-MLP at the activation level.
 
+<Callout variant="note" title="Two small-model parameter-budget choices: tied embeddings and intra-document masking">
+Two parameter- and data-efficiency choices that frontier small-open-models often bundle together do not change the transformer skeleton but appear at training time.
+
+**Tied embeddings.** The input embedding $E \in \mathbb{R}^{V \times d}$ and the output unembedding share one parameter matrix. For a $V = 128{,}000$ vocabulary at $d = 2{,}048$ residual width, this halves the embedding parameter count from $2Vd \approx 524\,\text{M}$ to $Vd \approx 262\,\text{M}$; at the 3B-class total budget the embedding share would otherwise pass 25% of all parameters. Llama 3.1 and DeepSeek-V3 untie at 70B+ scale; SmolLM3 (Allal et al., 2025) ties at 3B and additionally removes weight decay from the embedding, following the OLMo-2 stability recipe.
+
+**Intra-document masking on packed sequences.** When short documents are concatenated into one fixed-length training sequence to avoid padding waste, standard causal masking lets tokens attend across document boundaries. Intra-document masking restricts attention so each token attends only to previous tokens within its own source document. Zhao et al. (2024) report a measurable reduction in noise from cross-document attention on packed corpora; SmolLM3 adopted it from training start. The mask composes with the causal triangular mask at no additional inference cost.
+</Callout>
+
 ---
 
 <Sources items={[
@@ -575,5 +583,29 @@ The skeleton — residual stream, scaled dot-product attention, MLP, residual ad
     venue: "Ahead of AI",
     url: "https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison",
     note: "Comparative architecture table covering 18 models from 2024–2025; definitive survey of frontier choices as of early 2025."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "SmolLM3 base architecture, tokenizer, three-stage data mixture, and post-training pipeline. Source for tied-embeddings, intra-document-masking, and the OLMo-2 embedding-weight-decay-off recipe at 3B scale."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs",
+    venue: "Hugging Face Spaces",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook",
+    note: "Operational disclosure of the SmolLM3 recipe, ablations, and compute accounting."
+  },
+  {
+    authors: "Zhao, Y., Qu, Y., Staniszewski, K., Tworkowski, S., Liu, W., Miłoś, P., Wu, Y., Minervini, P.",
+    year: 2024,
+    title: "Analysing the Impact of Sequence Composition on Language Model Pre-Training",
+    venue: "arXiv:2402.13991",
+    url: "https://arxiv.org/abs/2402.13991",
+    note: "Empirical evidence that intra-document masking on packed sequences reduces cross-document attention noise."
   },
 ]} />

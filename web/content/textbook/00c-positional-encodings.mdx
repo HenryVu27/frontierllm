@@ -550,6 +550,8 @@ The table below summarises the positional encoding choices across major public m
 
 *Llama 4 iRoPE.* Meta's April 2025 blog post describes an interleaved architecture where some attention layers use standard RoPE and others use no positional encoding (NoPE — positional-free layers). The intent is that RoPE layers handle local ordering while NoPE layers aggregate global context without positional bias. The blog does not disclose the ratio of RoPE to NoPE layers; third-party analysis (Singh, Medium, April 2025) reports a 3:1 pattern, but this is not confirmed by Meta.
 
+*SmolLM3 selective NoPE.* The 3B SmolLM3 model (Allal et al., 2025) adopts a related but distinct hybrid: RoPE on most layers, with NoPE substituted on every fourth layer — a 3:1 RoPE:NoPE ratio that Yang et al. (2025, "RoPE to NoRoPE and Back Again") formalised as a small-model–friendly long-context recipe. The mechanism is similar in spirit to Llama 4 Scout's iRoPE (NoPE layers carry no positional bias and aggregate global context), but the SmolLM3 design (a) is applied from the start of pretraining rather than retrofitted, (b) omits the inference-time temperature scaling Llama 4 uses, and (c) is paired with intra-document masking and tied embeddings as a coherent small-model recipe. Trained at 4 K context, SmolLM3 extends to 32 K and then 64 K via continued pretraining (RoPE $\theta = 1.5 \times 10^{6}$ then $5 \times 10^{6}$, $5 \times 10^{10}$ tokens per stage) and reaches 128 K at inference through YaRN extrapolation.
+
 *Gemini 2.5 Pro.* No primary technical report with positional encoding details was available at the time of writing. Community sources conflict. This row should be revisited when Google DeepMind publishes a Gemini 2.5 technical report.
 
 ---
@@ -773,5 +775,19 @@ The table below summarises the positional encoding choices across major public m
     venue: "amaarora.github.io, September 2025",
     url: "https://amaarora.github.io/posts/2025-09-21-rope-context-extension.html",
     note: "Complete technical timeline for RoPE context extension; independent verification of NTK-aware and YaRN formulas."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "SmolLM3: smol, multilingual, long-context reasoner",
+    venue: "Hugging Face blog",
+    url: "https://huggingface.co/blog/smollm3",
+    note: "SmolLM3 selective-NoPE schedule (every 4th layer), two-stage RoPE theta ramp (1.5e6 then 5e6) for 4K → 32K → 64K continued pretraining, YaRN extrapolation to 128K at inference."
+  },
+  {
+    authors: "Yang, B. et al.",
+    year: 2025,
+    title: "RoPE to NoRoPE and Back Again: A New Hybrid Attention Strategy",
+    note: "Formalises the selective-NoPE-every-Nth-layer recipe adopted by SmolLM3; provides the small-model justification for the 3:1 RoPE:NoPE pattern."
   }
 ]} />

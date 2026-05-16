@@ -198,6 +198,10 @@ Gemma 2's choice of $G=2$ (a 16:1 Q:KV ratio) is notably more aggressive than th
 The optimal value of $G$ is a function of model scale, batch size, and target context length, and there is no universal formula for it. Larger models with more query heads can afford lower $G/H$ ratios while maintaining representational capacity per group. Smaller models are more sensitive to group size. The Ainslie et al. (2023) paper characterises this empirically for T5 but the results do not straightforwardly extrapolate to decoder-only models at different scales.
 </Callout>
 
+<Callout variant="note" title="A decoder-only data point: SmolLM3's GQA-ratio ablation">
+Ainslie et al.'s 2023 quality–speed table is on T5-XXL — an encoder-decoder at 11B parameters. The SmolLM3 playbook (Allal et al., 2025) reports an analogous decoder-only ablation at the 1B / 45B-token scale, sweeping MQA ($G = 1$), GQA at $G \in \{2, 4, 8, 16\}$, and MHA ($H = 32$) on a Llama-3.2-style baseline. The qualitative finding mirrors Ainslie et al.: MQA underperforms MHA, GQA at $G \in \{4, 8\}$ matches MHA to within ablation noise, and intermediate ratios capture most of the cache reduction without measured quality loss. SmolLM3 shipped at $G = 4$ — eight KV heads against sixteen query heads, a Q:KV ratio of 2 rather than the 4 used in Llama 3 dense or the 16 used in Llama 3.1 405B. The smaller ratio reflects the smaller absolute number of query heads at 3B-class scale: a model with $H = 16$ cannot use the $G = 8$ ratio Llama 3 dense uses, because doing so leaves only two query-heads per group. The exact ablation numbers are reported in the playbook and not independently re-run here.
+</Callout>
+
 Cross-reference: RoPE is applied per KV-group head (not per query head), so the rotary encoding interacts with the GQA grouping structure. The full treatment is in [positional encodings](/textbook/00c-positional-encodings#rope).
 
 ---
@@ -754,5 +758,13 @@ A model has $d=8192$, $H=64$, $L=80$ layers, and uses GQA with $G=8$. You want t
     venue: "HuggingFace",
     url: "https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-405B/blob/main/config.json",
     note: "Source for Llama-3.1-405B architecture parameters: d=16384, H=128, G=8, dk=128, L=126."
+  },
+  {
+    authors: "Allal, L. B. et al. (Hugging Face)",
+    year: 2025,
+    title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs",
+    venue: "Hugging Face Spaces",
+    url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook",
+    note: "Source for the SmolLM3 1B/45B-token GQA head-ratio ablation cited in the 'A decoder-only data point' callout in this chapter."
   }
 ]} />
