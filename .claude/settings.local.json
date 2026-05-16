@@ -27,7 +27,8 @@
       "Bash(python -c ' *)",
       "Skill(superpowers:dispatching-parallel-agents)",
       "Skill(superpowers:brainstorming)",
-      "Bash(npm *)"
+      "Bash(npm *)",
+      "Bash(cmd *)"
     ]
   }
 }
