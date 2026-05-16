@@ -25,7 +25,9 @@
       "PowerShell(New-Item *)",
       "PowerShell(Start-Process \"C:\\\\Users\\\\Vuduc\\\\Desktop\\\\networking-guide.html\")",
       "Bash(python -c ' *)",
-      "Skill(superpowers:dispatching-parallel-agents)"
+      "Skill(superpowers:dispatching-parallel-agents)",
+      "Skill(superpowers:brainstorming)",
+      "Bash(npm *)"
     ]
   }
 }
