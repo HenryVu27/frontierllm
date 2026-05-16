@@ -128,6 +128,10 @@ For LLM rollouts, $\gamma = 1.0$ (no future discount — completions are short a
 
 ## PPO at LLM scale: the InstructGPT recipe {#full-pipeline}
 
+<Figure caption="The four models of canonical RLHF and the data path through one PPO iteration. Policy π_θ produces rollouts; reward r_φ scores them; reference π_ref provides logπ_ref for the β·KL penalty that keeps π_θ from drifting; value V_ψ provides the baseline for advantage estimation. Advantage + KL feed the PPO clip update, which writes back into π_θ (and V_ψ) — closing the loop. Frozen models in muted boxes, trained models in primary color.">
+  <RlhfPpoLoop />
+</Figure>
+
 ### The episode formulation
 
 A PPO episode for an LLM is the generation of a single response. Given a prompt $x$ sampled from a distribution $\mathcal{D}$:

@@ -69,6 +69,10 @@ With $\beta = 0.9$, the effective gradient window is ~10 steps. If the learning 
 
 ## Adam {#adam}
 
+<Figure caption="Trajectories on a banana-shaped (Rosenbrock-style) loss surface. Contour lines show level sets of the loss; the minimum is at (1, 1). Plain SGD oscillates across the narrow valley and creeps along it slowly. Momentum smooths the oscillation. Adam (and RMSProp) additionally rescale per-coordinate, taking much more direct paths across ill-conditioned curvature. Press play to animate, or scrub the step slider.">
+  <OptimizerTrajectory />
+</Figure>
+
 Adam (Kingma & Ba, 2015) extends the momentum idea to *two* running statistics: a first moment (signed, like SGD momentum) and a second moment (unsigned, tracking gradient magnitude). The ratio of the two gives a per-parameter, scale-normalised step.
 
 ### Update rule

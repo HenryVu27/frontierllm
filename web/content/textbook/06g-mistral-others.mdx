@@ -22,6 +22,20 @@ This chapter compactly surveys these labs. Calibration: May 15, 2026. The chapte
 
 ## Mistral {#mistral-line}
 
+<Figure caption="Mistral release timeline. Mistral 7B (Sep 2023) and Mixtral 8×7B (Dec 2023) established the lab's open-weights credibility; Mistral Large 3 (Mar 2025) is the 675B-MoE closed flagship; Magistral Small (Jun 2025) was the first European-labelled open-weights reasoning model. Bar heights are total parameter count where disclosed.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2023-09", name: "Mistral 7B", sub: "first open release", size: 7 },
+      { date: "2023-12", name: "Mixtral 8×7B", sub: "MoE", size: 47 },
+      { date: "2025-03", name: "Mistral Large 3", sub: "675B-MoE · closed", size: 675, highlight: true },
+      { date: "2025-04", name: "Small 3.1", sub: "24B multimodal", size: 24 },
+      { date: "2025-06", name: "Magistral Small", sub: "first EU reasoning", size: 24, highlight: true },
+      { date: "2025-10", name: "Magistral Medium", sub: "closed reasoning" },
+      { date: "2025-10", name: "Medium 3.5", sub: "128B agentic", size: 128 },
+    ]}
+  />
+</Figure>
+
 **Mistral AI** is the strongest European frontier lab as of 2026. The line has bifurcated into proprietary closed models (Mistral Large, Mistral Medium) and permissive open-weights models (Mistral Small, Codestral, Magistral Small).
 
 **Mistral Large 3 (March 2025).** 675B-parameter MoE flagship, with reported active-parameter count in the low tens of billions. Closed-weight, API-only. The architecture follows the standard MoE Transformer pattern (Module 0h); Mistral has not published a technical report at Llama-3.1 / DeepSeek-V3 detail.

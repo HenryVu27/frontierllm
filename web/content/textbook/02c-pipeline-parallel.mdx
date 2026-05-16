@@ -28,6 +28,10 @@ The activation-memory formulas in this chapter assume a particular recomputation
 
 ## The pipeline-parallel idea {#pp-idea}
 
+<Figure caption="Pipeline schedule comparison. Toggle GPipe (forward sweep then backward sweep — large idle bubble), 1F1B (one-forward-one-backward in steady state — smaller bubble, same activation memory), and Zero-Bubble (split backward into activation-grad B and weight-grad W; schedule W into the would-be bubble). Bubble fraction is computed live as you change M and P.">
+  <PipelineSchedule />
+</Figure>
+
 ### Layer partitioning
 
 Consider a transformer with $L$ layers numbered $1, \dots, L$, deployed across $p$ pipeline stages. The canonical assignment is contiguous: stage $i$ owns layers

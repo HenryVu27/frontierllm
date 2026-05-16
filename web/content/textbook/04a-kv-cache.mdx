@@ -86,6 +86,10 @@ Defragmentation—compacting live requests to consolidate free space—is theore
 
 ## Paged attention {#paged-attention}
 
+<Figure caption="Contiguous reservation vs PagedAttention block tables. Top panel: every request reserves a full max_seq_len slab whether it uses it or not — most of memory ends up as light-grey trailing waste. Bottom panel: the same requests are partitioned into fixed-size blocks (slider — vLLM default is 16) from a shared pool. Only the last block of each request is partially filled, so fragmentation collapses from ~60% to a few percent.">
+  <KvCacheLayout />
+</Figure>
+
 The solution draws from an old operating systems idea: virtual memory paging. Instead of allocating one contiguous buffer per request, divide the KV cache into fixed-size **logical pages**, each mapping to scattered **physical memory blocks** via an indirection table (the block table).
 
 **Reference:** Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," OSDI 2023, [arXiv:2309.06180](https://arxiv.org/abs/2309.06180)

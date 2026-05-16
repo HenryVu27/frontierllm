@@ -22,6 +22,17 @@ This chapter walks the Qwen family. Calibration: May 15, 2026. Cross-references 
 
 ## Family tree {#qwen-family-tree}
 
+<Figure caption="Qwen release timeline. ~6-month cadence between major versions with rapid point-version refreshes between. Qwen3 (Apr 2025) is the headline release: 36T training tokens, hybrid reasoning/non-reasoning toggle, and the lab's largest open-weights MoE at 480B/35B-active. Bar heights are total parameter count of the flagship variant at each release.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-06", name: "Qwen2", sub: "up to 72B", size: 72 },
+      { date: "2024-09", name: "Qwen2.5", sub: "up to 72B · 18T tok", size: 72 },
+      { date: "2024-11", name: "QwQ-32B", sub: "reasoning", size: 32 },
+      { date: "2025-04", name: "Qwen3", sub: "480B/35B-A · hybrid", size: 480, highlight: true },
+    ]}
+  />
+</Figure>
+
 **Qwen2 (June 2024).** 0.5B / 1.5B / 7B / 57B-MoE / 72B variants. The 57B-MoE configuration uses 14B activated parameters. Dense models use GQA, RoPE, SwiGLU, RMSNorm — the standard 2024 stack. Trained on ~7T tokens with ~30 language coverage. MMLU on the 72B variant reached ~84.2%, competitive with Llama 3 70B at the time.
 
 **Qwen2.5 (September 2024).** 0.5B / 1.5B / 3B / 7B / 14B / 32B / 72B variants. The major changes: 18T training tokens (versus Qwen2's 7T), expanded context (32K standard, 1M token long-context variant), improved instruction-tuning and multilingual coverage. The 72B variant pushed MMLU into the high-80% range. The Qwen2.5 family was the production workhorse line across late 2024 and early 2025 — the academic and on-device community's preferred mid-scale model set.

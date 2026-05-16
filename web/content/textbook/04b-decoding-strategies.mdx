@@ -64,6 +64,10 @@ This chapter traces the foundational methods (greedy, beam search, temperature),
 
 ## Temperature {#temperature}
 
+<Figure caption="Interactive decoding-strategy explorer over a fixed 10-token candidate distribution. Slide temperature to see logits compress (T→∞) or sharpen (T→0). Switch between top-k and top-p (nucleus) to see exactly which tokens survive the filter (colored) and which get clipped to zero (grey). The entropy readout connects the visual shape change to 'diversity vs determinism' quantitatively.">
+  <DecodingStrategies />
+</Figure>
+
 **Definition:** Scale logits by $1/T$ before softmax. As $T \to 0$, the distribution approaches argmax; as $T \to \infty$, it approaches uniform.
 
 **Mathematical form:**

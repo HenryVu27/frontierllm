@@ -24,6 +24,10 @@ Two background facts from the prerequisite module belong up front. First, commun
 
 ## The canonical 3D mix {#canonical-3d}
 
+<Figure caption="A live device mesh for (DP, TP, PP). Each square is one GPU; x-axis is TP rank within a node (color-cycled per TP rank), y-axis is PP stage, and the depth offset is the DP replica. Drag the three sliders to see how total GPU count = DP·TP·PP and which axis owns which collective. The convention shown — TP innermost, DP middle, PP outermost — is exactly Megatron's linear rank addressing and is what places the most bandwidth-hungry collective on the fastest link.">
+  <DeviceMesh />
+</Figure>
+
 The phrase "3D parallelism" entered the field through Narayanan et al.'s SC '21 paper on Megatron-LM, which named its composition **PTD-P** — Pipeline, Tensor, Data Parallelism. The paper trained a 1T-parameter GPT-3-style model on 3 072 A100 GPUs at 502 PetaFLOP/s aggregate throughput, ≈ 52% of peak. At the time this was the highest reported Model FLOPs Utilization (MFU) at that scale, and the first explicit demonstration that the 3D composition beat any 2D combination on the iso-GPU frontier. The configuration was $(\text{TP}=8, \text{PP}=64, \text{DP}=6)$ with sequence length 2 048 and global batch 1 536; per-GPU throughput came out at 163 TFLOPS at FP16.
 
 The three axes are orthogonal in the sense that every GPU has a unique triple $(\text{tp\_rank}, \text{pp\_rank}, \text{dp\_rank})$, and the global rank is recovered by the linear addressing

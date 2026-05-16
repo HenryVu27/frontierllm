@@ -120,6 +120,10 @@ The state of practice as of May 2026 is split. Large open labs with serious comp
 
 ## Dynamic curriculum {#curriculum}
 
+<Figure caption="A canonical three-stage data-mix curriculum (Llama-3-style proportions, illustrative). Stage 1 is broad and web-heavy. Stage 2 tilts toward higher-quality web and more code as the model masters basic structure. Stage 3 is the annealing tail: web share collapses, math/code/synthetic share doubles or triples. Hover any segment for exact percentages.">
+  <DataMixStack />
+</Figure>
+
 The static-mix methods above choose a single $\boldsymbol{p}$. The dynamic-curriculum extension chooses a trajectory $\boldsymbol{p}(t)$ over training. The conceptual claim is that the optimal mix is not constant. Early in pretraining, when the model is still learning basic syntactic structure, lexical statistics, and broad-coverage facts, a wide and web-heavy mix is appropriate. As the model approaches convergence, the marginal nats-of-loss reduction is dominated by *hard* tokens — code, math, reasoning chains, well-formed multi-step prose. A curriculum that shifts toward those domains late in training extracts more downstream capability per compute hour than the same total token budget spent at fixed mix.
 
 The mechanics of *how* to schedule that shift — the learning-rate cooldown shape, the data-mix interpolation curve, the WSD-versus-cosine timing — are the subject of [annealing and stability](/textbook/01h-annealing-and-stability). This chapter introduces the *what* and the *why*. Four empirical exemplars give the shape.

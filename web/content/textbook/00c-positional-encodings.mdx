@@ -111,7 +111,7 @@ RoPE (Su, Lu, Pan, Murtadha, Wen, Liu — RoFormer, arXiv:2104.09864, published 
 
 > The inner product of a rotated query at position $m$ and a rotated key at position $n$ depends only on the raw vector content and the **relative distance** $m - n$, not on $m$ or $n$ individually.
 
-<Figure caption="Rotation of a single 2-D query vector through RoPE. Slide the position m; the vector sweeps an arc of angle m·θ around the origin. The dot product with a similarly rotated key depends only on the difference in their positions, which is the relative-encoding property.">
+<Figure caption="Three coupled views of RoPE. Panel A puts two (q,k) pairs at different absolute positions but the same Δm — their angle, and therefore their inner product, is identical. Panel B shows all d/2 frequency bands rotating simultaneously at log-spaced rates; highlighted bands have wrapped past π and lose distinguishability, which is the failure mode that YaRN/NTK-aware scaling are designed to fix. Panel C plots ⟨q̂_m, k̂_n⟩ versus Δm for a fixed (q,k) — the oscillating, decaying envelope is what attention actually 'sees.'">
   <RopeRotation />
 </Figure>
 

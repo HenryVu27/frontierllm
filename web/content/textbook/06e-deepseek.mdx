@@ -26,6 +26,17 @@ DeepSeek is the inverse of Anthropic and OpenAI on disclosure: full architectura
 
 ## V2 and MLA {#v2-mla-architecture}
 
+<Figure caption="DeepSeek release timeline. V2 (May 2024) introduced MLA; V3 (Dec 2024) was the first frontier-scale FP8-pretrained model with auxiliary-loss-free MoE routing and DualPipe; R1 (Jan 2025) demonstrated long chain-of-thought emerging from pure outcome-reward RL on a V3 base; V3.2 (Oct 2025) introduced DeepSeek Sparse Attention. Bar heights are total parameter count.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-05", name: "DeepSeek-V2", sub: "236B/21B-A · MLA", size: 236 },
+      { date: "2024-12", name: "V3", sub: "671B/37B · FP8", size: 671, highlight: true },
+      { date: "2025-01", name: "R1", sub: "GRPO reasoning", size: 671, highlight: true },
+      { date: "2025-10", name: "V3.2", sub: "Sparse Attention", size: 671 },
+    ]}
+  />
+</Figure>
+
 **DeepSeek-V2 (May 2024).** 236B total parameters, 21B activated per token, 160 experts, 128K-context training. The headline architectural contribution was **Multi-Head Latent Attention (MLA)** — a substantially KV-cache-compressed variant of multi-head attention.
 
 **MLA mechanism.** Standard multi-head attention caches a K and V tensor per layer per token of size $L \cdot H \cdot d_h$ bytes (Module 4 § 04a). MLA compresses the cached K and V via a low-rank projection: queries are computed normally, but the cached state is the *latent* low-rank representation (typically dimension $d_c \ll H \cdot d_h$), and K and V are reconstructed at attention time. The trick is to choose the projection so that the rotary positional encoding still applies correctly — MLA decouples RoPE-handled components from the latent-compressed components, applying RoPE only to a small per-head residual.

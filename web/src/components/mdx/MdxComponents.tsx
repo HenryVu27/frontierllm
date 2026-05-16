@@ -14,6 +14,25 @@ import RopeRotation from "./figures/RopeRotation";
 import ActivationCurves from "./figures/ActivationCurves";
 import ScheduleOverlay from "./figures/ScheduleOverlay";
 import IsoflopCurve from "./figures/IsoflopCurve";
+import TensorParallelMatmul from "./figures/TensorParallelMatmul";
+import ZeroStages from "./figures/ZeroStages";
+import DeviceMesh from "./figures/DeviceMesh";
+import PipelineSchedule from "./figures/PipelineSchedule";
+import ExpertParallelRouting from "./figures/ExpertParallelRouting";
+import CommComputeOverlap from "./figures/CommComputeOverlap";
+import RecomputeMemory from "./figures/RecomputeMemory";
+import KvCacheLayout from "./figures/KvCacheLayout";
+import DecodingStrategies from "./figures/DecodingStrategies";
+import SpeculativeDecodingTimeline from "./figures/SpeculativeDecodingTimeline";
+import RlhfPpoLoop from "./figures/RlhfPpoLoop";
+import DpoLossGeometry from "./figures/DpoLossGeometry";
+import SaeSparsityTradeoff from "./figures/SaeSparsityTradeoff";
+import LabReleaseTimeline from "./figures/LabReleaseTimeline";
+import MuPTransfer from "./figures/MuPTransfer";
+import LossSpikeRecovery from "./figures/LossSpikeRecovery";
+import OptimizerTrajectory from "./figures/OptimizerTrajectory";
+import ActivationStats from "./figures/ActivationStats";
+import DataMixStack from "./figures/DataMixStack";
 
 const components = {
   Callout,
@@ -30,6 +49,25 @@ const components = {
   ActivationCurves,
   ScheduleOverlay,
   IsoflopCurve,
+  TensorParallelMatmul,
+  ZeroStages,
+  DeviceMesh,
+  PipelineSchedule,
+  ExpertParallelRouting,
+  CommComputeOverlap,
+  RecomputeMemory,
+  KvCacheLayout,
+  DecodingStrategies,
+  SpeculativeDecodingTimeline,
+  RlhfPpoLoop,
+  DpoLossGeometry,
+  SaeSparsityTradeoff,
+  LabReleaseTimeline,
+  MuPTransfer,
+  LossSpikeRecovery,
+  OptimizerTrajectory,
+  ActivationStats,
+  DataMixStack,
 };
 
 interface MdxComponentsProviderProps {

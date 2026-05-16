@@ -26,6 +26,10 @@ The chapter assumes familiarity with KV caching ([Chapter 04a](/textbook/04a-kv-
 
 ## Draft-target framework {#draft-target}
 
+<Figure caption="One step of speculative decoding. The draft model emits k cheap tokens (top row, each costing c ≈ 0.1 target-step units). The target then runs a single forward that verifies all k positions in parallel (bottom block, cost 1 unit). The longest accepted prefix is committed plus one bonus token from the target's own argmax at the rejection point. Wallclock speedup vs vanilla decoding rises with acceptance rate α and falls as draft cost c·k grows — sliders let you sweep both.">
+  <SpeculativeDecodingTimeline />
+</Figure>
+
 ### The two-stage pipeline
 
 Speculative decoding decomposes inference into two recurring stages, applied in sequence over the output sequence:

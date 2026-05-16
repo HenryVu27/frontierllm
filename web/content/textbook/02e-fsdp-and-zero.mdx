@@ -28,6 +28,10 @@ Throughout this chapter: $\Psi$ denotes the total trainable parameter count, use
 
 ## ZeRO-1 / 2 / 3 {#zero-stages}
 
+<Figure caption="What gets sharded across DP ranks at each ZeRO stage. Green buckets are replicated on every rank; striped buckets are partitioned 1/N. ZeRO-1 shards only the optimizer state (the largest piece in mixed-precision Adam). ZeRO-2 adds gradients. ZeRO-3 / FSDP adds parameters — only 1/N of the model lives on each rank in rest state, all-gathered on demand per layer.">
+  <ZeroStages />
+</Figure>
+
 The ZeRO observation, stated precisely, is the following. Plain DDP holds three pieces of model state on every rank: BF16 (or FP16) parameters, BF16 (or FP16) gradients, and an FP32 optimiser state. Under $N_d$-way data parallelism, every byte of every piece is replicated $N_d$ times across the world. The three ZeRO stages partition these three pieces in turn:
 
 1. **ZeRO-1 ($P_{\text{os}}$).** Partition the *optimiser state* across the $N_d$ ranks; keep parameters and gradients replicated. Each rank still receives the full gradient (via the usual all-reduce) and still holds the full BF16 weight tensor, but the FP32 master parameters and the Adam moments live only on the rank responsible for each parameter slice.

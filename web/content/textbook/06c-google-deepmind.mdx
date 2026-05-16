@@ -22,6 +22,21 @@ This chapter is calibrated to Google DeepMind's public disclosures through May 1
 
 ## Gemini family tree {#gemini-family-tree}
 
+<Figure caption="Gemini release timeline. Gemini 1.5 (Feb 2024) shipped the 10M-token context that defined the line; Gemini 2.0 (Dec 2024–Feb 2025) dialed context back to 100K–200K but added real-time multimodal agentic capabilities; Gemini 2.5 Pro (May 2025) settled on 1M-token standard; Gemini 3 Pro (Nov 2025) introduced enhanced reasoning. Cadence averages ~6 months between major versions.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-02", name: "Gemini 1.5", sub: "10M context", highlight: true },
+      { date: "2024-12", name: "2.0 Flash Exp", sub: "" },
+      { date: "2025-01", name: "2.0 Flash GA", sub: "" },
+      { date: "2025-02", name: "2.0 Pro", sub: "" },
+      { date: "2025-05", name: "2.5 Pro", sub: "1M standard" },
+      { date: "2025-11", name: "Gemini 3 Pro", sub: "reasoning", highlight: true },
+      { date: "2025-12", name: "3 Flash", sub: "" },
+      { date: "2026-02", name: "3.1 Pro Preview", sub: "" },
+    ]}
+  />
+</Figure>
+
 **Gemini 1.5 (February 2024)** was the watershed release: a 10M-token native multimodal sparse Mixture-of-Experts model. The headline capability was the context window — an order of magnitude longer than Claude 2.1's 200K and GPT-4 Turbo's 128K — with retrieval accuracy of $>$ 99% on needle-in-haystack probes at the full 10M. The architecture combined a sparse MoE backbone with RoPE-based long-context attention and modality-specific tokenizers (Module 0c attention variants; Module 0h MoE plumbing).
 
 **Gemini 2.0 (December 2024 – February 2025).** Three variants: 2.0 Flash Experimental (December 2024), 2.0 Flash GA (January 2025, the new default), 2.0 Pro (February 2025). The release emphasised agentic capabilities — real-time multimodal API (audio/video in, audio/video/text out), native image generation, integrated Google Search — and 2× speedup over 1.5 Pro. Context dropped from 10M back to 100K–200K standard; the 10M capability remained available but became a specialty endpoint. The shift signals DeepMind's read that 10M solved a real but niche use case.

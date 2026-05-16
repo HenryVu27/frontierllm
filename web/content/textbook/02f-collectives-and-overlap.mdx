@@ -189,6 +189,10 @@ The chapter's worked example sits firmly in the bandwidth regime: a 14 GB gradie
 
 ## Communication overlap: DDP bucketing + FSDP prefetch {#overlap}
 
+<Figure caption="Serial vs bucketed-overlap timeline. In the serial schedule, the whole-gradient all-reduce begins only after backward finishes — it sits on the critical path. With bucketing, each gradient bucket all-reduces as soon as its grads are ready, overlapping with the remainder of backward; only the tail bucket cannot be hidden. The slider tunes bucket count: too few buckets leaves a large unhidden tail; too many drives up per-collective startup overhead.">
+  <CommComputeOverlap />
+</Figure>
+
 On a modern GPU, communication takes microseconds-to-milliseconds and compute takes microseconds-to-milliseconds. If they are sequenced, roughly half the machine is wasted. If they are overlapped, none of it is. Three frameworks accomplish this differently; each illustrates a key design pattern.
 
 ### PyTorch DDP: gradient bucketing

@@ -231,6 +231,10 @@ DeepMind released all Gemma Scope SAEs on Hugging Face, along with an interactiv
 
 ## TopK, BatchTopK, and Matryoshka SAEs {#topk-jumprelu}
 
+<Figure caption="The sparsity–reconstruction Pareto frontier. X-axis: L0 (active features per token, log scale). Y-axis: fraction of variance unexplained — lower is better. The Gated/JumpReLU family strictly dominates the ReLU/TopK family at the same L0. The dashed horizontal line marks the downstream-quality threshold at which substituting the SAE reconstruction for the original activations starts to hurt the underlying LM — the operational target is to sit *below* the line at the smallest L0 you can manage.">
+  <SaeSparsityTradeoff />
+</Figure>
+
 ### TopK: direct sparsity control
 
 **TopK** is a sparsity function that keeps exactly $k$ largest entries and zeros the rest:

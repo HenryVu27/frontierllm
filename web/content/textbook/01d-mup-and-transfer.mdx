@@ -91,6 +91,10 @@ A practical note: Appendix B of Tensor Programs V gives two algebraically equiva
 
 ## The mup-transfer procedure {#transfer-procedure}
 
+<Figure caption="The canonical µP demonstration. Toggle between Standard parameterization (SP) and µP. Under SP, the loss-vs-LR curves for different widths peak at *different* learning rates — a sweep at one width gives you the wrong LR at another. Under µP, all curves collapse onto the same optimum (vertical line). That collapse is what makes proxy-width tuning economically viable: sweep at width 128, train at width 8192.">
+  <MuPTransfer />
+</Figure>
+
 A working μP setup is established and validated by a four-step protocol. The same protocol appears in both the EleutherAI practitioner's guide (2024) and Cerebras's developer documentation, and is the de facto standard for adopting μP in a new codebase.
 
 ### Step 1: coordinate check

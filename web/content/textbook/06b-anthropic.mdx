@@ -26,6 +26,21 @@ Anthropic's pattern across 2024–2026: aggressive transparency on safety govern
 
 ## The Claude family tree {#claude-family-tree}
 
+<Figure caption="Claude release timeline through May 2026. The three-tier (Opus/Sonnet/Haiku) strategy starts at Claude 3 and stays throughout. Claude 4 (May 2025) introduced Computer Use as a public-model feature; Claude 4.6 (Feb 2026) added 1M-token context; Opus 4.7 (Apr 2026) is the current frontier with 87.6% on SWE-bench Verified.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-03", name: "Claude 3", sub: "Opus/Sonnet/Haiku" },
+      { date: "2024-06", name: "Claude 3.5 Sonnet", sub: "beats Opus 3" },
+      { date: "2024-10", name: "3.5 Haiku", sub: "" },
+      { date: "2025-05", name: "Claude 4", sub: "Opus + Sonnet", highlight: true },
+      { date: "2025-10", name: "Haiku 4.5", sub: "" },
+      { date: "2025-11", name: "Opus 4.5", sub: "" },
+      { date: "2026-02", name: "Claude 4.6", sub: "1M context" },
+      { date: "2026-04", name: "Opus 4.7", sub: "current frontier", highlight: true },
+    ]}
+  />
+</Figure>
+
 **Claude 3 (March 4, 2024)** introduced the three-tier strategy that has defined the line: **Opus** (largest, most capable, slowest, most expensive), **Sonnet** (optimal speed–intelligence balance, the production workhorse), and **Haiku** (smallest, fastest, lowest cost). All three tiers shipped with 200K-token context, native vision input, and the same Constitutional AI training pipeline.
 
 **Claude 3.5 Sonnet (June 20, 2024)** outperformed Claude 3 Opus on most benchmarks despite being a smaller model — the explicit demonstration that training quality and instruction-tuning can beat raw parameter scaling. **Claude 3.5 Haiku (October 22, 2024)** followed with similar gains in the small-model tier.

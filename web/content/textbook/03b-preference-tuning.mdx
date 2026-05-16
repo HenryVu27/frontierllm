@@ -28,6 +28,10 @@ One partial exception is worth noting at the outset. Qwen-3 (Alibaba, May 2025) 
 
 ## DPO derivation {#dpo-derivation}
 
+<Figure caption="The DPO loss −log σ(β·m) as a function of the log-ratio margin m = (logπ_θ(y_w)−logπ_ref(y_w)) − (logπ_θ(y_l)−logπ_ref(y_l)), for several β. The loss is just binary cross-entropy on a transformed margin. m > 0 means the policy already prefers the winner more than the reference did. Larger β sharpens the loss around m=0 — stronger reward pressure, faster convergence, but more reward-hacking risk. The loss never reaches zero: there is always pressure to widen the gap further.">
+  <DpoLossGeometry />
+</Figure>
+
 ### The RLHF objective
 
 Classical RLHF, as described by Ouyang et al. (2022) for InstructGPT, trains a reward model $r_\phi$ from preference data and then maximises expected reward under a KL constraint that prevents the policy from drifting too far from the reference:

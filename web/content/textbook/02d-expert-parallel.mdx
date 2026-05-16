@@ -34,6 +34,11 @@ Why pay this cost at all? With many small experts, the total expert parameter co
 
 ## AlltoAll dispatch and combine {#alltoall}
 
+<Figure caption="Expert-parallel all-to-all dispatch. Tokens at the top live wherever they arrived; experts at the bottom are sharded across devices. Each token's color encodes the expert it was routed to; same-device routing (dashed) carries no network bytes, cross-device routing (solid) does. The dispatch all-to-all sends every token to the device that owns its assigned expert; a symmetric combine all-to-all returns results.">
+  <ExpertParallelRouting />
+</Figure>
+
+
 Both AlltoAll calls in an MoE layer are personalised in the MPI sense: each source rank sends a distinct buffer to each destination rank. They are neither AllGather (where every rank sends the same payload) nor ReduceScatter (where reductions happen in transit). In NCCL, the calls are implemented either as a single `ncclAllToAll` (when buffers are uniform-size) or as `ncclAllToAllv` or a sequence of `Send`/`Recv` pairs (when buffers vary). MoE almost always requires the variable-size form because token-to-expert load is data-dependent: routing decisions are made by a learned router on actual input tokens, and the number of tokens that land on each expert fluctuates from micro-batch to micro-batch.
 
 The dispatch ships three quantities per routed (token, expert) pair: the token's hidden vector of $d$ elements, the gate value for that (token, expert) pair as a single fp32 scalar, and an index field that identifies the originating rank and position so the combine can route the expert output back to the right place. The hidden vector dominates the byte count; the gate and metadata are negligible to first order. If a token is routed to $k$ experts, the dispatch in principle sends $k$ copies of its hidden vector, one to each of the $k$ host ranks. In practice, implementations deduplicate within a rank: if two of a token's $k$ experts both live on the same destination rank $r'$, the hidden vector is shipped to $r'$ only once and replicated locally. DeepSeek-V3 exploits a stronger version of this deduplication via node-limited routing, discussed in the next section.

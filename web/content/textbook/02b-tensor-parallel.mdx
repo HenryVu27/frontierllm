@@ -44,6 +44,10 @@ The remainder of the chapter derives Megatron's particular choice of partitionin
 
 ## The MLP split: column-then-row {#mlp-split}
 
+<Figure caption="Column-parallel vs row-parallel linear layers. Column-parallel splits the weight along its output dimension — each rank produces a slice of Y with no comm during forward. Row-parallel splits along the input dimension — each rank produces a partial sum and an all-reduce combines them. Megatron's MLP composes them as ColumnParallel → GeLU → RowParallel, which is why exactly one all-reduce sits at the very end of the block.">
+  <TensorParallelMatmul />
+</Figure>
+
 The transformer's [MLP block](/textbook/00a-transformer#mlp-block) maps a hidden state $X \in \mathbb{R}^{b \times s \times h}$ through two linear projections with an elementwise nonlinearity between them:
 
 $$

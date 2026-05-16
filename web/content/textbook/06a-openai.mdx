@@ -26,6 +26,22 @@ OpenAI has not published architectural details for GPT-4 onward (parameter count
 
 ## The GPT line {#gpt-line}
 
+<Figure caption="OpenAI release timeline through May 2026. Highlighted dots mark the line's punctuated phase changes: GPT-4o (May 2024) collapsed text/vision/audio into one model, o1 (Dec 2024) introduced inference-time reasoning as a paradigm, GPT-5 (Aug 2025) unified reasoning back into the dense line, and GPT-5.5 (Apr 2026) is the current frontier dense model.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2023-03", name: "GPT-4", sub: "8K → 128K" },
+      { date: "2024-05", name: "GPT-4o", sub: "native multimodal", highlight: true },
+      { date: "2024-12", name: "o1", sub: "reasoning-1", highlight: true },
+      { date: "2025-02", name: "GPT-4.5 Orion", sub: "last pre-reasoning" },
+      { date: "2025-04", name: "o3 / o4-mini", sub: "reasoning flagship" },
+      { date: "2025-08", name: "GPT-5", sub: "unified", highlight: true },
+      { date: "2025-12", name: "GPT-5.2", sub: "modes" },
+      { date: "2026-03", name: "GPT-5.4", sub: "" },
+      { date: "2026-04", name: "GPT-5.5", sub: "current", highlight: true },
+    ]}
+  />
+</Figure>
+
 **GPT-4 (March 2023)** was the first OpenAI frontier model with a published technical report, an 8K-context multimodal-input transformer with explicit benchmark disclosures (88th-percentile on the Uniform Bar Exam). The November 2023 **GPT-4 Turbo** refresh raised context to 128K and improved instruction-following; the underlying model line remained roughly the same.
 
 **GPT-4o (May 2024)** was the first end-to-end natively multimodal model — text, vision, and audio trained jointly into a single transformer, with audio-output latency reported at 232–320 ms (near-conversational). GPT-4o's image-generation behaviour was native (not a separate DALL·E hop), enabling iterative refinement inside a chat. Cost dropped roughly 50% versus GPT-4 Turbo on the same text benchmarks, which made GPT-4o the production workhorse for most of 2024–2025.

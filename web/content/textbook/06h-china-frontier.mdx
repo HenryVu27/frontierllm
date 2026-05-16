@@ -24,6 +24,22 @@ Several of these labs publish primarily in Chinese; not all technical reports ha
 
 ---
 
+<Figure caption="Chinese frontier-LLM release timeline (excluding DeepSeek and Qwen, which have their own chapters). Bar heights are total parameter count where disclosed. The cluster of 2025 MoE releases — GLM-4.5 (355B/32B), Kimi K2 (1.04T/32B), Hunyuan HY3 (295B/21B), MiniMax M1 (456B/45.9B) — places multiple Chinese labs in the same total-parameter regime as DeepSeek-V3 and Llama 4 Maverick.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-01", name: "GLM-4", sub: "Zhipu" },
+      { date: "2024-06", name: "Hunyuan HY2", sub: "Tencent · 406B/32B-A", size: 406 },
+      { date: "2025-01", name: "Kimi K1.5", sub: "Moonshot" },
+      { date: "2025-04", name: "GLM-4.5", sub: "355B/32B · tool-use", size: 355 },
+      { date: "2025-06", name: "Kimi K2", sub: "1.04T/32B-A", size: 1040, highlight: true },
+      { date: "2025-07", name: "MiniMax M1", sub: "456B · Lightning Attn", size: 456, highlight: true },
+      { date: "2025-09", name: "Hunyuan-T1", sub: "Mamba hybrid" },
+      { date: "2026-01", name: "Kimi K2.5", sub: "agentic" },
+      { date: "2026-02", name: "Doubao Seed 2.0", sub: "ByteDance · 155M WAU" },
+    ]}
+  />
+</Figure>
+
 ## Moonshot Kimi {#moonshot-kimi}
 
 **Moonshot AI** is the Chinese lab whose Kimi line has been the most aggressive on context length and reasoning.

@@ -126,6 +126,10 @@ Always verify that your RMSNorm implementation upcasts the accumulation to FP32 
 
 ## Pre-norm vs post-norm {#pre-norm-vs-post-norm}
 
+<Figure caption="Activation and gradient norms across depth (log scale, 40 layers) under three regimes. Without normalization, activations decay (or explode, depending on init) and gradients vanish at the head — the network is untrainable past a few layers. Post-LN (original Transformer): activations drift upward late and gradients vanish at the top, exactly the failure mode that limited GPT-1 → GPT-2 stability. Pre-LN: both stay roughly flat across depth — the reason every frontier model from GPT-3 onward uses it.">
+  <ActivationStats />
+</Figure>
+
 The placement of normalization within a transformer block has substantial training dynamics consequences. Refer to the [residual stream framing](/textbook/00a-transformer#residual-stream) in chapter 1 for the block-level context.
 
 ### Placement variants

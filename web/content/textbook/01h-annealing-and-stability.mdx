@@ -127,6 +127,10 @@ A complication worth flagging: ProLong-8B and Phi-4 both report that training so
 
 ## Training stability {#stability}
 
+<Figure caption="Loss-spike triage. Trend ±1σ shown as the shaded band. A spike at step ~60k triggers one of three responses: 'do nothing' lets the loss sit permanently above trend (the 'lost run' signature — category 3 in Bekman's taxonomy below); 'skip bad batch' returns to trend within a few hundred steps with negligible compute cost; 'rollback + lower LR' takes longer but is the canonical recovery when the offending data slice cannot be identified.">
+  <LossSpikeRecovery />
+</Figure>
+
 The published "no-spike" claims at the 14.8T-token / 671B-parameter scale (DeepSeek-V3), at the 15.5T-token / 1T-parameter scale (Kimi-K2), and at the 7B / 13B / 32B sizes (OLMo-2) all rely on a *stack* of techniques. None of the three runs reports the minimal subset that would have sufficed; the literature has not yet falsified any one component as unnecessary. This section walks through the spike-lineage history and the operational tools, with the caveat that the stack is empirically tunable and lab-specific.
 
 <Callout variant="info" title="Bekman's six-category loss-pattern taxonomy">

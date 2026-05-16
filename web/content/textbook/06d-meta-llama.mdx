@@ -26,6 +26,19 @@ The Llama line ships with weights under the Meta Community License. The license 
 
 ## The Llama 3 line {#llama-3-line}
 
+<Figure caption="Llama release timeline. The 3.x line is the canonical dense frontier — Llama 3.1 (Jul 2024) shipped the 405B flagship with the most-detailed open-weights training disclosure of the era. Llama 4 (Apr 2025) is the MoE pivot: Scout (109B/17B-active), Maverick (400B/17B-active). Bar heights are total parameter count, log scale.">
+  <LabReleaseTimeline
+    releases={[
+      { date: "2024-04", name: "Llama 3", sub: "8B / 70B", size: 70 },
+      { date: "2024-07", name: "Llama 3.1", sub: "405B flagship", size: 405, highlight: true },
+      { date: "2024-09", name: "Llama 3.2", sub: "VLM 11B/90B", size: 90 },
+      { date: "2024-12", name: "Llama 3.3", sub: "70B only", size: 70 },
+      { date: "2025-04", name: "Llama 4 Scout", sub: "109B/17B-A MoE", size: 109, highlight: true },
+      { date: "2025-04", name: "Maverick", sub: "400B/17B-A", size: 400 },
+    ]}
+  />
+</Figure>
+
 **Llama 3 (April 2024).** 8B and 70B dense transformers. Trained on 15T tokens with the standard transformer recipe (Module 0a), RoPE positional encoding (Module 0c), Grouped-Query Attention (Module 0b), SwiGLU MLP (Module 0e), and RMSNorm (Module 0d). The 70B variant reached competitive MMLU at ~82%; the 8B variant established the new small-model frontier at ~66%.
 
 **Llama 3.1 (July 2024).** Added the **405B** flagship — the largest open-weights model released to date — alongside 8B and 70B refreshes. The accompanying *Llama 3.1 Herd of Models* technical report disclosed: 15.6T training tokens, 16K H100 GPUs, 30.84M GPU-hours for pretraining (and a similar order for post-training), BF16 mixed-precision pretraining with FP8 used for quantization at inference. The 405B variant matched GPT-4 on most knowledge benchmarks (MMLU 87.3%, MATH 73.8%, HumanEval 89.0%, GPQA 50.7%) and substantially shifted the open-weights frontier.
