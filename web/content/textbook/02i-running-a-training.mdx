@@ -1,0 +1,164 @@
+---
+slug: 02i-running-a-training
+title: Running a training campaign — practice, not mechanics
+description: The Smol Training Playbook as a case study in how a real frontier pretraining team decides to train, picks a framework, structures its compute budget, runs the pre-flight checklist, monitors the run, and survives mid-run failures.
+order: 27
+chapter: 27
+module: 2
+module_title: Distributed training
+reading_minutes: 22
+depends_on: [02-distributed]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## About this chapter {#about}
+
+Chapters 19–26 of this module covered the *mechanics* of multi-thousand-GPU language-model training: how to shard the model across DP, TP, PP, EP, and CP ranks; how the NCCL collectives compose into the bandwidth bill of each step; how mixed precision and gradient checkpointing trade memory for compute; how all of these axes compose into the 3D / 4D / 5D parallelism recipes that real frontier runs use. The mechanics are durable. The recipes change every six to twelve months.
+
+This chapter covers the *practice* of running a real training campaign — the engineering and organisational decisions that sit on top of the mechanics. The questions it answers are operational: when should a team train a base model at all? What framework should they pick? How much compute do they actually need, once ablations and debugging are included? What should they monitor beyond loss? What goes wrong in the middle of a run, and what is the first-pass diagnostic?
+
+The chapter draws primarily on the **Hugging Face Smol Training Playbook** (Allal et al., 2025) — the cleanest open disclosure of these questions as of May 2026. Most frontier labs publish a tech report after the model ships. The playbook publishes the *recipe development* alongside the *recipe*, including ablation budgets, framework-selection rationale, debugging stories, and the full mid-run silent-tensor-parallelism-bug episode that consumed roughly 37% of SmolLM3's total compute. No closed-frontier lab has published anything comparable; the playbook is the worked example this chapter treats as canonical and supplements with disclosures from Meta (Llama-3 herd paper), DeepSeek-AI (V3 technical report), and AllenAI (OLMo-2) where they exist.
+
+---
+
+## The compass: when to train a base model {#compass}
+
+The question the playbook puts first is not "how" but "why train at all." Three categories of justification are named.
+
+**Research.** A novel question requires running the experiment. Examples from the 2024–2025 cycle: "can RL alone produce reasoning without SFT?" (DeepSeek-R1, 2025), "does a MoE with auxiliary-loss-free routing match a softmax-aux-loss MoE?" (DeepSeek-V3, 2024), "does the iRoPE interleaved-NoPE schedule extend cleanly to 10M-token deployment?" (Llama-4 Scout, 2025). The experiment is the deliverable; the model is the by-product.
+
+**Production.** An existing model does not meet a real deployment constraint — domain-specific quality, latency budget, on-device memory, governance posture, data-residency requirement. The decision is economic: is the cost of training cheaper than the cost of working around the gap? For a 7B-class on-device deployment, the answer is often yes; for a 70B-class general-purpose chat model in 2026, almost never.
+
+**Strategic open-source.** A community gap exists that no closed-lab release will fill: a better-data recipe, an open replication for a closed result, an ecosystem-level capability transfer. BLOOM (2022) addressed GPT-3 closure; StarCoder/StarCoder2 replicated Codex for open-source code; the SmolLM family (135M–3B) targeted the underexplored small-on-device-model space. Each of these justifications is *external* — a gap in the ecosystem, not a gap in the lab's compute schedule.
+
+The negative case the playbook names is the most common failure mode: *"we have compute available."* Allal et al. (2025) flag this explicitly as insufficient justification. Compute that is not tied to a defined research question or production target produces a model with no audience and no follow-up; the run absorbs team attention that would compound elsewhere.
+
+---
+
+## Iteration speed and team shape {#iteration}
+
+A second piece of the playbook's framing argument is structural. Frontier-style pretraining is feasible at a team scale of **two to three engineers** for the small-open-model regime (135M–3B), provided the team iterates on a roughly **quarterly cadence**. Hugging Face's own trajectory is the worked example: BLOOM (BigScience consortium) → StarCoder (small core team) → StarCoder2 → SmolLM → SmolLM2 → SmolLM3. Each release is roughly one quarter to two quarters apart; each compounds the previous recipe's improvements.
+
+The thesis the playbook makes explicit is that *every recipe-improvement cycle compounds*. A lab that runs four quarters of recipe-iteration in a year accumulates four rounds of ablation findings, debugging fixes, and data-pipeline improvements. A lab that runs one annual training cycle at the same total compute accumulates one. At fixed total compute the cadence-iteration lab is structurally ahead.
+
+The closed-frontier labs — OpenAI, Anthropic, Google DeepMind, the closed Chinese frontier — are presumed to operate at substantially larger team scale, but their iteration cadence is not publicly disclosed. The contrast is not closed-vs-open; it is *cadence-disclosed-vs-not-disclosed*, and the per-lab chapters in [Module 6](/textbook/06-frontier-labs) inherit that asymmetry.
+
+The compute consequence of the cadence thesis is that ablation share of total compute is *substantial*, not a rounding error. SmolLM3 spent roughly 161,280 GPU-hours on ablations, debugging, and a full restart from a silent tensor-parallelism bug — about **37%** of the 437,760 GPU-hour total. The next section makes this concrete.
+
+---
+
+## Compute budget accounting {#compute-budget}
+
+The headline "training compute" number in a frontier tech report covers the single main run. It excludes the recipe-development work that decided what that run should be. SmolLM3 is the cleanest open disclosure of the gap.
+
+<Callout variant="warning" title="The ablation share is the biggest gap between published numbers and reality">
+Of SmolLM3's total **≈ 437,760 GPU-hours**, approximately **161,280 GPU-hours (≈ 37%)** were consumed by ablations, debugging, and a full restart from a silent tensor-parallelism bug at the ~1T-token mark. The remaining **≈ 276,480 GPU-hours (≈ 63%)** paid for the production 11.2 T-token run. The independent cross-check: 384 H100 GPUs × 24 days = ≈ 221,184 GPU-hours covers the main-run wall-clock; the remaining ≈ 55,000 hours sit in continued-pretraining stages and end-of-run validation. The ≈ 161,000 ablation hours are spread across smaller clusters earlier in the project. The orientation page of [Module 1](/textbook/01-pretraining#shape) quotes this breakdown verbatim and uses it as the calibration anchor for "what an ablation budget should look like" at any other scale.
+</Callout>
+
+Frontier-scale runs do not publish an analogous breakdown. The SmolLM3 disclosure is the right order-of-magnitude expectation for any lab that takes recipe development seriously: budget for an ablation share of **30–50% of total compute**, not 5%. A lab that plans the main run at 100% of compute and discovers the ablation share at 30% mid-project either ships a worse recipe or extends timeline by months.
+
+The same compute-accounting honesty applies to the validation budget. SmolLM3's evaluation cost (roughly 10,000 GPU-hours, spread throughout the project) is not in the headline 437,760 number. Frontier labs that run continuous eval loops typically allocate 1–3% of compute to evaluation; the playbook recommends not letting this drift toward zero.
+
+---
+
+## Training framework landscape {#frameworks}
+
+The 2026 frontier landscape has converged on four production-quality training frameworks. Each occupies a distinct point on the battle-tested–vs–readable trade-off.
+
+<ComparisonTable
+  caption="Training frameworks for frontier pretraining, May 2026. Battle-tested examples come from public technical reports; LoC counts are approximate core-only counts and exclude tests and tooling."
+  columns={["Framework", "Battle-tested at", "Core LoC (approx.)", "Position on the trade-off"]}
+  rows={[
+    ["Megatron-LM (NVIDIA)", "BLOOM 175B, Nemotron family, Phi pretraining stack", "~93k", "Most battle-tested; large codebase; steep learning curve."],
+    ["DeepSpeed (Microsoft)", "BLOOM, GLM family, several Microsoft research models", "~94k", "Battle-tested; ZeRO origin; complex debugging surface."],
+    ["TorchTitan (PyTorch team)", "PyTorch-team reference + community 2024–2025 adoption", "~7k", "Smallest readable codebase; FSDP-2 reference implementation; less battle-tested at largest scales."],
+    ["Nanotron (Hugging Face)", "StarCoder, StarCoder2, SmolLM family, SmolLM3", "~15k", "Moderate complexity; integrated with HF data and tokenizer tooling."],
+  ]}
+/>
+
+The playbook's operational rule is unambiguous: **do not switch frameworks between ablations and the production run.** Each framework has subtle differences in how it handles mixed-precision casts, gradient accumulation, optimizer-state sharding, and checkpoint format. A model that ablates well in Nanotron and then trains in Megatron-LM at full scale is not the same model; the cross-framework reproduction is itself a weeks-of-wall-clock engineering project. SmolLM3 ablated and trained in Nanotron throughout. Llama-3 405B used Meta's internal stack throughout. DeepSeek-V3 used DeepSeek's internal stack throughout.
+
+The corollary for a lab starting from scratch: pick the framework with the team's pretraining experience, not the framework with the most-cited paper. A team comfortable with FSDP-2 ships TorchTitan; a team comfortable with the HF tokenizer + dataset stack ships Nanotron; a team comfortable with the Megatron ZeRO-3 + sequence-parallel stack ships Megatron-LM. The "best" framework is the one the team can debug at 3am during a mid-run incident.
+
+---
+
+## The pre-flight checklist {#pre-flight}
+
+The single highest-leverage operational discipline the playbook documents is the pre-flight checklist. Six items the team verifies *before* the production run starts.
+
+1. **Validate the evaluation suite against published baselines.** Pick a known checkpoint with a known reported score on a known benchmark — Llama-3.1-8B on MMLU CF, for example — and reproduce the reported number to within reported noise. If the eval suite cannot reproduce a known result on a known checkpoint, every downstream evaluation in the run is suspect.
+
+2. **Test every library upgrade between last working state and the production codepath.** This includes `transformers`, `torch`, `nanotron` / `megatron`, NCCL, CUDA, the GPU driver. Dependency upgrades have a documented history of introducing silent numerical changes (most famously the BF16 reduction-order changes in NCCL 2.18+); the test is to run the last-known-good ablation on the production codepath and verify the loss curve matches.
+
+3. **Spot-check the data loading at several seeds.** Sample documents from the actual loader, verify tokenization round-trips, verify that document boundaries match the intra-document masking strategy from §[the transformer block](/textbook/00a-transformer). Most data bugs do not crash; they degrade quality silently.
+
+4. **Profile throughput on the target hardware at the target parallelism configuration.** A configuration that profiles well at 32 GPUs may scale poorly to 384; an extra communication step that's unobserved at small scale dominates at full scale. The throughput profile is the production cost forecast.
+
+5. **Verify checkpoint save / load round-trips deterministically.** Save a checkpoint, load it, take one training step, save again, compare to the checkpoint produced by a continuous run from the same starting state. The two should be bitwise-identical for model weights, optimiser state, scheduler state, dataloader state, and RNG state. Any divergence is a mid-run resume bug waiting to surface.
+
+6. **Test the parallelism configuration at small scale before scaling to full cluster.** Run the production codepath at a single node, then at four nodes, then at the full cluster — observing throughput and loss continuity at each step. A bug that hides at single-node scale and appears at 48 nodes is the most expensive class of bug; small-scale staging catches most of them.
+
+The checklist is operational rather than methodological. It does not improve the recipe; it prevents the run from absorbing a debugging episode that consumes the ablation budget twice over. SmolLM3's 1T-token silent-TP-bug episode is one example of what a passed checklist does not catch — a numerically correct tensor-parallel implementation can still produce a slow loss drift that is invisible at small scale.
+
+---
+
+## Monitoring beyond loss {#monitoring}
+
+The deep treatment of mid-run monitoring is in [§Mid-run operational failures](/textbook/01h-annealing-and-stability#mid-run-failures) of Chapter 17. The summary for this chapter: **loss alone is the wrong sensor.** Loss is a final-product metric; it lags the upstream symptom by anywhere from a single step (sharp spike) to thousands of steps (slow throughput drift). The playbook recommends logging six metrics at every checkpoint alongside loss:
+
+- **Tokens/sec/GPU** — gates throughput regressions.
+- **Gradient global-norm** — signals pre-clip instability and optimiser drift.
+- **Per-rank loss** — distinguishes a silent single-rank failure from a global event.
+- **Batch domain composition** — confirms the data mixture matches the schedule's intent.
+- **Optimiser-state on-disk size** — sanity-checks checkpoint round-trips and detects partial-save corruption.
+- **A 1–3% held-out cloze-formulated evaluation slice** — see [§Cloze vs MCF](/textbook/05a-benchmarks#knowledge) in Chapter 46 for why cloze and not MCF at the pretraining scale.
+
+The silent tensor-parallelism bug that triggered SmolLM3's mid-run restart was caught not by loss (which continued descending) but by a divergence between two of these auxiliary metrics. The lesson is operational: a single-metric dashboard is debt; a six-metric dashboard is the minimum.
+
+---
+
+## Stage transitions and the architecture-freeze rule {#stages}
+
+Modern pretraining recipes are multi-stage. SmolLM3 has an explicit stage boundary at 8 T tokens (mixture shift, see [Chapter 15](/textbook/01f-data-curriculum)) and another at 10 T (the WSD decay tail, see [Chapter 14](/textbook/01e-schedules-and-batch)). The long-context phase after the main run shifts the sequence length from 4 K to 32 K to 64 K (see [Chapter 16](/textbook/01g-long-context)). DeepSeek-V3 has analogous stage transitions in its multi-phase WSD schedule. Llama-3 has the 40-million-token annealing tail.
+
+Two operational rules from the playbook:
+
+**Mixture and sequence-length transitions are first-class operations.** They are planned, scheduled, and validated separately. The team verifies that the new mixture has been packed correctly, that the new sequence length fits in the parallelism configuration, and that the loss continuity through the transition is monotonic. SmolLM3's three-stage mixture (Web 85% → 75% → 63%, Code 12% → 15% → 24%, Math 3% → 10% → 13%) is the worked example.
+
+**Architectural changes are not first-class operations.** Head count, layer count, MLP ratio, normalisation placement, embedding tying, positional encoding scheme — these require a fresh run. The published frontier recipes that do alter architecture mid-run are exceptions covered in [§Checkpoint surgery](/textbook/01h-annealing-and-stability#checkpoint-surgery), not norms. The rule is operational, not theoretical: a model can in principle be surgically modified, but the engineering cost is comparable to a fresh ablation cycle.
+
+---
+
+## Three families of mid-run failures {#failures}
+
+The detailed treatment of mid-run operational failures is in [§Mid-run operational failures](/textbook/01h-annealing-and-stability#mid-run-failures) of Chapter 17, including the SmolLM3 silent-TP-bug case study. For this chapter, the three families with one-sentence diagnostics:
+
+- **Vanishing throughput** — tokens/sec/GPU drifts downward over hours or days. First-pass diagnostic: separate per-step time into compute, communication, and dataloader components and localise which grew.
+- **Persisting loss spikes** — loss jumps on a quasi-periodic schedule rather than as isolated events. First-pass diagnostic: log per-rank loss and per-shard batch-domain composition; verify gradient-accumulation determinism on resume.
+- **Noisy loss curves** — step-to-step variance of 5–10% on a schedule that should be stable. First-pass diagnostic: replay the last 10–50 B tokens at half the peak LR and observe whether variance drops.
+
+All three share the same diagnostic discipline: narrow the search space by separating *compute*, *communication*, and *data* hypotheses, then bisect.
+
+---
+
+## What this chapter does not teach {#non-goals}
+
+The chapter teaches *vocabulary and published practice*. It does not teach the operational craft. The following are out of scope:
+
+- **Debugging a hang in a 16K-GPU run.** Cluster-specific NCCL behaviour, hardware-failure recovery protocols, and the social engineering of cross-time-zone incident response require the runs themselves.
+- **Tuning NCCL environment variables for a specific cluster.** `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, the SHARP-disabling escape hatches — covered briefly in [§NCCL primitives](/textbook/02f-collectives-and-overlap), but the cluster-specific tuning is craft that lives in lab-internal wikis.
+- **Choosing between InfiniBand and RoCE for a specific deployment.** Vendor-specific, cost-specific, and physically-deployment-specific.
+- **Recovering from a hardware failure mid-run.** The taxonomy of recoverable vs unrecoverable node failures, the rollback policy, the warm-spare provisioning — operational engineering that is barely documented in public.
+
+The chapter teaches the *operating system* of a frontier training campaign. The detailed mechanics live in the eight chapters preceding it; the operational craft lives in the runs themselves.
+
+---
+
+<Sources items={[
+  { authors: "Allal, L. B. et al. (Hugging Face)", year: 2025, title: "The Smol Training Playbook: The Secrets to Building World-Class LLMs", venue: "Hugging Face Spaces", url: "https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook", note: "Primary source for this chapter. Compute-budget accounting (437,760 / 161,280 / 276,480 GPU-hours), framework comparison, pre-flight checklist, monitoring-beyond-loss recommendation, three-failure-family taxonomy, iteration-cadence thesis, and the silent-TP-bug episode." },
+  { authors: "Allal, L. B. et al. (Hugging Face)", year: 2025, title: "SmolLM3: smol, multilingual, long-context reasoner", venue: "Hugging Face blog", url: "https://huggingface.co/blog/smollm3", note: "Companion source for verified SmolLM3 hyperparameters: 3B dense, 11.2 T tokens, 384 H100 × 24 days, TP=2 / DP=4 per 8-GPU node, Nanotron." },
+  { authors: "Grattafiori, A. et al. (Meta)", year: 2024, title: "The Llama 3 Herd of Models", venue: "arXiv:2407.21783", url: "https://arxiv.org/abs/2407.21783", note: "Closed-stack Megatron-LM-style training campaign reference; published recipe with 16K H100s, 15.6T tokens, 4D parallelism." },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V3 Technical Report", venue: "arXiv:2412.19437", url: "https://arxiv.org/abs/2412.19437", note: "Worked example of multi-stage WSD with mixture transitions; FP8 training stack." },
+  { authors: "Walsh, P. et al. (AllenAI)", year: 2025, title: "2 OLMo 2 Furious", venue: "arXiv:2501.00656", url: "https://arxiv.org/abs/2501.00656", note: "Fully-open recipe with intermediate-checkpoint publication; complements the SmolLM3 disclosure with a different stack and team shape." },
+]} />
