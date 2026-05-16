@@ -1,0 +1,439 @@
+---
+slug: 04h-deployment-architecture
+title: Deployment architectures
+description: Prefill-decode disaggregation (Splitwise, DistServe, Mooncake), KV offload hierarchy, multi-LoRA serving, and wide-EP for DeepSeek-V3-style MoE inference.
+order: 44
+chapter: 44
+module: 4
+module_title: Inference and serving
+reading_minutes: 31
+depends_on: [02d-expert-parallel, 02e-fsdp-and-zero, 04a-kv-cache, 04d-continuous-batching, 04f-frontier-engines]
+provides: [pd-disaggregation, splitwise, distserve, mooncake, kv-offload, multi-lora, wide-ep, deepseek-inference]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Inference at scale is not a monolithic problem. The prefill phase—processing an entire input prompt in parallel—is compute-bound: throughput scales with the number of matrix-multiply operations. The decode phase—generating one token at a time—is memory-bandwidth-bound: each forward pass reads the entire KV cache but adds only one token of compute. These two phases have fundamentally incompatible resource profiles. Running both on the same hardware forces a compromise: either starve prefill of parallelism to avoid hogging GPU memory, or accept that decode tokens stall waiting for memory bandwidth while compute units sit idle.
+
+This chapter departs from the algorithmic focus of earlier chapters to address the **operational realities of deploying production inference systems**. The treatment is cluster-centric: how are bytes routed through heterogeneous devices? Which experts are replicated on which GPUs, and why? What happens when a request's KV cache exceeds GPU memory? The frontier deployment (DeepSeek-V3, operating at Moonshot AI scale) achieves **52,300 input tokens per second** and **22,300 output tokens per second** per node by combining physical separation of prefill and decode, hierarchical KV cache offload, and wide expert parallelism tuned differently per phase. This chapter explains why each choice is made and what tradeoffs it encodes.
+
+---
+
+## Prefill-decode disaggregation {#pd-disaggregation}
+
+The core insight of prefill-decode disaggregation is straightforward: if two phases have opposite resource demands, do not force them to share hardware.
+
+### The resource mismatch
+
+During prefill, all positions of the input context are computed in parallel. For a 4,000-token prompt, the transformer computes attention over all 4,000 tokens simultaneously; the sequence of matrix multiplications is fully saturating for modern GPUs. Compute utilization approaches 90%+ of peak floating-point throughput. The **compute-per-byte** ratio is high: each byte of weight is applied to thousands of tokens, amortizing the weight's memory cost across many computation operations.
+
+During decode, a single token is generated per forward pass. Attention reads the entire cached KV but computes output for only one new token. The GPU becomes memory-bound: the forward pass is starved for work once KV loading completes. For a 128,000-token context with 8-bit KV cache, the context requires 128k × 128 dimensions × 8 bytes ≈ 128 GB per batch element per layer. An H100 GPU with 6 TB/s bandwidth cannot feed this context fast enough to saturate all cores. **Compute utilization drops to 10–30%** in naive implementations.
+
+Collocating both phases forces a compromise:
+- Prefill at small batch sizes to avoid memory pressure, reducing prefill throughput.
+- Decode at reduced request concurrency to limit KV cache growth, increasing decode latency.
+
+Modern deployments accept that a single cluster cannot optimize for both. Instead, the cluster is partitioned: prefill hardware is compute-optimized, decode hardware is memory-optimized. After prefill completes, the KV cache is transferred to the decode cluster.
+
+### Splitwise: heterogeneous hardware separation
+
+Splitwise (Patel et al., 2024) operationalizes this insight by pairing **heterogeneous** hardware: H100 GPUs for prefill, A100 GPUs for decode. The reasoning: H100 excels at dense compute (prefill matmul), while A100 offers better **power efficiency and cost per unit memory bandwidth** (decode). Under fixed cost budget, Splitwise achieved **2.35× higher throughput** by separating prefill and decode onto identically-priced A100 clusters.
+
+The system pipeline is:
+1. Prefill cluster receives input prompt, computes KV cache in large batches.
+2. Completed KV is serialized and shipped (via network or direct GPU-to-GPU interconnect) to decode cluster.
+3. Decode cluster loads KV and generates tokens at full concurrency, batching hundreds of requests.
+4. Prefill cluster cycles back to accept new prompts.
+
+**Key tradeoff:** KV transfer latency (10–100 ms over datacenter network) is overlapped with decode generation, so time-to-first-token increases only slightly. The gain (2.35× throughput) outweighs the latency cost.
+
+### DistServe: global scheduling and bandwidth awareness
+
+DistServe (Zhong et al., 2024, OSDI) extends simple disaggregation with a global scheduler that makes routing decisions aware of network congestion. The observation: if prefill is overloaded, KV cache transfer becomes the bottleneck, causing decode requests to stall. DistServe's scheduler monitors the bandwidth between prefill and decode clusters and may interleave prefill requests to balance KV production rate with decode consumption rate.
+
+The system achieves **7.4× more requests** or **12.6× tighter SLO satisfaction** compared to colocated baselines, while maintaining >90% SLO compliance. Key mechanism: each request carries a **latency target** (e.g., "first token in 100 ms, each subsequent token in 50 ms"). The scheduler routes prefills to minimize the probability of SLO violation, considering both local cluster queue depth and network bandwidth to the decode cluster.
+
+### Mooncake: KV-centric global cache
+
+Mooncake (Moonshot AI, July 2024, ACM Transactions on Storage) takes a different approach. Instead of treating KV cache as ephemeral (compute, ship, discard), Mooncake maintains a **global KV cache layer** that persists on the prefill cluster across requests. A central coordinator ("Conductor") tracks which cache blocks are resident, where they are stored (GPU HBM, pinned DRAM, NVMe), and when to load them for a decode request.
+
+The key insight: many requests share common prefixes (system prompts, document headers, repeated queries in batch scenarios). Reusing cached KV for common prefixes saves prefill computation. Mooncake's architecture:
+
+1. Prefill computes KV and stores in a global cache (GPU → pinned DRAM → NVMe tiers).
+2. Conductor tracks global cache state (which users' sequences are cached, residency).
+3. Decode requests query Conductor: "Is my KV already cached?" If yes, load from tier. If no, trigger a prefill.
+4. Cache eviction follows cost-based policies: high-reuse sequences stay in GPU, low-reuse sequences tier to NVMe.
+
+Mooncake handles **100 billion tokens per day** across ~1,000 nodes at Moonshot's production service. The system increases effective request capacity by **75% on real traces** (measured against disaggregation without global cache) by exploiting prefix reuse.
+
+### DeepSeek-V3: wide-EP disaggregation
+
+DeepSeek-V3's production deployment (2024) applies disaggregation to sparse MoE models. With 256 routed experts per layer, the system has sufficient sparsity to benefit from wide expert parallelism (discussed in detail below). The disaggregation strategy:
+
+**Prefill unit:** 4 nodes (32 GPUs). Each GPU hosts 9 routed experts + 1 shared expert. Experts are arranged to handle the load imbalance inherent in prefill (some experts receive many more tokens). Redundancy: the 32 GPUs hold 288 expert "slots" (32 × 9), yet only 256 unique experts exist, so some experts are replicated for load balancing.
+
+**Decode unit:** 18–36 nodes (144–320 GPUs, depending on deployment). Each GPU hosts 2 routed experts + 1 shared. Wider expert parallelism is essential: decode tokens are sparse (each token activates top-8 of 256 experts), and without wide EP, hot experts become bottlenecks. With wide EP, load is distributed, and all GPUs remain utilized.
+
+**Throughput numbers** (achieved on H800 hardware):
+- Prefill: ~73,700 input tokens per second per node, or ~295k tokens/sec across 4-node prefill unit.
+- Decode: ~14,800 output tokens per second per node. On 36-node decode unit: ~533k tokens/sec.
+
+These numbers include all coordination overhead (AlltoAll collectives, load balancing) and assume continuous batching and KV paging (from chapter 04a).
+
+---
+
+## KV-cache storage and offload hierarchy {#kv-offload}
+
+KV cache capacity is a hard constraint in decode. Each additional concurrent request adds KV cache; exceeding GPU memory forces either rejecting requests or offloading cache to slower tiers.
+
+### Four-tier memory hierarchy
+
+NVIDIA's Inference Context Memory Storage Platform (ICMSP) standardizes a hierarchical approach:
+
+| Tier | Storage | Latency | Bandwidth | Use case |
+|---|---|---|---|---|
+| **Tier 1: GPU HBM** | H100/H200 on-die SRAM | ~100 ns | 6 TB/s | Hot KV cache for actively generating tokens |
+| **Tier 2: GPU pinned DRAM** | CPU memory pinned via PCIe/NVLink | ~100 μs | 100 GB/s | Recently-used cache, prefetch staging |
+| **Tier 3: Host DRAM** | Heterogeneous CPU memory | ~1 ms | 80 GB/s | Working set larger than GPU pinned memory |
+| **Tier 4: NVMe SSD** | Local or remote SSD | 10–100 μs (PCIE 5.0) | 7 GB/s | Bulk archive; rarely accessed sequences |
+
+**Bandwidth is the critical metric for inference.** A decode step that must load 128 GB of KV from tier 3 (host DRAM, 80 GB/s) incurs 1.6 seconds of latency—unacceptable for real-time serving. The system must predict and prefetch KV from slower tiers into faster tiers in the background, overlapping I/O with compute.
+
+### Synchronous vs. overlapped prefetch
+
+**Synchronous strategy:** When a decode step needs KV from a lower tier, the GPU stalls until the transfer completes. This is simple but incurs full latency penalty.
+
+**Overlapped prefetch:** The scheduler predicts which KV block will be needed next (based on the attention pattern or expert routing decision, which is known before the attention computation) and prefetches it to a faster tier while the current token is being processed. If prefetch completes before attention needs the data, latency is fully hidden. Overlapped prefetch requires:
+- Prefetching logic that is >90% accurate (false prefetches waste bandwidth).
+- Asynchronous transfer primitives (CUDA streams, DMA engines) that can run concurrently with compute.
+- Conservative scheduling (never schedule a decode step if required KV is not guaranteed to arrive in time).
+
+vLLM and Mooncake both implement overlapped prefetch strategies, achieving >80% latency hiding.
+
+### CXL-based offload
+
+Compute Express Link (CXL) is an open interconnect standard (CPU–GPU and GPU–GPU) offering latencies of 200–300 nanoseconds (vs. 1–10 milliseconds for PCIe and host DRAM). CXL-attached memory devices (CXL-PNM, process near memory) act as a tier between GPU HBM and host DRAM, with bandwidth 200–400 GB/s.
+
+For inference serving, CXL enables a new cost-efficiency frontier: by pooling CXL memory across multiple GPUs, the system can serve larger request batches with cheaper DRAM-centric infrastructure. Academic studies (e.g., Tang et al., 2024, NeurIPS ML for Systems workshop) show CXL-based KV offload achieves comparable or better throughput to GPU-only deployments at 40–60% lower total cost.
+
+CXL deployment is still emerging (2026); mainstream adoption requires standardized CXL controllers on GPU cards. Early deployments are in Astera Labs' systems and Meta research.
+
+### NVMe-based full-context serving
+
+Some applications (e.g., legal document analysis, scientific literature review) require serving 200k–500k token contexts that cannot fit in any GPU memory tier. NVMe-based systems (llm-d, Cheops) spill the entire KV cache to SSD.
+
+Cheops (Bilal et al., 2025) characterizes the I/O behavior: for 128k-token contexts on H100, NVMe-backed KV achieves ~50% of GPU-only throughput, with latency per token increasing from ~5 ms (GPU) to ~50 ms (NVMe + overlapped prefetch). The tradeoff is explicit: users trade throughput for unbounded context length.
+
+---
+
+## Multi-LoRA serving {#multi-lora}
+
+### The adapter decomposition
+
+Fine-tuning large models is expensive (training cost scales with model size). An alternative: store one base model and many small **adapters** (task-specific, few-parameter models). LoRA (Low-Rank Adaptation) represents adapters as low-rank residuals: instead of fine-tuning the full weight matrix $W$, LoRA stores small matrices $A \in \mathbb{R}^{d \times r}$ and $B \in \mathbb{R}^{r \times d}$ (rank $r \ll d$) such that the adapted weight is $W + AB^T$. For a model like Llama 3 70B (16 GB in FP16), a LoRA adapter occupies ~200 MB–1 GB (1–6% of base model size).
+
+Serving 100+ LoRA adapters on a single base model is a natural extension: store the base model once, swap adapters per request. Naive implementations incur high overhead: loading an adapter from host DRAM into GPU HBM stalls the GPU for 50–100 ms, killing throughput.
+
+### Punica: batched adapter compute
+
+Punica (Zhang et al., 2023, MLSys) introduces the **Segmented Gather Matrix-Vector (SGMV)** kernel, which batches operations across many adapters in a single CUDA kernel call. Key mechanism:
+
+1. Each request in a batch carries an adapter ID.
+2. During the forward pass, instead of applying adapters one at a time (context-switching, low utilization), SGMV gathers adapter weights for all requests in the batch.
+3. SGMV performs a fused gather + matrix-vector multiply, applying each adapter to its request's activations in parallel.
+
+Result: **12× higher throughput** compared to sequential single-adapter serving, with only **+2 ms latency per token** (due to kernel launch and synchronization overhead). Scheduling policy: Punica uses lazy allocation, routing new requests to a small set of active GPUs until they are fully utilized, then bringing additional GPUs online.
+
+### S-LoRA: unified paging for adapters and KV
+
+S-LoRA (Sheng et al., 2023, MLSys) serves 10k+ concurrent LoRA adapters by treating adapter weights as pageable resources, similar to KV cache paging (chapter 04a). Key contributions:
+
+1. **Unified paging:** Both KV cache and adapter weights are divided into pages and managed by a single allocator. Hot adapters stay in GPU memory; cold adapters are paged to DRAM or NVMe.
+2. **Tensor-parallel adapters:** Large adapters are sharded across multiple GPUs. If an adapter is used by requests on GPUs A and B, the adapter is split between them, reducing per-GPU memory footprint.
+3. **Throughput:** S-LoRA serves 30+ concurrent models on a single GPU, achieving near-base-model throughput even with high adapter diversity.
+
+### Production multi-LoRA: Hugging Face TGI, AWS SageMaker
+
+Hugging Face Text Generation Inference (TGI) integrates Punica-style batching and supports multiple LoRA adapters per base model. AWS SageMaker provides efficient multi-LoRA serving with adapter caching and dynamic loading, handling 5–50 concurrent adapters per deployment. As of 2026, multi-LoRA is the default pattern for production fine-tuning services, with support from vLLM, TGI, and proprietary systems.
+
+---
+
+## Wide expert parallelism for inference {#wide-ep}
+
+### Training vs. inference expert parallelism
+
+In training (chapter 02d), expert parallelism (EP) is primarily a **memory constraint**: the routed expert weights are too large for a single GPU, so they are sharded across $D_{\text{EP}}$ devices. Each forward pass involves an AlltoAll shuffle of tokens to expert hosts, local expert compute, and another AlltoAll to return outputs. Typical training deployments use $D_{\text{EP}} = 8$ or $16$ (e.g., DeepSeek-V3 training uses 64 GPUs across 8 nodes, with $D_{\text{EP}} = 8$).
+
+In inference, the constraint is different. A single GPU is sufficient to hold all expert weights (they fit in 80 GB H100 memory). The bottleneck is instead **load balance and memory bandwidth utilization**:
+
+- Decode is sequential: tokens are generated one at a time.
+- Each token selects a sparse subset of experts (e.g., top-8 of 256).
+- If the batch is small or the routing is skewed, experts become hot (over-subscribed) and others sit idle.
+- Wider EP distributes experts across more GPUs, improving load balance.
+
+Wide-EP does increase AlltoAll communication (more pairs of GPUs exchange tokens), but the communication is sparse (proportional to the sparsity $k/E$) and can be overlapped with compute. The net result is higher throughput and lower latency variance.
+
+### DeepSeek-V3 wide-EP deployment
+
+DeepSeek-V3 has 256 routed experts per layer + 1 shared expert. The inference system scales to **320 GPUs per expert parallel group** for decode. With each GPU handling 2–3 routed experts, the sparse AlltoAll is well-distributed: if each token activates 8 experts, the expected number of tokens hitting any single GPU is $8 \times (\text{batch size}) / 256$, leading to balanced load.
+
+**Why not wider?** Beyond 320 GPUs, AlltoAll communication becomes the bottleneck. At wider EP, the synchronization overheads of sparse collectives (gathering messages from 320+ GPUs, rerouting them) exceed the gains from better load balance.
+
+### vLLM wide-EP support (2025)
+
+vLLM integrated wide-EP support via:
+
+1. **DeepEP kernels:** High-throughput all-to-all primitive optimized for current-generation interconnects (NVLink 160 GB/s intra-node, InfiniBand 50 GB/s inter-node). DeepEP handles sparse communication (not all GPU pairs exchange data) more efficiently than dense AlltoAll.
+2. **Expert Load Balancing (EPLB):** vLLM implements DeepSeek's hierarchical load balancing strategy, which periodically (every 100–1000 tokens) analyzes token-to-expert distributions and rebalances routing decisions to prevent hot-spots. Enabled via `--enable-eplb` flag.
+3. **Disaggregation integration:** Wide-EP is especially effective when paired with prefill-decode disaggregation. Prefill's load imbalance (some experts receive many more tokens than others) is isolated to the prefill cluster; the decode cluster benefits from more uniform token distribution.
+
+### Frontier throughput numbers
+
+With prefill on 4 nodes and decode on 18–36 nodes (wider EP possible, depending on application):
+
+| Phase | Nodes | GPUs | Throughput per node | Total throughput |
+|---|---|---|---|---|
+| Prefill (4 nodes, 9 experts/GPU) | 4 | 32 | 52,300 tokens/sec | ~209k tokens/sec |
+| Decode (36 nodes, 2 experts/GPU, wide-EP) | 36 | 288 | 22,300 tokens/sec | ~803k tokens/sec |
+
+These numbers assume:
+- Continuous batching with 1,000–5,000 request concurrency.
+- 2,000-token average prefill length (for prefill numbers).
+- Sequence lengths 2k–128k (for decode with paged attention).
+- H800 hardware (similar to H100, with faster memory).
+- All collectives overlapped with compute.
+
+Sources: DeepSeek-V3 technical report [2412.19437](https://arxiv.org/abs/2412.19437); vLLM 0.6+ benchmarks.
+
+---
+
+## Expert redundancy and placement {#expert-placement}
+
+### Why redundancy in prefill?
+
+Prefill processes a single request's entire prompt in one forward pass. The routed experts for that batch of tokens are determined by the learned gating layer and are typically non-uniform. A 2,000-token prefill might route 40% of tokens to experts $\{0, 1, 5, 10\}$ and 10% to experts $\{100, 150, 200\}$. If expert 0 is hot (many tokens) and lives on only one GPU, that GPU becomes the bottleneck, stalling all other GPUs waiting for expert 0's output.
+
+**Expert redundancy** means replicating expert 0 on multiple GPUs so the tokens routed to it can be **load-balanced** among copies. If 800 tokens are routed to expert 0 and it is replicated on 2 GPUs, each GPU handles ~400 tokens, halving latency.
+
+### DeepSeek-V3 redundancy policy
+
+**Prefill (4 nodes, 32 GPUs):**
+- Total experts per layer: 256 routed + 1 shared.
+- Experts per GPU: 9 routed + 1 shared.
+- Capacity: $32 \times 9 = 288$ routed expert slots for 256 actual experts.
+- Redundancy: Some experts are replicated 1–2 times (average redundancy ≈ 1.1×).
+- Routing: Tokens are first routed to M=4 nodes (out of the full 4-node prefill unit), then within those nodes, experts are accessed with load-balancing awareness.
+
+**Decode (36 nodes, 288 GPUs):**
+- Experts per GPU: 2 routed + 1 shared.
+- Capacity: $288 \times 2 = 576$ expert slots for 256 actual experts (2.25× overprovisioning).
+- Redundancy: **None.** Load is more evenly distributed in decode (each token activates only 8 of 256 experts); a single-GPU-per-expert placement is sufficient.
+- No-redundancy strategy: saves memory, necessary because decode requires many more GPUs.
+
+### Memory-latency tradeoff
+
+Redundancy uses extra GPU memory (replicating expert weights) but reduces stall latency and improves throughput. In prefill, the latency reduction justifies the memory cost (extra memory is usually available; latency is the bottleneck). In decode, where load is uniform and GPU count is high, redundancy wastes memory without benefit, so it is eliminated.
+
+---
+
+## Cross-datacenter inference {#cross-dc}
+
+### The cross-DC challenge
+
+A single datacenter may lack sufficient GPU capacity for large-scale inference. Serving spans multiple datacenters in a region (latency &lt;10 ms, bandwidth 50 GB/s over InfiniBand) or globally (latency 10–200 ms, bandwidth &lt;10 GB/s over WAN). Expert parallelism's AlltoAll communication becomes expensive across datacenters, where bandwidth is orders of magnitude lower than intra-cluster.
+
+### Hybrid expert-data transmission
+
+To reduce cross-DC AlltoAll volume, some systems adopt:
+
+1. **Local EP within datacenter:** Within each DC, expert parallelism with full routing to all experts. AlltoAll is confined to the DC's internal network (high bandwidth).
+2. **Data parallelism across datacenters:** Each DC holds a full replica of the model. Tokens are not routed across DCs; only gathered/scattered at DC boundaries. Each DC computes for all tokens (sparsity benefit is lost) but cross-DC communication is zero.
+
+This trades sparsity for bandwidth efficiency: each DC uses more compute per token but avoids expensive cross-DC traffic.
+
+### Node-limited routing
+
+An alternative: use **node-limited routing**, where each token is routed to M nodes out of the full N-node cluster (e.g., M=4 out of 100 in a global deployment). This bounds cross-node AlltoAll volume. For inference, the strategy extends: each datacenter is treated as a "virtual node," and routing decisions are made by a central scheduler aware of network latency and bandwidth.
+
+**Routing policy:** Tokens are routed to the M geographically closest datacenters that hold the required experts. If expert X is hot, additional copies are instantiated in distant datacenters (at memory cost) to reduce routing distance.
+
+---
+
+## Multi-tenant request scheduling {#scheduling}
+
+### Token pool abstraction
+
+Modern inference clusters serve hundreds to thousands of concurrent requests, each with different latency targets and token counts. A unified scheduler must allocate three resources:
+- **Throughput** (tokens/sec): priority order for compute.
+- **KV capacity** (GB): memory reserved for each request.
+- **Concurrency** (# requests): number of in-flight requests.
+
+A **token pool** formalizes these dimensions: the cluster has (say) 1,000 tokens/sec budget, 500 GB KV cache, and 1,000 concurrent-request slots. Each request claims a slice:
+- Prefill of 1,000 tokens: claims 100 tokens/sec for duration, 10 GB KV, 1 slot.
+- Decode of 100 tokens: claims 1 token/sec, 10 GB KV, 1 slot.
+
+The scheduler admits requests only if all three resources are available.
+
+### Priority and SLO mechanisms
+
+Scheduling decisions are guided by:
+- **Service class:** Premium (e.g., chatbot) vs. standard (batch) vs. best-effort.
+- **SLO deadline:** Urgency level (e.g., "first token in 100 ms").
+- **Burst history:** Requests waiting longer (starvation) are prioritized for fairness.
+- **Accumulated service debt:** If a previous request missed its SLO, the next request from the same user gets priority.
+
+### Prefill-aware batching
+
+A critical scheduling insight: prefill and decode have opposite resource profiles. A large prefill (10,000 tokens) is compute-bound and can run concurrently with many decode requests (which are memory-bandwidth-bound). Schedulers like vLLM's batch requests to exploit this:
+
+- Phase 1: Schedule one large prefill (compute saturated) + 500 decode requests (memory saturated).
+- Phase 2: Prefill completes; its requests transition to decode. Schedule a new prefill + a fresh batch of decodes.
+
+This interleaving maximizes GPU utilization: prefill and decode phases are staggered, and resources are always in use.
+
+### Mooncake Conductor: global cache-aware scheduling
+
+Mooncake's central scheduler ("Conductor") has **global visibility** into KV cache state:
+- Which user sequences are cached on which clusters?
+- Is the cache resident in GPU memory or paged to DRAM/NVMe?
+- How stale is the cache (when was it last accessed)?
+
+When a decode request arrives, Conductor checks:
+1. Is the KV cache already in memory? If yes, route to that cluster and decode immediately.
+2. If cache is paged to DRAM/NVMe, initiate prefetch and route decode after prefetch completes.
+3. If cache is missing (new request), trigger a prefill.
+
+This global-visibility approach enables cache reuse and reduces redundant computation. The tradeoff: Conductor is a central component (single point of failure mitigated via replication), and maintaining global state introduces coordination overhead (~10 ms per dispatch).
+
+---
+
+## Worked example: 40-node DeepSeek-V3 deployment {#worked-example}
+
+### Cluster configuration
+
+Setup: 40 H800 nodes (8 GPUs/node = 320 total GPUs), running inference for DeepSeek-V3 (671B parameters, 37B active per token, 256 routed + 1 shared expert per layer, 61 layers).
+
+### Prefill unit
+
+**Assign 4 nodes (32 GPUs) to prefill.**
+- **Expert capacity:** 32 GPUs × 9 routed experts/GPU = 288 routed expert slots per layer. (256 actual experts, so 32 redundant slots for load balancing.)
+- **Shared expert:** 1 per GPU (not bottleneck-critical, always present).
+- **Token routing:** During prefill, all 256 experts are accessible. Tokens are routed via the gating layer; load imbalance is expected.
+- **Redundancy strategy:** Hot experts (high-routed-token-count) are replicated on multiple GPUs to balance load.
+- **Expected throughput:** ~73,700 tokens/sec per node × 4 nodes ≈ 295k tokens/sec.
+- **Batch composition:** 16 requests, each 1k–8k context, for ~50k-token aggregate prefill batch.
+- **Latency:** 50,000 tokens ÷ 73,700 tok/sec ≈ 678 ms per prefill phase.
+
+**Note:** Prefill latency per request is lower than phase latency: a 2,000-token request prefills in ~27 ms (2,000 ÷ 73,700 tok/sec), overlapped with other requests' prefill in the same batch.
+
+### Decode unit
+
+**Assign 36 nodes (288 GPUs) to decode using wide-EP.**
+- **Expert capacity:** 288 GPUs × 2 routed experts/GPU = 576 routed expert slots per layer. (256 actual, so 2.25× overprovisioning.)
+- **No redundancy:** Load is more uniform; each GPU handles only a fraction of the 8 experts selected per token.
+- **Token routing:** Each decode token selects top-8 of 256 experts. Expected tokens hitting any single GPU: $8 \times (\text{batch size}) / 256 = \text{batch size} / 32$. With 500 concurrent decodes, ~15–16 tokens per GPU per step (low contention).
+- **Expected throughput:** ~14,800 tokens/sec per node × 36 nodes ≈ 533k tokens/sec.
+- **Batch composition:** 500–1,000 concurrent decode requests, each generating 1–10 tokens per decode batch.
+
+### AlltoAll communication
+
+**Decode AlltoAll per step:**
+- Tokens per GPU per step: ~500 requests ÷ 288 GPUs ≈ 1.7 tokens.
+- Each token activates 8 experts; expected experts per GPU: 8 (on average, spread uniformly).
+- AlltoAll volume: Each GPU sends tokens to other GPUs and receives others' tokens.
+- Sparse AlltoAll overhead: ~(8 / 256 sparsity) × (model dim × bytes) × (tokens per GPU).
+- For 37B active params in 61 layers, per-layer param count: 37B / 61 ≈ 600M params. Per-layer weight size: 600M × 2 bytes (BF16) = 1.2 GB.
+- Per-step AlltoAll volume per GPU: (8 / 256) × 1.2 GB × 1.7 tokens ≈ 8 MB. (Rough order of magnitude; actual depends on tensor layout.)
+- AlltoAll bandwidth: 160 GB/s intra-node (NVLink), 50 GB/s inter-node (InfiniBand).
+- AlltoAll latency: Largest intra-node transfer ~8 MB ÷ 160 GB/s = 50 μs (hidden in compute pipeline).
+
+### KV cache management
+
+- **Per-request KV size:** 500 requests × 8,192 avg context (for this example) × 2 (K and V) × 2 bytes (BF16) × (model hidden dim) ≈ 500 × 8k × 2 × 2 × 4096 (hidden) ≈ 320 GB per layer.
+- **Total KV for 61 layers:** 320 GB × 61 ≈ 19.5 TB (unrealistic without offload).
+- **PagedAttention allocation:** vLLM divides KV into 4k-token pages. For 500 requests, avg context 8k = ~500 × 8k ÷ 4k = 1,000 pages.
+  - One page per layer: 4,096 tokens × 4 (K/V, 2×) × 2 bytes × 8 KV heads × 128 head dim ≈ 8 MB per layer.
+  - Total in-GPU KV: 1,000 pages × 8 MB/page ≈ 8 GB (achievable on a cluster with modest GPU memory).
+- **Excess KV (offload):** Oldest pages are spilled to pinned DRAM (500 GB per node × 36 nodes = 18 TB cluster-wide) or NVMe (unlimited).
+- **Prefetch strategy:** Decode decoder predicts which tokens will be needed next (based on attention pattern or expert routing) and prefetches from DRAM to GPU HBM in parallel with current compute.
+
+### End-to-end latency (example request)
+
+Request: 1,000-token context, generate 10 tokens.
+
+1. **Prefill:** 1,000 tokens ÷ 73,700 tok/sec ≈ 13.5 ms.
+2. **Decode first token (AlltoAll + routing + compute):**
+   - Routing decision: 100 μs (learned gating, not collective).
+   - AlltoAll (gathering tokens to expert hosts): 50 μs (overlapped).
+   - Expert compute (forward pass): 1 ms.
+   - AlltoAll return (expert outputs back to GPU): 50 μs.
+   - Combine (linear projection): 100 μs.
+   - Total: ~3 ms (expert routing latency dominates).
+3. **Time-to-first-token (TTFT):** 13.5 + 3 = 16.5 ms.
+4. **Per-token latency (decode):** 1 ÷ 14,800 tok/sec ≈ 67 μs per token.
+5. **Total generation latency for 10 tokens:** 10 tokens × 67 μs ≈ 0.67 ms.
+6. **Total latency (prefill + first token + 9 more tokens):** 13.5 + 3 + 0.67 ≈ **17.2 ms**.
+
+### Cluster efficiency
+
+- **Compute utilization (prefill):** Prefill is compute-saturated; GPUs at ~90% of peak FLOPS.
+- **Compute utilization (decode):** Decode is memory-bandwidth-bound; compute utilization drops to ~20–30% of peak (acceptable, because memory bandwidth is the constraint).
+- **Network utilization:** AlltoAll sparse communication uses &lt;5% of available inter-node bandwidth (50 GB/s × 36 nodes = 1.8 TB/s cluster-wide; actual AlltoAll ≈ 50 MB/sec total).
+- **Memory utilization:** KV cache occupies ~8 GB GPU + 18 TB pinned DRAM + NVMe (spillover). Efficient use of tiering.
+
+---
+
+## Comparison of approaches {#comparison}
+
+| Aspect | Splitwise | DistServe | Mooncake | DeepSeek-V3 | vLLM 2025 |
+|---|---|---|---|---|---|
+| **Core mechanism** | Heterogeneous HW (H100/A100) | Bandwidth-aware scheduler | Global KV cache + Conductor | Wide-EP disaggregation | DeepEP + EPLB kernels |
+| **PD separation** | Physical clusters | Logical (scheduler) | Logical + cache layer | Physical (4 vs. 36 nodes) | Optional API |
+| **KV offload** | None | None | GPU → DRAM → NVMe tiers | Paged (within-cluster) | PagedAttention (all tiers) |
+| **Multi-LoRA** | Not mentioned | Not mentioned | Not mentioned | Base model only | SGMV batching |
+| **Expert redundancy** | N/A (dense) | N/A | N/A | Prefill 1.1× | Load-balancing optional |
+| **Throughput gain** | 2.35× (cost) | 7.4× (request count) | 1.75× (real trace) | 2–5× combined | 1.2–2× vs. baseline |
+| **Latency overhead** | Minimal | Minimal | ~10 ms (dispatch) | &lt;1 ms (same-cluster) | &lt;2 ms |
+| **Production scale** | Not disclosed | Research (OSDI) | Moonshot 1k nodes | DeepSeek proprietary | vLLM 0.6+ |
+| **Data source** | Patel et al., IEEE Micro 2025 | Zhong et al., OSDI 2024 | Moonshot, ACM ToS 2024 | DeepSeek technical report 2024 | vLLM docs 2025 |
+
+---
+
+## Summary {#summary}
+
+Frontier inference systems are defined by three interlocking decisions:
+
+1. **Physical vs. logical disaggregation:** Prefill and decode have opposite resource profiles (compute vs. bandwidth). Splitwise disaggregates onto heterogeneous hardware; DistServe and Mooncake use logical separation with global scheduling; DeepSeek-V3 disaggregates with different expert parallelism degrees per phase. Each trades off scheduling complexity against throughput gains (2.35–7.4×).
+
+2. **KV cache offload hierarchy:** Decode is starved for GPU memory. Tiering (GPU HBM → pinned DRAM → host DRAM → NVMe) with overlapped prefetch enables serving hundreds of concurrent requests. The bandwidth hierarchy (6 TB/s → 100 GB/s → 80 GB/s → 7 GB/s) is the fundamental constraint; prefetch accuracy must exceed 90% to hide lower-tier latency.
+
+3. **Expert parallelism degree:** In prefill, wide-EP increases load imbalance (redundancy is required). In decode, wide-EP (up to 320 GPUs) balances sparse token routing and enables full GPU utilization. Wider EP is sustained only when paired with prefill disaggregation (load imbalance isolated to prefill cluster).
+
+DeepSeek-V3's frontier numbers (52.3k input tokens/s prefill, 22.3k output tokens/s decode per node) are achieved by combining all three: physical disaggregation (4 nodes prefill, 36 nodes decode), hierarchical KV offload, and expert redundancy in prefill + wide-EP in decode. The system design is not a single innovation but a careful orchestration of solutions to memory, compute, and communication bottlenecks, each justified by the resource profile of the phase it serves.
+
+---
+
+## Further reading
+
+**Prefill-decode disaggregation:**
+- Patel et al., "Splitwise: Efficient Generative LLM Inference Using Phase Splitting," IEEE Micro, [2311.18581](https://arxiv.org/abs/2311.18581).
+- Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving," OSDI 2024, [2401.09670](https://arxiv.org/abs/2401.09670).
+- Moonshot AI, "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving," ACM Transactions on Storage, [2407.00079](https://arxiv.org/abs/2407.00079).
+
+**DeepSeek-V3 inference:**
+- DeepSeek-AI, "DeepSeek-V3 Technical Report," [2412.19437](https://arxiv.org/abs/2412.19437).
+
+**KV cache and memory:**
+- Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP 2023, [2309.06261](https://arxiv.org/abs/2309.06261).
+- Bilal et al., "Cheops: An I/O Characterizing Study of Offloading LLM Models and KV Caches to NVMe SSD," [TBD 2025].
+- Tang et al., "Exploring CXL-based KV Cache Storage for LLM Serving," NeurIPS 2024 ML for Systems workshop.
+
+**Multi-LoRA serving:**
+- Zhang et al., "Punica: Multi-Tenant LoRA Serving," MLSys 2024, [2310.18547](https://arxiv.org/abs/2310.18547).
+- Sheng et al., "S-LoRA: Serving Thousands of Concurrent LoRA Adapters," MLSys 2024, [2311.03285](https://arxiv.org/abs/2311.03285).
+- Hu et al., "EdgeLoRA: Efficient Multi-Tenant LLM Serving on Resource-Constrained Edge Devices," [2507.01438](https://arxiv.org/abs/2507.01438).
+
+**Expert parallelism and wide-EP:**
+- vLLM documentation, "Expert Parallel Deployment and Wide-EP," [https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/).
+- LMSYS Org, "Deploying DeepSeek on 96 H100s with PD Disaggregation and Large-Scale Expert Parallelism," [https://www.lmsys.org/blog/2025-05-05-large-scale-ep/](https://www.lmsys.org/blog/2025-05-05-large-scale-ep/).

@@ -1,0 +1,358 @@
+---
+slug: 04a-kv-cache
+title: KV cache and paged attention
+description: Memory mathematics of the KV cache, vLLM's paged attention, and the 2024–2026 compression methods (H2O, StreamingLLM, SnapKV, KIVI).
+order: 37
+chapter: 37
+module: 4
+module_title: Inference and serving
+reading_minutes: 28
+depends_on: [00b-attention-variants]
+provides: [kv-cache, paged-attention, kv-compression, h2o, streamingllm, snapkv, kivi]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+The inference phase of transformer-based large language models is dominated by a single bottleneck: the key-value (KV) cache. Unlike training, where gradient computation drives GPU utilization, inference accumulates intermediate key and value matrices across the sequence length. A 70-billion-parameter model serving a 128,000-token context at batch size 32 allocates nearly 80 GB to store these activations—an amount that exceeds GPU memory itself and forces severe batch-size reductions. Traditional memory allocation strategies waste 60–80% of available GPU memory through fragmentation, making the KV cache not merely a technical detail but the architectural bottleneck of modern language model deployment.
+
+This chapter develops the memory mathematics of the KV cache, explains how paged attention—a technique borrowed from operating systems—solves the fragmentation problem, and surveys the compression methods (H2O, StreamingLLM, SnapKV, KIVI) that have emerged since 2023 to squeeze further efficiency from inference workloads. The chapter assumes familiarity with [attention variants](/textbook/00b-attention-variants) and attention mechanism basics; it builds toward the scheduling and batching strategies covered in [continuous batching](/textbook/04d-continuous-batching).
+
+---
+
+## Memory mathematics {#memory-math}
+
+The KV cache stores one copy of the key and value matrices for every layer of the transformer. During decoding—the generation phase—these caches accumulate: each new token adds one more row to the key and value tensors. To avoid redundant computation, inference systems never recompute earlier keys and values; they retrieve them from cache.
+
+**The total memory footprint is:**
+
+$$
+\text{KV\_cache\_bytes} = 2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{seq\_length} \times \text{batch\_size} \times \text{bytes\_per\_element}
+$$
+
+Breaking down each factor:
+
+- **2×** accounts for separate key and value tensors.
+- **layers**: Transformer depth. Llama 3 70B has 80 layers.
+- **kv_heads**: Number of key-value heads. Modern models use Grouped-Query Attention (GQA), which shares a small set of KV heads across many query heads. Llama 3 70B has 8 KV heads (vs. 64 query heads).
+- **head_dim**: Dimension per head, typically 128.
+- **seq_length**: Current context length in tokens.
+- **batch_size**: Number of concurrent sequences being processed.
+- **bytes_per_element**: 2 bytes for FP16 or BF16, 1 byte for FP8, 0.5 bytes for INT4 with quantization.
+
+The per-token increment—the memory added by each new generated token—is:
+
+$$
+\Delta \text{KV} = 2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{bytes\_per\_element}
+$$
+
+For Llama 3 70B in BF16, this evaluates to $2 \times 80 \times 8 \times 128 \times 2 = 409.6$ kilobytes per token. While modest in isolation, this accumulation becomes severe over long contexts: 128,000 tokens multiplied by batch size 32 yields the 78 GB figure quoted earlier.
+
+**Concrete example:** Llama 3 70B at 128,000 tokens context, batch size 32, BF16 precision:
+
+$$
+\text{KV} = 2 \times 80 \times 8 \times 128 \times 128{,}000 \times 32 \times 2 \text{ bytes}
+$$
+
+$$
+= 83{,}886{,}080{,}000 \text{ bytes} \approx 83.9 \text{ GB}
+$$
+
+This single model at a moderate batch size consumes nearly the entire memory budget of an H100 GPU (80 GB HBM), leaving no capacity for the model weights themselves (which occupy 140 GB in FP16). The situation worsens with longer contexts or larger batches. Longer-context models (200K–400K tokens) designed for specialized applications become infeasible on commodity hardware under naive memory allocation.
+
+<Sidenote>
+The KV cache is separate from the activations computed during the forward pass. The forward pass computes query, key, value, and attention output for a single new token; those activations can be discarded after attention. The KV cache stores only the historical K and V tensors, not intermediate gradients or activations. This distinction is why KV cache reduction is possible—the cache is a pure storage problem, not a computational bottleneck.
+</Sidenote>
+
+---
+
+## Fragmentation and the limits of contiguous allocation {#fragmentation}
+
+Traditional KV cache management allocates one contiguous buffer per request, sized to accommodate the maximum expected context length. As requests complete and depart, gaps open in GPU memory—fragmented regions too small to fit new requests, even when total free memory exceeds demand.
+
+This phenomenon mirrors external fragmentation in operating systems. A simple scenario illustrates:
+
+1. Request A arrives, expects 4,000 tokens; allocates 4 GB buffer.
+2. Request B arrives, expects 32,000 tokens; allocates 32 GB buffer.
+3. Request A completes; 4 GB gap remains.
+4. Request C arrives, expects 16,000 tokens; cannot fit in the 4 GB gap, must either wait or be rejected.
+5. System utilization drops to 20–40%, even though 80% of GPU memory is nominally free.
+
+This fragmentation problem was endemic to pre-2023 inference systems: FasterTransformer, Orca, and other frameworks that preceded vLLM. Memory utilization rates reported in the literature ranged from 20% to 40% despite high raw availability. The practical consequence was severe: batch sizes were limited to 1–4 concurrent requests per GPU, resulting in 2–4× lower throughput than optimal memory allocation would allow.
+
+Defragmentation—compacting live requests to consolidate free space—is theoretically possible but computationally expensive. Copying multi-gigabyte buffers between GPU memory regions on every request completion incurs latency penalties that outweigh the gains. Inference systems prioritize latency, making defragmentation infeasible for production deployments.
+
+---
+
+## Paged attention {#paged-attention}
+
+The solution draws from an old operating systems idea: virtual memory paging. Instead of allocating one contiguous buffer per request, divide the KV cache into fixed-size **logical pages**, each mapping to scattered **physical memory blocks** via an indirection table (the block table).
+
+**Reference:** Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," OSDI 2023, [arXiv:2309.06180](https://arxiv.org/abs/2309.06180)
+
+### Mechanism
+
+**Block size and partitioning:** The KV cache is divided into blocks of 16 tokens (a design choice specific to vLLM's implementation, derived from typical attention head dimensions and memory alignment). Each block holds:
+
+$$
+\text{block\_size} = 16 \text{ tokens} \times \text{kv\_heads} \times \text{head\_dim} = 16 \times 8 \times 128 = 16{,}384 \text{ elements per layer}
+$$
+
+With BF16 (2 bytes per element), one block occupies roughly 32 KB per layer. Across 80 layers, a single logical block occupies ~2.56 MB—a size chosen to balance allocation granularity and indirection overhead.
+
+**Block table:** Each request maintains a block table mapping logical block indices to physical block IDs:
+
+```
+block_table[request_id][layer][logical_block] → physical_block_id
+```
+
+When a request arrives, the scheduler allocates physical blocks from a free pool and populates the block table. Blocks from different requests need not be contiguous; they scatter across GPU memory.
+
+**Attention computation:** During the attention operation for a new token, the kernel:
+
+1. Computes queries for the current token.
+2. Iterates over logical blocks of previous tokens (in the same sequence).
+3. For each logical block, dereferences the block table to find its physical address.
+4. Loads the corresponding K and V tensors from physical memory.
+5. Computes attention scores and accumulates the output.
+
+This indirection—one pointer dereference per block per query—adds negligible latency (modern GPUs hide memory latency through occupancy). The gain is eliminating fragmentation entirely: any free physical block can be allocated to any logical block, from any request.
+
+### Memory efficiency gains
+
+Under paged attention:
+
+- **Fragmentation elimination:** Every allocated block is immediately usable. No gaps, no wasted space.
+- **Throughput improvement:** Empirical throughput increases by 2–4× compared to contiguous allocation (vLLM vs. FasterTransformer on identical hardware).
+- **Memory utilization:** Over 95% of allocated memory remains in use at any time, vs. 20–40% with contiguous allocation.
+- **Scheduling flexibility:** Requests of varying lengths can coexist in the same batch. The block table naturally handles variable-length sequences without padding.
+- **Shared caches:** KV caches can be shared within a single request (prompt prefill shared with decoding) or across requests (forking a sequence for multi-turn conversations).
+
+These gains compound with other inference optimizations like continuous batching, discussed in a later chapter.
+
+---
+
+## Compression methods: H2O {#h2o}
+
+Despite paged attention's efficiency, the raw KV cache size remains large. A new class of techniques, emerged after 2023, reduces cache size by selectively storing or quantizing tokens.
+
+H2O (Heavy-Hitter Oracle) observes that a small fraction of tokens accumulate disproportionate attention weight. In autoregressive generation, recent tokens matter for next-token prediction, and a handful of "heavy-hitter" tokens—often early tokens with high cumulative attention scores—anchor the model's representations. Discarding the middle tokens introduces little degradation.
+
+**Reference:** Zhang et al., "H₂O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models," NeurIPS 2023, [arXiv:2306.14048](https://arxiv.org/abs/2306.14048)
+
+### Method
+
+H2O maintains two categories of tokens in the KV cache:
+
+1. **Recent tokens:** The last M tokens (e.g., last 32), always retained.
+2. **Heavy hitters:** The top-k tokens by cumulative attention weight across all layers and heads.
+
+As generation proceeds and new tokens arrive, H2O evicts tokens that are neither recent nor heavy hitters. The cumulative attention scores are computed lazily—only once per several steps—to avoid overhead.
+
+### Results and tradeoffs
+
+- **Memory reduction:** 5× reduction (retaining 20% of tokens) with no measurable accuracy loss on benchmarks like MMLU, HumanEval, and TriviaQA.
+- **Throughput improvement:** 29× speedup compared to DeepSpeed Zero-Inference on OPT-175B; 3× faster than FlexGen.
+- **Validated models:** OPT (6.7B–175B), LLaMA, GPT-NeoX.
+
+The method is orthogonal to paged attention and quantization: H2O reduces the number of tokens cached, while paging and quantization reduce the memory per token. They compose well.
+
+<Callout type="warning">
+H2O's gains assume that attention patterns are stable—that heavy hitters identified during early generation remain informative later. This assumption holds for typical language tasks but can break in knowledge-retrieval scenarios where middle context contains critical facts. Practitioners should validate H2O on their specific workloads before deployment.
+</Callout>
+
+---
+
+## Compression methods: StreamingLLM {#streamingllm}
+
+StreamingLLM targets a different problem: models trained on finite-length sequences exhibit pathological attention patterns when context extends beyond training lengths. Specifically, LLMs trained with fixed windows (e.g., 4K tokens) allocate disproportionate attention weight to initial tokens as a stabilization mechanism—an "attention sink" phenomenon.
+
+**Reference:** Xiao et al., "Efficient Streaming Language Models with Attention Sinks," ICLR 2024, [arXiv:2309.17453](https://arxiv.org/abs/2309.17453)
+
+### Method
+
+Instead of discarding the middle, StreamingLLM:
+
+1. **Retains the first few tokens** (typically the initial 4 tokens) as an explicit attention sink.
+2. **Retains a recent sliding window** (e.g., last 2K tokens).
+3. **Discards middle tokens** entirely.
+
+The cache size becomes constant: sink_size + window_size, regardless of total sequence length. For a model trained on 4K tokens, using a 4-token sink and 2K-token window enables processing of 4M+ token sequences.
+
+The key insight is that the attention sink phenomenon exists because models were trained on finite windows. By explicitly reserving capacity for the sink, the rest of the attention distribution becomes more stable and interpretable.
+
+### Results
+
+- **Infinite-context support:** Llama 2, MPT, Falcon, and Pythia models (originally trained on 4K–8K tokens) handle 4M+ token sequences with stable perplexity.
+- **Speedup:** 22.2× speedup vs. naive sliding window with recomputation (which repeatedly computes attention over the discarded middle region).
+- **Quality:** Negligible perplexity degradation or none, validated on perplexity benchmarks and downstream tasks.
+
+StreamingLLM is best suited to streaming or long-document scenarios where the model can adapt to a single input stream. It pairs well with paged attention for practical systems.
+
+---
+
+## Compression methods: SnapKV {#snapkv}
+
+SnapKV observes that attention patterns exhibit regularity across the generation phase: each attention head consistently focuses on the same positions in the prompt. This pattern can be extracted from a short "observation window"—the last few tokens of the prompt—without requiring fine-tuning.
+
+**Reference:** Li et al., "SnapKV: LLM Knows What You are Looking for Before Generation," NeurIPS 2024, [arXiv:2404.14469](https://arxiv.org/abs/2404.14469)
+
+### Method
+
+1. **Observation window:** At the end of the prompt (e.g., final 128 tokens), compute attention patterns to identify which prompt positions each head attends to.
+2. **Clustering:** Cluster the important positions per head (e.g., positions 0–100, 200–300, etc., for head 1; different clusters for other heads).
+3. **Compression:** During generation, retain only the clusters and recent tokens; discard other prompt positions.
+
+No fine-tuning required. The method is plug-compatible with standard inference frameworks.
+
+### Results
+
+- **Memory efficiency:** 8.2× improvement on 16K-token inputs (compared to uncompressed KV cache).
+- **Generation speedup:** 3.6× faster generation.
+- **Extreme lengths:** Handles 380K-token contexts on a single A100-80GB GPU without accuracy degradation.
+- **Robustness:** Negligible drops on Needle-in-a-Haystack retrieval benchmarks, indicating that important long-range information is retained.
+
+SnapKV excels when prompts are long and static (retrieval-augmented generation, in-context learning), as the observation window captures stable retrieval patterns.
+
+---
+
+## Compression methods: KIVI {#kivi}
+
+KIVI (Key-Value Intelligence) applies asymmetric quantization to the KV cache itself. The core observation is that keys and values have distinct statistical properties: keys benefit from per-channel quantization (grouping across the hidden dimension), while values benefit from per-token quantization (grouping across the sequence dimension).
+
+**Reference:** Liu et al., "KIVI: A Tuning-Free Asymmetric 2-bit Quantization for KV Cache," ICML 2024, [arXiv:2402.02750](https://arxiv.org/abs/2402.02750)
+
+### Method
+
+- **Key cache:** Quantized to 2 bits per channel, with quantization parameters (scale and zero-point) computed per-channel across the hidden dimension.
+- **Value cache:** Quantized to 2 bits per token, with parameters per-token across the sequence dimension.
+- **Hardware-friendly:** Implemented with standard GPU primitives (no custom kernels required).
+- **No fine-tuning:** Applied post-hoc to any pretrained model.
+
+The asymmetry is crucial: naive symmetric quantization (2 bits for both K and V) performs poorly. The method is validated on Llama, Falcon, and Mistral.
+
+### Results
+
+- **Memory reduction:** 2.6× reduction in peak memory when including model weights (vs. baseline FP16).
+- **Batch scaling:** Enables 4× larger batch sizes compared to unquantized baselines.
+- **Throughput improvement:** 2.35–3.47× faster throughput on real workloads (measured on commodity GPUs).
+- **Quality:** Maintains perplexity and downstream task performance; no degradation on MMLU or other benchmarks.
+
+KIVI is orthogonal to H2O and SnapKV: it reduces bits per element, while those methods reduce the number of elements. Combining KIVI with a token-reduction technique yields multiplicative gains.
+
+<Sidenote>
+2-bit quantization of the KV cache is aggressive and raises questions about numerical stability. The empirical success of KIVI suggests that KV attention is robust to quantization—a finding that contradicts intuitions from gradient-based quantization (where aggressive quantization often fails). The reason is likely that KV attention is read-only during inference: quantization error does not propagate through backpropagation, and the softmax operation in attention is somewhat forgiving of small numerical errors.
+</Sidenote>
+
+---
+
+## Worked example: Llama 3 70B at 128K context, batch 32 {#worked-example}
+
+This section applies the above concepts to a concrete, realistic configuration.
+
+**Model specification:**
+- Llama 3 70B: 80 layers, 8 KV heads (GQA), 128-dim per head.
+- Context: 128,000 tokens.
+- Batch size: 32 concurrent sequences.
+- Precision: BF16 (2 bytes per element).
+
+### Baseline (no compression)
+
+$$
+\text{KV cache} = 2 \times 80 \times 8 \times 128 \times 128{,}000 \times 32 \times 2 \text{ bytes}
+$$
+
+$$
+= 83{,}886{,}080{,}000 \text{ bytes} = 83.9 \text{ GB}
+$$
+
+This exceeds the 80 GB HBM of an H100 GPU. Practical deployment requires:
+- Batch size 16 (42 GB), or
+- Dual-GPU setup, or
+- Offloading to CPU memory (with PCIe latency penalties).
+
+Model weights alone occupy 140 GB in FP16, so even with paged attention, a single GPU cannot hold the full model.
+
+### With paged attention (vLLM)
+
+- **Memory footprint:** Still 83.9 GB, but fragmentation waste drops from 60–80% to &lt;5%.
+- **Effective utilization:** Full 78–80 GB available for KV cache; no wasted gaps.
+- **Batch scheduling:** Paged attention enables flexible scheduling; the block table naturally accommodates variable-length sequences.
+- **Throughput gain:** 2–3× higher throughput vs. contiguous allocation, achieved through better scheduling and reduced idle time.
+
+### With H2O compression (20% retention)
+
+Retaining 20% of tokens (recent + heavy hitters):
+
+$$
+\text{KV cache} = 83.9 \text{ GB} \times 0.20 = 16.8 \text{ GB}
+$$
+
+This fits comfortably on a single H100. Batch size can increase to 4–5 concurrent requests, and total throughput improves accordingly.
+
+**Tradeoff:** Slight perplexity degradation (typically &lt;0.5 points on MMLU) on knowledge-retrieval tasks; negligible impact on chat and instruction-following.
+
+### With KIVI quantization (2-bit, from FP16 baseline)
+
+2-bit quantization reduces per-element memory from 2 bytes to 0.25 bytes:
+
+$$
+\text{KV cache} = 83.9 \text{ GB} \times \frac{2 \text{ bits}}{16 \text{ bits}} = 83.9 \text{ GB} \times 0.125 = 10.5 \text{ GB}
+$$
+
+This enables batch 32 on a single H100 with substantial headroom. Adding model weights (140 GB) exceeds a single GPU, but in a multi-GPU serving cluster, the KV cache reduction frees capacity for other optimizations: larger batch sizes, longer contexts, or pipelining.
+
+### Combined: PagedAttention + KIVI at batch 32
+
+- **KV memory:** ~10.5 GB (quantized, 2-bit).
+- **Scheduling:** Paged blocks eliminate fragmentation.
+- **Model weights:** ~140 GB, still requires a dedicated GPU or multi-GPU cluster.
+- **Net effect:** Single-GPU inference of Llama 3 70B at 128K context with batch 32 becomes feasible if model weights are cached elsewhere (e.g., on a separate GPU or served via model-parallel techniques).
+
+---
+
+## Comparison table {#comparison}
+
+<ComparisonTable>
+| Method | Memory Savings | Latency Impact | Fine-tuning Req'd | Best For | Citation |
+|--------|---|---|---|---|---|
+| Baseline (contiguous) | — | — | — | Reference | — |
+| **Paged Attention** | 0% (fragmentation eliminated) | ~0% | No | High-throughput batching, variable-length sequences | Kwon et al., OSDI 2023, [arXiv:2309.06180](https://arxiv.org/abs/2309.06180) |
+| **H2O** | 5× (20% tokens retained) | +5–10% quality loss on retrieval | No | Long-context generation, knowledge-light tasks | Zhang et al., NeurIPS 2023, [arXiv:2306.14048](https://arxiv.org/abs/2306.14048) |
+| **StreamingLLM** | 4–8× (infinite context support) | ~0% | No (or pretraining-aware) | Streaming, models with attention sinks | Xiao et al., ICLR 2024, [arXiv:2309.17453](https://arxiv.org/abs/2309.17453) |
+| **SnapKV** | 4–8× (8.2× on 16K inputs) | +0–3% quality impact | No | Long static prompts, RAG, in-context learning | Li et al., NeurIPS 2024, [arXiv:2404.14469](https://arxiv.org/abs/2404.14469) |
+| **KIVI (2-bit)** | 8× (2.6× with model weights) | ~0% (inference only) | No | Batch scaling, throughput-critical scenarios | Liu et al., ICML 2024, [arXiv:2402.02750](https://arxiv.org/abs/2402.02750) |
+| **H2O + KIVI** | 40–50× | +5–10% quality | No | Extreme efficiency, mobile/edge inference | Composition of above |
+</ComparisonTable>
+
+---
+
+## Summary {#summary}
+
+The KV cache dominates memory consumption during large language model inference. The memory cost—approximately 84 GB for Llama 3 70B at 128K context and batch 32—exceeds available GPU memory and forces severe batch-size reductions. Three complementary strategies address this bottleneck:
+
+1. **Paged Attention** (vLLM, 2023) eliminates fragmentation by mapping logical cache blocks to scattered physical memory via an indirection table, improving memory utilization from 20–40% to &gt;95% and increasing throughput by 2–4×.
+
+2. **Token Reduction** techniques—H2O (heavy-hitter oracle), StreamingLLM (attention sinks), SnapKV (position-aware clustering)—selectively discard or downweight tokens, achieving 5–8× memory reduction with minimal quality impact.
+
+3. **Quantization** (KIVI, 2-bit asymmetric) reduces per-element memory from 2 bytes to 0.25 bytes, achieving 8× reduction and enabling batch scaling without model accuracy loss.
+
+These methods compose: paged attention + KIVI + token compression can reduce KV cache from 84 GB to under 5 GB, making single-GPU inference of very large models with long contexts increasingly practical. The field remains active, with ongoing work on adaptive compression, multi-GPU scaling, and hardware codesign.
+
+The impact extends beyond model size and context length: efficient KV management unlocks [continuous batching](/textbook/04d-continuous-batching) strategies, which further improve throughput by packing multiple requests in the same iteration. This multiplication of gains—efficient memory layout, compression, and flexible scheduling—explains why inference throughput has improved 10–50× from 2022 to 2026.
+
+---
+
+<Sources>
+
+1. Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., & Stoica, I. (2023). "Efficient Memory Management for Large Language Model Serving with PagedAttention." *Proceedings of the 29th Symposium on Operating Systems Principles (OSDI)*, 2023. [arXiv:2309.06180](https://arxiv.org/abs/2309.06180)
+
+2. Zhang, Z., Sheng, Y., Zhou, T., Liao, T., Zheng, L., Chen, A. Y., & Zhang, H. (2023). "H₂O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models." *NeurIPS*, 2023. [arXiv:2306.14048](https://arxiv.org/abs/2306.14048)
+
+3. Xiao, G., Tian, Y., Chen, B., Han, S., & Lewis, M. (2024). "Efficient Streaming Language Models with Attention Sinks." *ICLR*, 2024. [arXiv:2309.17453](https://arxiv.org/abs/2309.17453)
+
+4. Li, Y., Huang, Y., Zhou, B., & Jia, Z. (2024). "SnapKV: LLM Knows What You are Looking for Before Generation." *NeurIPS*, 2024. [arXiv:2404.14469](https://arxiv.org/abs/2404.14469)
+
+5. Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman, V., Chen, B., & Hu, X. (2024). "KIVI: A Tuning-Free Asymmetric 2-bit Quantization for KV Cache." *ICML*, 2024. [arXiv:2402.02750](https://arxiv.org/abs/2402.02750)
+
+</Sources>

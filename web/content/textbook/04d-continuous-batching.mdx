@@ -1,0 +1,395 @@
+---
+slug: 04d-continuous-batching
+title: Continuous batching
+description: Orca's iteration-level scheduling, vLLM's continuous batching with PagedAttention, chunked prefill, and 2024-2026 SLA-aware schedulers.
+order: 40
+chapter: 40
+module: 4
+module_title: Inference and serving
+reading_minutes: 28
+depends_on: [04a-kv-cache]
+provides: [continuous-batching, iteration-scheduling, chunked-prefill, preemption, ragged-batching]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Static batching—the traditional approach to GPU-accelerated inference in which multiple requests are collected into a fixed batch and processed through the model as multi-dimensional tensors—remains adequate for training but introduces severe inefficiencies in LLM serving. Each request must wait for the slowest sequence to complete, GPU memory is wasted on padding, short sequences occupy resources long after finishing, and new requests queue outside the current batch. The cumulative effect: throughput is drastically underutilized, and response latency becomes unpredictable.
+
+Continuous batching and iteration-level scheduling represent a fundamental departure from this model. Rather than fixing a batch at the start of a request and keeping it intact until completion, the scheduler makes batching decisions at the granularity of a single forward pass iteration. As sequences complete individual tokens during decoding, they exit the batch immediately. Empty slots are filled with newly arriving requests. The batch composition shifts—sometimes growing, sometimes shrinking—at every iteration.
+
+This section examines the architecture, performance characteristics, and tradeoffs of continuous batching across three generations of systems:
+
+1. **Orca** (OSDI 2022): The first comprehensive iteration-level scheduler.
+2. **vLLM** (SOSP 2023): Continuous batching combined with PagedAttention, now the production standard.
+3. **Emerging systems** (2024–2026): Chunked prefill, disaggregated serving, and SLA-aware schedulers that extend continuous batching to diverse workloads.
+
+Earlier discussion of the [KV cache](/textbook/04a-kv-cache) established memory layout and access patterns. This chapter builds on those foundations to explore how scheduling decisions reshape the KV cache footprint and overall GPU utilization.
+
+## Static Batching Limits {#static-batching-limits}
+
+Static batching illustrates the core scheduling challenge in LLM inference. Consider a batch of five requests with different output lengths:
+
+- Request A: 512-token prompt, 20-token output.
+- Request B: 1024-token prompt, 80-token output.
+- Request C: 256-token prompt, 100-token output.
+- Request D: 2048-token prompt, 50-token output.
+- Request E: 512-token prompt, 30-token output.
+
+In static batching, all sequences are padded to the longest dimensions (2048 tokens for prompts in this case) and processed together. Every forward pass computes on the full padded tensor, even though after request A completes, its allocated GPU memory sits idle for 80 iterations while request B finishes. Similarly, GPU resources remain reserved for request A for the entire duration of the batch, preventing new requests from entering.
+
+### Head-of-Line Blocking
+
+The delay imposed on short requests by slow ones is called head-of-line blocking. In the example above, request A waits 80 iterations (once its output finishes) before the entire batch clears. The scheduler cannot begin processing a new batch until every sequence in the current batch terminates. If a single request is slow—due to long output, poor cache locality, or a less predictable decode trajectory—all other requests in that batch are held hostage.
+
+This effect becomes acute under realistic workloads. At an AI API provider, requests arrive with high concurrency and variable characteristics. A bursty arrival of short requests followed by one outlier (a request with 4000-token prompt and 200-token output) can cause the entire system to stall. Median latency climbs; tail latency (p99) becomes extremely high because the tail is dominated by requests stuck in slow batches.
+
+### Padding Waste
+
+Padding overhead represents a substantial source of wasted computation. Empirical measurements across representative workloads show padding waste of **60–80%** for typical batch sizes and natural sequence length distributions. If a batch contains 32 sequences with an average length of 512 tokens but a maximum length of 2048 tokens, the effective batch size is 32 × 2048 = 65,536 tokens, even though only 32 × 512 ≈ 16,384 tokens carry meaningful computation. The remaining ≈ 49,000 tokens are padding.
+
+This waste is particularly harmful in the decode phase. Decode iterations process single tokens per request; if ten requests are being decoded, the batch processes 10 tokens per iteration. Padding these 10 tokens to align with the longest sequence in the system (sometimes several thousand tokens, if a different batch is in the prefill phase) is clearly wasteful.
+
+### GPU Underutilization
+
+Short sequences that finish early cease to generate new tokens but continue occupying GPU memory slots. If a request completes its output within 10 iterations, its allocated position in the batch remains reserved for the remaining 90 iterations until the batch clears. During those 90 idle iterations, no new requests can fill that slot.
+
+Furthermore, GPU compute utilization varies sharply between phases. During prefill (processing the entire prompt in a single forward pass), compute is saturated: the model performs matrix multiplications on large inputs, and memory bandwidth is well-amortized. During decode (generating one token per iteration), each forward pass is small relative to the model size. A single sequence generates one token; compute utilization per sequence is low. Static batching attempts to compensate by grouping many sequences, but this creates the head-of-line blocking problem.
+
+### Request Queueing
+
+New requests must queue outside the current batch. The scheduler cannot admit them mid-batch because the batch shape and GPU memory allocations are fixed. This creates a scheduling opportunity cost: resources sit idle or underutilized while new requests wait in queue.
+
+## Iteration-Level Scheduling {#iteration-scheduling}
+
+The breakthrough insight of Orca (Yu et al., OSDI 2022) is simple but powerful: make batching decisions at the granularity of a single iteration rather than at the granularity of a complete request.
+
+### The Core Mechanism
+
+At each iteration of the forward pass, the scheduler performs the following steps:
+
+1. Execute one forward pass through the model on the current batch.
+2. Identify sequences that produce their final token and remove them immediately.
+3. Evaluate the waiting queue and admit new requests into freed slots, subject to hardware constraints (maximum number of sequences, total token budget per iteration).
+4. Adjust the batch composition based on new admissions and completions.
+
+The batch composition can change at every iteration. A batch with 32 sequences at iteration *t* might have 28 sequences at iteration *t+1* (if 4 sequences finished) and 32 sequences again at iteration *t+2* (if 4 new requests were admitted). The batch is no longer a static container but a dynamic set.
+
+This mechanism breaks head-of-line blocking. A slow request does not prevent short requests from exiting. A short request finishes, its slot is freed, and the scheduler immediately fills it with a waiting request. The entire batch need not drain for progress to be made.
+
+### Selective Batching
+
+Attention computation poses a challenge to ragged batching: different sequence lengths require different shapes in the attention matrix. The attention operation computes interactions between all token pairs in a sequence. If sequences have different lengths, the attention dimensions do not align naturally without padding.
+
+Orca addresses this with **selective batching**: attention operations are computed sequentially (one sequence at a time, or grouped by length), while other operations (linear layers, GeLU activations, normalization) are batched across sequences of different lengths. This hybrid approach maintains the batching benefits for compute-bound operations while respecting the structural constraints of attention.
+
+Later systems improved on this by developing ragged-attention kernels (FlashInfer, FlashAttention variants) that directly support variable-length sequences in a single batched operation, but Orca's selective batching remains a valid and simpler approach for systems without specialized kernels.
+
+### Performance Gains
+
+Orca demonstrated up to **36.9× throughput improvement** over static batching systems in controlled experiments. This dramatic improvement reflects the compound effect of:
+
+- Removing head-of-line blocking (requests exit immediately upon finishing).
+- Enabling new requests to be admitted before the current batch clears (reducing idle GPU time).
+- Dynamically sizing the batch to match available resources (avoiding over-provisioning and padding waste).
+
+The throughput gain varies with workload characteristics. Workloads with high variance in output length benefit more; workloads with uniform sequences benefit less. Nevertheless, even in relatively uniform cases, iteration-level scheduling consistently improves throughput over static approaches.
+
+## vLLM Scheduler {#vllm-scheduler}
+
+vLLM (Zhou et al., SOSP 2023) represents the production-grade instantiation of continuous batching. It combines iteration-level scheduling with PagedAttention, a memory management innovation, to achieve near-zero KV cache fragmentation and superior throughput. vLLM is now the de facto standard for LLM serving in production deployments.
+
+### Three-Queue Model
+
+vLLM organizes requests into three queues:
+
+1. **Waiting Queue**: Requests that have arrived but not yet begun execution. These requests lack allocated GPU memory for their KV cache.
+
+2. **Running Queue**: Sequences actively computing in the current iteration. Their KV cache blocks are allocated and present on the GPU.
+
+3. **Swapped Queue**: Preempted sequences whose KV cache blocks have been serialized to CPU DRAM. These sequences are candidates for re-admission when GPU memory becomes available.
+
+The scheduler operates across these queues at each iteration, making decisions about which sequences to run, which to preempt, and which waiting requests to admit.
+
+### Admission and Preemption Constraints
+
+At each decode iteration, the scheduler checks:
+
+- **Maximum concurrent sequences** (`--max-num-seqs`): A hard limit on the number of sequences active simultaneously. Typical value: 256. This constraint prevents the scheduler from over-committing GPU memory.
+
+- **Maximum batched tokens per forward pass** (`--max-num-batched-tokens`): The total number of tokens processed in a single iteration. For decode iterations, this is equal to the number of running sequences (since each generates one token). For prefill iterations, this can be larger. Typical value: 4096–8192 tokens. This constraint ensures that memory access and compute bandwidth are not exceeded.
+
+When these constraints are reached, the scheduler blocks new admissions. If higher-priority requests arrive or ongoing sequences approach latency deadlines, preemption of lower-priority sequences may be triggered.
+
+### Scheduling Example
+
+Consider a running batch with 10 sequences that after 20 iterations sees 5 sequences complete. The scheduler:
+
+1. Removes the 5 completed sequences from the running queue, freeing their KV cache blocks.
+2. Evaluates the waiting queue and admits 5 new requests (assuming sufficient GPU memory).
+3. At iteration 21, the batch again contains 10 sequences: the original 5 plus the 5 newly admitted ones.
+
+Without admitting new sequences, the scheduler would run an idle batch with only 5 sequences, wasting GPU capacity. With continuous batching, GPU utilization remains high.
+
+### Integration with PagedAttention
+
+PagedAttention is orthogonal to the scheduling mechanism but essential for it to function efficiently at scale. Rather than allocating contiguous GPU memory for the entire KV cache of each sequence (which leads to fragmentation as sequences of different lengths are allocated and freed), PagedAttention divides the KV cache into fixed-size logical blocks (typically 16 tokens per block). Each block is allocated independently, and a sequence's KV cache is a list of block references.
+
+When a sequence completes, its blocks are returned to a free pool. When a new sequence is admitted, blocks are allocated on demand. This approach reduces memory waste from **60–80%** (characteristic of contiguous allocation with padding) to **under 4%**. The low fragmentation enables the scheduler to admit more sequences and operate at higher utilization.
+
+For continuous batching to achieve its throughput gains, efficient memory management is critical. Without PagedAttention or a similar mechanism, the scheduler quickly runs out of GPU memory and is forced to reject or preempt arriving requests.
+
+### Observed Performance
+
+vLLM achieves **2–4× throughput improvement** over prior state-of-the-art systems (FasterTransformer, Orca) at equivalent latency. In specific benchmarks (Anyscale testing with appropriate batch configuration), improvements reach **23× throughput gain** compared to static batching. The variance reflects differences in workload, hardware, and tuning.
+
+Tail latency (p99) is dramatically reduced because long sequences no longer block short ones. A request that generates 20 tokens completes within ~20 iterations regardless of whether other sequences in the batch are generating 100 tokens. In static batching, that request might be held for 100+ iterations waiting for the batch to clear.
+
+## Ragged Batching {#ragged-batching}
+
+Continuous batching fundamentally operates on **ragged tensors** (also called jagged tensors), in which sequences of different lengths are grouped without padding to a common maximum length.
+
+### Why Ragged Batching Matters
+
+Traditional batching pads all sequences to the maximum length. If a batch contains sequences of length 256, 512, 1024, and 2048 tokens, all are padded to 2048. The total token count is batch_size × 2048, even though the average sequence length might be 800. The difference—padding overhead—is often **60–80%** of the total computation, as noted earlier.
+
+Ragged batching concatenates tokens from all sequences into a single tensor without padding. If a batch contains 32 sequences with lengths \{256, 512, ..., 2048\}, the token tensor has shape [sum(lengths), hidden_dim]. The total token count is 32 × (average_length), not 32 × 2048. For typical length distributions, this reduces computation by 2–3× compared to padded batching.
+
+### Implementation Techniques
+
+Three approaches exist for computing attention on ragged tensors:
+
+1. **Offset Tables**: The attention kernel receives metadata specifying the start and end indices of each sequence within the concatenated token buffer. The kernel uses these offsets to determine which tokens belong to the same sequence (and thus can attend to each other) versus different sequences.
+
+2. **Specialized Ragged Kernels**: Libraries like FlashInfer provide kernels that natively operate on ragged batches. These kernels fuse the offset computation with the attention computation, avoiding the overhead of separate indexing operations.
+
+3. **PyTorch NestedTensors**: A higher-level abstraction in PyTorch that represents ragged tensors with explicit metadata. Some frameworks use NestedTensors to simplify ragged batching implementation, though performance is often worse than specialized kernels due to less-optimized compilation.
+
+The choice of implementation affects both ease of integration and performance. Offset tables are simplest but require manual kernel tuning. Specialized kernels like FlashInfer offer better performance but require integration and maintenance.
+
+### Interaction with Continuous Batching
+
+Ragged batching is essential to the functioning of continuous batching. Consider a running batch with sequences in the decode phase (each sequence generates one token per iteration) and a newly admitted sequence in the prefill phase (its prompt is many tokens long). Without ragged batching, the entire batch would be padded to accommodate the longest prompt, potentially multiplying the computation by 10–100×. This overhead would negate the throughput benefits of continuous batching.
+
+With ragged batching, the decode sequences contribute 1 token each to the attention computation, and the prefill sequence contributes tokens from its prompt. The total computation is proportional to the sum of all tokens, not to the product of batch size and maximum length.
+
+## Preemption {#preemption}
+
+When KV cache GPU memory is fully occupied and new requests arrive with higher priority or tighter latency constraints, the continuous batching scheduler must decide whether to reject requests or preempt existing ones.
+
+### Preemption Modes
+
+vLLM supports two preemption strategies:
+
+**Swap Mode** (slow, compute-preserving):
+- Sequences have their KV cache blocks serialized to CPU DRAM.
+- Blocks are moved from the GPU to the swapped queue.
+- Later, when GPU memory becomes available, blocks are transferred back over PCIe (using DMA or explicit host-to-device copies).
+- Trade-off: PCIe bandwidth is limited (~32 GB/s for PCIe 4.0), so transferring large KV caches (e.g., a 2000-token sequence with a 70B model's 80 layers) incurs significant latency. However, the sequence's KV cache is preserved, so no recomputation is needed.
+
+**Recomputation Mode** (fast, compute-intensive):
+- Preempted sequences are discarded from GPU memory entirely. The sequence state is lost.
+- On re-admission, the prefill phase is re-executed from the beginning to recompute the KV cache.
+- Trade-off: Recomputation is expensive (proportional to the prompt length), but avoids PCIe latency. For short prompts, recomputation is faster than swap; for long prompts, swap may be preferable.
+
+The choice depends on workload and hardware. Systems with high PCIe bandwidth (fast CPU-GPU interconnect) favor swap. Systems with large compute capacity and short prompts favor recomputation.
+
+### Scheduling Implications
+
+Preemption introduces a cost that must be balanced against other objectives. A system that preempts too aggressively to prioritize high-priority requests may suffer from excessive recomputation or PCIe contention, reducing overall throughput. Conversely, a system that preempts too conservatively may violate SLO deadlines for high-priority requests.
+
+Modern schedulers use predictive models to estimate:
+
+- The remaining latency of each running sequence.
+- The potential latency of waiting requests if admitted immediately versus after a preemption.
+- The cost of preemption (either recomputation time or PCIe transfer time).
+
+These estimates guide preemption decisions, aiming to minimize SLO violations while maximizing throughput.
+
+## Throughput–Latency Tradeoff {#throughput-latency}
+
+Batching improves throughput but increases per-request latency. Understanding this tradeoff is fundamental to deploying LLM serving systems.
+
+### The Batch-Size Effect
+
+The relationship between batch size and latency differs sharply between the prefill and decode phases:
+
+**Decode Phase** (memory-bound):
+- Loading model weights from GPU memory is the primary bottleneck, not compute.
+- Adding a second sequence to the batch incurs minimal additional latency because the weights are already in memory. The additional computation (one more token) amortizes the weight load.
+- Throughput increases nearly linearly with batch size up to hardware saturation (B_sat), where the memory access pattern becomes compute-bound.
+- Example: On an A100 GPU, serving 64 sequences at once increases throughput by ~14× compared to serving 1 sequence, but increases per-request latency by only ~4× (not 64×) because weight reuse is very efficient.
+
+**Prefill Phase** (compute-bound):
+- Processing the entire prompt in a single forward pass saturates GPU compute quickly.
+- Increasing batch size increases per-iteration latency more directly.
+- The amortization of weight load across tokens in the same sequence is very efficient, so prefill has high compute utilization per sequence even with small batches.
+
+**Beyond saturation** (compute-bound):
+- As batch size exceeds B_sat, per-iteration latency increases substantially because GPU compute and memory bandwidth are saturated.
+- Queuing delays accumulate; per-request latency follows a "hockey stick" curve, rising sharply.
+
+### Continuous Batching's Reshaping
+
+Continuous batching and chunked prefill reshape the throughput–latency curve by:
+
+1. **Separating prefill and decode scheduling** to prevent long prefills from blocking short decodes. Instead of queuing all decode sequences until a prefill finishes, the scheduler interleaves small prefill chunks with decode batches.
+
+2. **Adding new requests dynamically** to fill GPU slots as sequences complete, rather than waiting for the entire batch to drain.
+
+3. **Expanding the efficient operating region** (the "knee" of the curve) further out, allowing higher throughput before latency spikes.
+
+The net effect is that systems can operate at higher throughput (closer to hardware saturation) while maintaining acceptable latency (by admitting new requests continuously and preventing any single request from blocking others).
+
+## Chunked Prefill {#chunked-prefill}
+
+A long prompt (e.g., 8000 tokens) in prefill saturates GPU compute for many iterations, blocking decode sequences from being scheduled. Chunked prefill addresses this by splitting the prefill phase into smaller chunks.
+
+### Mechanism
+
+A long prompt is decomposed into chunks (e.g., 512 tokens each, or sized dynamically based on available GPU capacity). Each chunk is processed with a batch of decode-only requests. This creates **decode-maximal batching**: every iteration contains one prefill chunk (producing intermediate KV cache) and as many decode sequences as fit. The final prefill chunk generates the first output token, and the sequence transitions to decode.
+
+**Example**: A request with an 8000-token prompt is split into 16 chunks of 512 tokens each. At iteration 1, chunk 0 is processed with 32 decode sequences. At iteration 2, chunk 1 is processed with 32 (possibly different) decode sequences. By iteration 16, the entire prompt is processed, and the sequence begins generating output tokens. Meanwhile, decode sequences exit and new ones are admitted, maintaining high throughput throughout.
+
+### Performance Impact
+
+Chunked prefill achieves several benefits:
+
+- **Reduced latency variance**: No single prefill blocks all decodes for multiple iterations.
+- **Improved decode throughput**: Decode sequences are scheduled more frequently, increasing their overall tokens-per-second.
+- **More predictable latency**: Requests have better visibility into their completion time.
+
+Sarathi-Serve (OSDI 2024) demonstrated **2.6–5.6× serving capacity improvements** (number of concurrent users with a given SLO) using chunked prefill with decode-maximal batching compared to vLLM's interleaved approach.
+
+### Comparison to vLLM
+
+vLLM's scheduler interleaves prefill and decode dynamically but may stall decode sequences if a very long prefill arrives. Sarathi-Serve's chunked prefill explicitly prevents this by ensuring that every iteration contains both prefill work and decode work, maintaining a constant ratio of compute allocation.
+
+### Chunk Size Optimization
+
+An open question in the field is the optimal chunk size for a given workload, hardware, and prompt length distribution. Current systems use heuristics:
+
+- **Fixed chunk size** (e.g., 512 tokens): Simple but may be suboptimal for diverse workloads.
+- **Occupancy-based sizing**: Chunks are sized to exactly fill available GPU capacity. Requires online measurement of batch occupancy.
+- **Cost-aware sizing**: Chunks are sized to minimize a weighted combination of throughput and latency, using predictive models. More complex but potentially optimal.
+
+Principled optimization of chunk sizing remains an active research area.
+
+## SLA Scheduling {#sla-scheduling}
+
+Modern AI API providers operate under diverse service-level agreements (SLOs). Some requests are latency-sensitive (interactive applications with per-token deadlines); others are throughput-oriented (batch processing with total latency bounds). Continuous batching enables advanced scheduling to handle multiple SLO classes.
+
+### Multi-SLO Scheduling
+
+Recent work (SLO-Aware Scheduling, 2025) addresses systems with multiple request types:
+
+- **Per-token deadline SLOs** (e.g., ≤50ms per token): Interactive applications where users expect rapid responses. Each token must be generated quickly.
+- **Total latency bound SLOs** (e.g., ≤5s for a 100-token response): Batch processing where the total time to complete is the constraint, but intermediate tokens are not visible to the user.
+- **Token throughput SLOs** (e.g., ≥20 tokens/second): Streaming applications where throughput is the primary constraint.
+
+A single scheduler must balance these diverse requirements:
+
+1. **Prioritize by deadline urgency**: Requests that are close to missing their deadline are prioritized in preemption and admission decisions.
+2. **Reorder admission**: When multiple waiting requests exist, the scheduler admits those with the tightest deadlines first.
+3. **Allocate compute dynamically**: During prefill, long sequences are processed in chunks to prevent them from monopolizing compute. During decode, sequences close to their deadline are prioritized.
+
+**Performance**: Systems implementing multi-SLO scheduling achieve up to **5× improvement** in SLO attainment (fraction of requests meeting their deadline) and **31.6% reduction** in average latency compared to baseline continuous batching with FIFO admission.
+
+### Priority and Fairness
+
+Priority-based preemption allows high-priority requests to trigger preemption of low-priority ones. However, this introduces a fairness concern: low-priority sequences must not starve indefinitely. Schedulers typically implement:
+
+- **Priority aging**: Low-priority requests become higher priority as they age in the queue, eventually preempting high-priority requests to prevent indefinite starvation.
+- **SLO-driven prioritization**: Requests are prioritized by their deadline, not by a static priority level. This ensures that requests most at risk of missing their deadline are scheduled first.
+
+## Comparison of Batching Approaches {#comparison}
+
+<ComparisonTable>
+
+| Aspect | Static Batching | Dynamic Batching | Continuous Batching (vLLM) | Chunked Prefill (Sarathi) | Disaggregated (DistServe) |
+|--------|-----------------|------------------|----------------------------|---------------------------|---------------------------|
+| **Scheduling Granularity** | Request-level | Request + time-based | Iteration-level | Phase-level + chunk-level | Cluster-level |
+| **Batch Composition** | Fixed until done | Waits for batch fill | Changes every iteration | Chunks + decode-maximal | Independent prefill/decode |
+| **Head-of-Line Blocking** | Severe | Moderate | Minimal | Eliminated | Eliminated |
+| **Memory Overhead** | 60–80% (padding) | 40–60% | &lt;4% (with PagedAttention) | &lt;4% | &lt;4% |
+| **Throughput vs. Static** | 1× (baseline) | 1.08–1.28× | 2–23× | 2.6–5.6× | 1.5–3× |
+| **Tail Latency** | Very high (p99) | High | Low | Very low | Low |
+| **SLA Support** | Poor | Fair | Good | Excellent | Excellent |
+| **Prefill Latency** | High (amortized) | High | Moderate | Low (chunked) | Low (separate) |
+| **Implementation** | Simple | Moderate | Complex | Complex | Very complex |
+| **Production Adoption** | Legacy | Moderate | Widespread (vLLM) | Growing | Research |
+| **Source** | — | — | [vLLM Blog](https://blog.vllm.ai/2023/06/20/vllm.html) | [Sarathi-Serve OSDI 2024](https://www.usenix.org/system/files/osdi24-agrawal.pdf) | [DistServe OSDI 2024](https://www.usenix.org/system/files/osdi24-zhong-yinmin.pdf) |
+
+</ComparisonTable>
+
+## Future Directions {#summary}
+
+The field of continuous batching remains active. Several open challenges are shaping the next generation of LLM serving systems:
+
+1. **Optimal Chunk Sizing**: Principled algorithms for determining prefill chunk size given workload characteristics, prompt length distribution, and hardware constraints. Current approaches are heuristic-based.
+
+2. **Predictive Latency Models**: More accurate prediction of per-request completion time under dynamic load. Current models are simple and often inaccurate; machine-learning-based approaches show promise but add scheduling overhead.
+
+3. **KV Cache Placement Policies**: When should a preempted sequence's cache be swapped to CPU versus recomputed? When should cache be compressed or evicted? Current policies are greedy or LRU-based; cost models lack precision.
+
+4. **Cross-Request Cache Sharing**: Some requests share common prefixes (e.g., multi-turn conversations, retrieval-augmented generation). Can KV cache be shared efficiently? vLLM's prefix caching is basic; more sophisticated approaches like RadixAttention show promise but remain under-integrated.
+
+5. **Adaptive Batch Sizing**: Can systems dynamically adjust batch size, chunk size, and other parameters based on observed latency and throughput? Current systems use static configuration.
+
+6. **Distributed Serving Trade-offs**: When does disaggregation (DistServe, Splitwise) outweigh network transfer overhead? Principled guidelines for system design are lacking.
+
+7. **Load Shedding and Overload Control**: How to fairly prioritize requests and shed load when the system is overloaded? Current approaches are ad-hoc; SLA-aware policies are emerging.
+
+## Summary
+
+Continuous batching and iteration-level scheduling represent a fundamental shift in how LLM inference is orchestrated. Rather than treating a request as an atomic unit that occupies a batch slot until completion, continuous batching makes scheduling decisions at the granularity of a single forward pass iteration. As sequences complete individual tokens, they exit the batch. Empty slots are filled with waiting requests. This dynamic reshaping of the batch composition eliminates head-of-line blocking, reduces padding waste, and increases GPU utilization.
+
+vLLM's combination of continuous batching and PagedAttention has become the production standard, enabling **2–23× throughput improvements** over static batching systems while reducing tail latency. Emerging techniques—chunked prefill, disaggregated serving, and SLA-aware scheduling—extend continuous batching to handle diverse request characteristics and heterogeneous workloads.
+
+The field remains dynamic. Ongoing work focuses on predictive scheduling, adaptive resource allocation, and scaling to distributed systems. The fundamental insights of iteration-level scheduling, however, are solid and will likely shape LLM serving architecture for years to come.
+
+<Sources>
+
+1. [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/system/files/osdi22-yu.pdf) — Yu et al., OSDI 2022. First comprehensive analysis of iteration-level scheduling (continuous batching).
+
+2. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) — Zhou et al., SOSP 2023. vLLM's PagedAttention mechanism and integration with continuous batching.
+
+3. [vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention](https://blog.vllm.ai/2023/06/20/vllm.html) — vLLM Blog. Practical overview of vLLM's continuous batching and scheduling.
+
+4. [Continuous batching from first principles](https://huggingface.co/blog/continuous_batching) — Hugging Face Blog. Detailed explanation of ragged batching and continuous scheduling mechanics.
+
+5. [DeepSpeed-FastGen: High-throughput Text Generation for LLMs via MII and DeepSpeed-Inference](https://arxiv.org/pdf/2401.08671) — Holmes et al., January 2024. Dynamic SplitFuse and chunked prefill techniques.
+
+6. [Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve](https://www.usenix.org/system/files/osdi24-agrawal.pdf) — Agrawal et al., OSDI 2024. Stall-free scheduling and decode-maximal batching for managing throughput–latency tradeoff.
+
+7. [SLO-Aware Scheduling for Large Language Model Inferences](https://arxiv.org/html/2504.14966v1) — 2025. Multi-SLO scheduling with deadline-aware prioritization.
+
+8. [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/html/2311.18677v2) — Patel et al., ISCA 2024. Disaggregated prefill and decode scheduling across machine pools.
+
+9. [DistServe: Disaggregating Prefill and Decoding for Scalable and Efficient LLM Serving](https://www.usenix.org/system/files/osdi24-zhong-yinmin.pdf) — Zhong et al., OSDI 2024. Cluster-level separation of prefill and decode phases.
+
+10. [Achieve 23x LLM Inference Throughput & Reduce p50 Latency](https://www.anyscale.com/blog/continuous-batching-llm-inference) — Anyscale Blog. Benchmarks comparing static, dynamic, and continuous batching.
+
+11. [How to Speed up AI Inference with vLLM Continuous Batching](https://voice.ai/hub/tts/vllm-continuous-batching/) — Voice.ai. Practical guide to continuous batching implementation.
+
+12. [LLM Inference: Continuous Batching and PagedAttention](https://insujang.github.io/2024-01-07/llm-inference-continuous-batching-and-pagedattention/) — Inju Sang, 2024. Technical deep-dive on scheduling and memory management.
+
+13. [vLLM Explained: PagedAttention, Continuous Batching, and Deploying High-Throughput LLM Inference in Production](https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching) — RunPod. Production deployment guide.
+
+14. [Static, dynamic and continuous batching](https://bentoml.com/llm/inference-optimization/static-dynamic-continuous-batching) — BentoML LLM Inference Handbook. Taxonomy and comparison of batching strategies.
+
+15. [Throughput-Latency tradeoff in LLM Inference — Part I](https://medium.com/better-ml/throughput-latency-tradeoff-in-llm-inference-5a9e0d1d2c14) — Jaideep Ray, Medium. Analysis of throughput–latency curves and batch sizing.
+
+16. [KV-Compress: Paged KV-Cache Compression with Variable Compression Rates per Attention Head](https://arxiv.org/html/2410.00161v2) — 2024. Advanced KV cache management via compression.
+
+17. [LLM Inference Optimizations - Chunked Prefills and Decode Maximal Batching](https://donmoon.medium.com/llm-inference-optimizations-2-chunked-prefill-764407b3a67a) — Don Moon, Medium. Explanation of chunked prefill technique.
+
+18. [Iteration Batching (a.k.a. Continuous Batching)](https://friendli.ai/blog/llm-iteration-batching) — FriendliAI Blog. Comparison of iteration batching to prior approaches.
+
+19. [Life of an inference request (vLLM V1): How LLMs are served efficiently at scale](https://www.ubicloud.com/blog/life-of-an-inference-request-vllm-v1) — Ubiquitous Cloud. Request lifecycle and scheduler internals.
+
+20. [Inside vLLM: Anatomy of a High-Throughput LLM Inference System](https://www.aleksagordic.com/blog/vllm) — Aleksa Gordić. Detailed scheduler architecture.
+
+21. [What Your Inference Provider Is Hiding From You: KV Cache, Batching, and the Latency Floor](https://tianpan.co/blog/2026-04-19-inference-provider-kv-cache-batching-latency-floor) — TianPan, April 2026. Critical perspective on batching trade-offs and latency floors.
+
+</Sources>

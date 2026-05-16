@@ -1,0 +1,541 @@
+---
+slug: 04f-frontier-engines
+title: Inference engines — vLLM, SGLang, TRT-LLM, and the rest
+description: Feature matrix and benchmarks for vLLM, SGLang, TRT-LLM, TGI, DeepSpeed-FastGen, llama.cpp, MLX, LMDeploy.
+order: 42
+chapter: 42
+module: 4
+module_title: Inference and serving
+reading_minutes: 32
+depends_on: [04a-kv-cache, 04d-continuous-batching, 04c-speculative-decoding, 04e-quantization]
+provides: [vllm, sglang, trt-llm, tgi, deepspeed-fastgen, llama-cpp, mlx, lmdeploy, engine-comparison]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Eight major inference engines have emerged as production standards for serving frontier LLMs in 2024–2026. By May 2026, vLLM and SGLang dominate the open-source ecosystem; TensorRT-LLM leads on NVIDIA infrastructure; TGI (now in maintenance) serves as the multi-backend middleware for hosting providers; DeepSpeed-FastGen innovates on prefill scheduling for heterogeneous workloads; llama.cpp owns the consumer and edge space; MLX specializes in Apple Silicon; LMDeploy claims peak throughput with quantized models. The reader arrives here understanding KV cache management ([04a](/textbook/04a-kv-cache)), continuous batching ([04d](/textbook/04d-continuous-batching)), speculative decoding ([04c](/textbook/04c-speculative-decoding)), and quantization ([04e](/textbook/04e-quantization)). This chapter ties those techniques together into complete systems.
+
+The treatment proceeds in three layers. First, a detailed profile of each of the eight engines — their core innovation, key features, performance characteristics, and deployment context. Second, a feature matrix and benchmark table summarizing throughput, latency, memory, and API compatibility. Third, a decision framework for when to choose each engine and what the frontier expects from inference systems by Q2 2026.
+
+What this chapter does *not* cover is signposted forward. Distributed serving and multi-GPU inference (load balancing, disaggregation, sharding) are treated in [Module 4e onwards](/textbook/04e-quantization); the mechanics of structured output constrained decoding are deferred to [Chapter 04g](/textbook/04g-structured-output); model quantization strategies beyond the engine perspective are in [Chapter 04e](/textbook/04e-quantization). The present chapter stays within the boundaries of a single inference engine running on a single logical device (GPU or multi-GPU cluster as a unit).
+
+<Callout variant="note" title="Notation and terminology">
+Throughout this chapter: **TPS** denotes tokens per second, the primary throughput metric for serving. **TTFT** is time-to-first-token in milliseconds, the latency from request submission to first output token. **Token capacity** refers to the maximum context window a model can load given fixed GPU memory. All benchmark numbers are taken from published results dated 2024–2026; exact hardware, batch size, and temperature assumptions are noted on each table row. **Speculative decoding speedup** is always a multiplier on baseline tokens per second; e.g., "3.6×" means the engine with speculative decoding achieves 3.6 times the TPS of the same engine without it.
+</Callout>
+
+---
+
+## vLLM {#vllm}
+
+### Innovation: PagedAttention
+
+vLLM (UC Berkeley, PyTorch Foundation) introduced **PagedAttention** in 2023, the highest-impact single technique in modern inference engines. The core idea borrows from operating-system virtual memory: fragment the KV cache into fixed-size "pages" (typically 16 tokens per page), isolate allocation and deallocation per page, and enable KV cache sharing within and across requests.
+
+Without paging, a contiguous KV cache for Llama 70B with 4,096 token context uses 140 GB of HBM per request. A request of 512 tokens wastes 127 GB of allocated but un-filled cache memory — 60–80% waste in practice, because every request must pre-allocate for worst-case context length. PagedAttention reduces that waste to ~4% by allowing requests to "allocate" pages on-demand and by enabling multiple requests to *share* pages holding identical prefix tokens (e.g., system prompts or long context documents that many queries reuse).
+
+The mechanics: the attention kernel is rewritten to handle page-table lookups (logical token index → physical page ID) during the softmax-weighted value aggregation. The cost is negligible — a few register lookups per token — and the benefit is direct: the same GPU memory holds 10–20× more concurrent requests without any approximation.
+
+### Features and performance
+
+**Continuous batching** with position indices and per-request attention masks (no right-padding), enabling requests of different lengths to batch efficiently.
+
+**Multi-LoRA support** at scale (up to 50+ adapters) with static HBM allocation and LRU eviction policies. Some workloads see performance cliffs when exceeding 30–40 active adapters, requiring per-deployment tuning.
+
+**Speculative decoding** reaches 3.6× speedup on H200 with draft-model validation; 2–3× speedup is the typical range across hardware.
+
+**XGrammar constrained decoding** enforces valid JSON or schema compliance during generation with &lt;40 μs/token overhead. Schema caching amortizes compilation cost over multiple requests.
+
+**Persistent batching** (also called continuous batching) allows requests to enter the batch at any time and exit when done, rather than strict request-sized micro-batches.
+
+**Performance benchmarks:**
+- **Throughput (H100, Llama 70B, TP=1):** 10K–16K TPS depending on batch composition and sequence lengths.
+- **With speculative decoding:** up to 3.6× speedup, reaching ~36–58K TPS on identical hardware (measured with draft model acceptance rate α ≥0.6).
+- **Memory (Llama 70B, BF16):** 140 GB in full precision; 18 GB in 4-bit quantization (3.8× reduction with 97.3% MMLU retention).
+- **TTFT:** 50–150 ms at batch=1, increasing gracefully with batch size.
+
+### Deployment and limitations
+
+**Strengths:** vLLM is the default inference engine for research and most production deployments as of 2026. The API is Python-native, the community is large, and the codebase is actively maintained. Multi-model serving (batching requests across models with different parameters) is cost-effective on vLLM because the PagedAttention memory savings make it practical.
+
+**Weaknesses:** Multi-LoRA management at 50+ adapters requires careful tuning to avoid memory exhaustion. Recent research (April 2025) shows ~46.5% of LoRA caches become invalid under dynamic request patterns, suggesting room for improvement. KV cache and LoRA scheduling are not jointly optimized. Some users report latency tail degradation (p99 vs p50) at very high concurrency (100+ concurrent requests), mitigated by request rate limiting and priority queues in production.
+
+Source: [vLLM Blog: Anatomy of vLLM](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html), [vLLM Documentation](https://docs.vllm.ai/en/latest/design/paged_attention/)
+
+---
+
+## SGLang {#sglang}
+
+### Innovation: RadixAttention and structured generation
+
+SGLang (LMSYS, Zheng et al., NeurIPS 2024) adds one critical layer on top of vLLM's paging paradigm: **RadixAttention**, an automatic KV cache reuse mechanism. The runtime maintains a radix tree of KV cache pages, indexed by token IDs and metadata. When a new request arrives, the engine checks whether any portion of its prompt (prefix) matches an existing cached radix path. If so, the pages are relinked into the new request's page table, avoiding redundant compute and bandwidth.
+
+The speedup on cache-reuse workloads is dramatic: 5–6.4× higher throughput vs. baseline on long-sequence workloads with substantial prefix overlap (e.g., a document retrieval system where many queries retrieve the same corpus context). Even on non-overlapping workloads, SGLang's continuous batching is comparable to vLLM.
+
+The second innovation is **language-level integration**: SGLang exposes a frontend DSL (domain-specific language) for specifying generation constraints (JSON schemas, function calls, regex patterns) that the backend interprets and enforces during token generation. This co-design of language and runtime is more ergonomic than vLLM's lower-level API.
+
+### Features and performance
+
+**RadixAttention** for KV cache reuse (5–6.4× throughput on prefix-overlap workloads, measured against competing systems without cache reuse).
+
+**Structured language** for expressive generation control — JSON modes, regex constraints, function call synthesis — with schema matching at the token level.
+
+**Multi-LoRA support** with native batching of requests targeting different adapters. SGLang's scheduling is more polished than vLLM at 50+ adapter scale, with better default heuristics for adapter switching.
+
+**Speculative decoding support** with the same 2–3× speedup range as vLLM.
+
+**llguidance constrained decoding** (~50 μs/token overhead) or XGrammar (shared with vLLM) for structured output guarantees.
+
+**Performance benchmarks:**
+- **Throughput (H100, Llama 70B):** 16K+ TPS on dense workloads; up to 6.4× vs. competing systems on cache-reuse scenarios (e.g., 100K-token corpus + 50 different queries).
+- **TTFT:** 40–120 ms, optimized for structured generation.
+- **Memory:** 140 GB / 18 GB (same paging as vLLM); RadixAttention adds minimal overhead (&lt;1% HBM).
+- **Recent milestone (January 2025):** Day-1 support for DeepSeek V3/R1 (both MLA and MoE architectures).
+
+### Deployment and context
+
+**Strengths:** SGLang excels on structured generation workloads (chatbots, function calling, JSON APIs), in-context learning (same document used across queries), and multi-LoRA serving at scale. The language-level design makes it natural for researchers exploring prompt programming and output constraints. Community is growing rapidly; GitHub stars exceed 15K as of May 2026.
+
+**Weaknesses:** The DSL introduces a learning curve for engineers used to OpenAI-style APIs. Multi-backend support (CPU, AMD) lags vLLM. Integration with monitoring and observability tools is less mature than vLLM.
+
+Source: [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), [LMSYS SGLang Blog](https://www.lmsys.org/blog/2024-01-17-sglang/)
+
+---
+
+## TensorRT-LLM {#trt-llm}
+
+### Innovation: Custom kernels and prefill-decode disaggregation
+
+TensorRT-LLM (NVIDIA, 2023–2026) is built on a different philosophy than vLLM and SGLang: instead of a Python-first runtime, it compiles inference graphs to optimized CUDA kernels and orchestrates them with NVIDIA's Triton Inference Server. The core innovations are **custom CUDA kernels** for attention, GEMMs, and MoE operations, and **prefill-decode disaggregation** — running the prompt-processing phase (prefill) and token-generation phase (decode) on separate GPU pipelines with potential overlap.
+
+Because NVIDIA owns both the hardware and the stack, TensorRT-LLM can target specific GPU capabilities (H100 Tensor Cores, H200 HBM bandwidth) with precision that general-purpose engines cannot. The compilation step imposes a build cost upfront but yields highly optimized inference at runtime.
+
+Prefill-decode disaggregation is particularly powerful for workloads with long prompts or variable prompt lengths. The prefill phase saturates Tensor Cores (high FLOP utilization, memory-bandwidth-limited) while the decode phase is memory-bandwidth-limited. Running both simultaneously on separate GPU clusters or on different SM (streaming multiprocessor) partitions within a single GPU can improve end-to-end latency.
+
+### Features and performance
+
+**Prefill-decode disaggregation** with separate GPU pipelines, enabling overlapped execution for latency reduction.
+
+**Wide Expert Parallelism (MoE)** with native support for mixture-of-experts models (e.g., Mixtral, Llama-3-MoE), leveraging NVIDIA's NVLink and InfiniBand for expert sharding.
+
+**Speculative decoding** (3.6× on H200) with native H100/H200 support, automatically integrated into the graph compiler.
+
+**Structured output** using OpenAI-style constrained sampling (NVIDIA is credited by OpenAI for foundational work on this).
+
+**Tight integration with Triton Inference Server** and NVIDIA's Dynamo/PyTorch 2 compiler stack. Models can be deployed via Triton's API, allowing multi-model serving, A/B testing, and request routing natively.
+
+**Custom kernels** for Llama, Mistral, Qwen, DeepSeek, Gemma, and other popular models, with optimizations tuned per architecture.
+
+**Multi-GPU and multi-node orchestration** via Tensor Parallelism (TP), Pipeline Parallelism (PP), and distributed serving.
+
+**Performance benchmarks:**
+- **Throughput (H200, Llama 3.3 70B):** ~15K TPS baseline; 3× speedup with speculative decoding (effectively ~45K TPS with acceptance rate α≥0.6).
+- **TTFT:** 30–100 ms, benefiting from prefill-decode disaggregation on long prompts.
+- **Memory:** 140 GB / 18 GB (same as vLLM/SGLang with paging).
+
+### Deployment and limitations
+
+**Strengths:** Enterprise deployments on NVIDIA infrastructure, especially when cost-per-inference is secondary to absolute throughput. MoE model serving is a stronghold. Tight integration with Triton, NVIDIA's DGX software stack, and production monitoring tools (Prometheus, Grafana) makes it a natural choice for large-scale serving clusters.
+
+**Weaknesses:** NVIDIA-only hardware support (no AMD, no CPU fallback). The compilation model has a steep learning curve; hand-optimizing graph profiles for a new model variant is not trivial. Build times can be substantial (10–30 minutes for complex models). The API is less Pythonic than vLLM, and standard benchmarking against open-source engines can be misleading because TensorRT-LLM exploits hardware-specific features unavailable on consumer GPUs.
+
+Source: [NVIDIA TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/), [TensorRT-LLM Speculative Decoding](https://developer.nvidia.com/blog/tensorrt-llm-speculative-decoding-boosts-inference-throughput-by-up-to-3-6x/)
+
+---
+
+## TGI (Text Generation Inference) {#tgi}
+
+### Design: Multi-backend middleware
+
+Hugging Face's TGI (2022, major revision December 2024 with v3.0) occupies a different niche: it is a *middleware* that abstracts over multiple backends, allowing operators to choose vLLM, TensorRT-LLM, or a Rust-based fallback at deployment time. TGI's value is **standardization and compatibility** — it exposes an OpenAI-compatible API and handles the abstraction of backend details.
+
+The December 2024 redesign added vLLM and TensorRT-LLM support as pluggable backends, moving away from TGI's custom Rust runtime (which still exists as a fallback for non-standard hardware or models). This architectural pivot reflects the reality that the field has converged on a small number of high-quality engines, and TGI's role is best viewed as a management layer rather than a new engine.
+
+### Features and innovations
+
+**Multi-backend support** (vLLM, TRT-LLM, Rust fallback) selectable at deployment time.
+
+**30K token capacity** on a single L4 (24GB) vs. ~10K for vLLM in comparable settings, through aggressive memory optimizations. This advantage has narrowed as vLLM's paging has matured, but TGI still excels on long-prompt scenarios.
+
+**Token healing** (merging fragmented tokens at boundaries) for tokenizer-agnostic prompts.
+
+**OpenAI-compatible API** (drop-in replacement for OpenAI's chat completions endpoint), essential for hosting providers.
+
+**Token streaming** via server-sent events (SSE), enabling real-time streaming to clients.
+
+**XGrammar structured output** support (shared with vLLM).
+
+**Performance benchmarks:**
+- **Long-prompt throughput (200K token context):** ~2 seconds to process 200K-token prompt (vLLM alone: 27.5 seconds), a 13× advantage on this specific scenario.
+- **TTFT:** 60–200 ms (higher variance due to backend switching overhead).
+- **Standard-length throughput:** Comparable to underlying backend (vLLM or TRT-LLM).
+
+### Current status and outlook
+
+**Strengths:** Hosting providers (Hugging Face Inference Endpoints, Replicate) standardize on TGI for consistency and OpenAI API compatibility. Multi-backend design insulates operators from single-engine risks (e.g., vLLM regression, TRT-LLM NVIDIA-only limitation).
+
+**Weaknesses:** TGI is now in **maintenance mode as of December 2025** — bug fixes and documentation only. New feature development has ceased; the project is effectively a stable interface over vLLM/TRT-LLM rather than an active engine. Users building new systems should prefer the underlying engines directly for latest optimizations.
+
+Source: [Hugging Face TGI v3.0 Release](https://www.marktechpost.com/2024/12/10/hugging-face-releases-text-generation-inference-tgi-v3-0-13x-faster-than-vllm-on-long-prompts/)
+
+---
+
+## DeepSpeed-FastGen {#deepspeed-fastgen}
+
+### Innovation: Dynamic SplitFuse and prefill scheduling
+
+Microsoft's DeepSpeed-FastGen (January 2024) tackles a different problem: heterogeneous workloads with highly variable prompt lengths. On such workloads, the decode phase (generating output tokens) and prefill phase (processing input prompt) have conflicting resource requirements. Decode is memory-bandwidth-limited (each token reads the entire KV cache); prefill is compute-heavy (processing long prompts with parallel attention over many tokens). Standard engines serialize: finish all prefill, then start decode. This serialization wastes compute at the prefill end and bandwidth at the decode end.
+
+**Dynamic SplitFuse** is a token composition strategy that decomposes long prompts into smaller chunks, schedules them as separate forward passes, and only triggers output-token generation on the final pass. The effect is a constant forward-pass size regardless of prompt length, enabling interleaving of prefill and decode work across multiple simultaneous requests. This is a scheduling innovation rather than an algorithmic one, but it translates to measurable latency improvements.
+
+### Recent research and extensions (2025)
+
+**POD-Attention** (Microsoft, March 2025) extends prefill-decode overlap with mathematically guaranteed overlapping, providing a formal analysis of achievable overlap rates.
+
+**SwiftKV** (ACL EMNLP 2025) optimizes the prefill phase specifically through KV cache prefetching, achieving further latency reductions.
+
+### Features and performance
+
+**Dynamic SplitFuse token batching** with constant forward size independent of prompt length.
+
+**Heterogeneous workload optimization** (mixed prompt and decode phases across multiple requests).
+
+**Integration with DeepSpeed-MII** and DeepSpeed-Inference for parameter-efficient inference.
+
+**Performance benchmarks:**
+- **Effective throughput vs. vLLM:** 2.3× higher on heterogeneous workloads (variable prompt length).
+- **Average latency:** 2× lower vs. vLLM on mixed workloads.
+- **Tail latency:** up to 3.7× lower (p99 latency) on bursty request patterns.
+- **Baseline homogeneous workloads:** Comparable to vLLM (within 10%).
+
+### Deployment context
+
+**Strengths:** Ideal for latency-sensitive applications with variable prompt lengths (e.g., real-time chat, interactive retrieval). Research deployments exploring prefill-decode dynamics benefit from DeepSpeed's publicly available implementation and research papers.
+
+**Weaknesses:** DeepSpeed-FastGen is still primarily a research system. Production integration is less mature than vLLM or TRT-LLM; operator guides and best practices are limited. It has not been adopted by major hosting providers yet. The community is smaller, with fewer public case studies.
+
+Source: [Microsoft DeepSpeed-FastGen](https://github.com/microsoft/DeepSpeed/blob/master/blogs/deepspeed-fastgen/README.md), [POD-Attention: Unlocking Full Prefill-Decode Overlap](https://www.microsoft.com/en-us/research/wp-content/uploads/2025/03/POD-Attention-ASPLOS25.pdf)
+
+---
+
+## llama.cpp {#llama-cpp}
+
+### Core design: CPU-first quantization and GGUF format
+
+llama.cpp (GGML/GGUF format, 2023–2026) owns the consumer and edge-inference space by targeting **CPU-first inference** with aggressive quantization. The GGUF file format (GGML Universal File, standardized August 2023) stores model weights and metadata in a single portable binary, with native support for 1.5-bit through 8-bit quantization. The toolkit is written in C with minimal dependencies, making it portable to virtually any consumer hardware.
+
+The engineering focus is on memory efficiency and ease of use — a single file containing a quantized model can be loaded on a laptop, and inference can run on CPU with GPU acceleration optional. This contrasts sharply with vLLM (Python, GPU-centric) and TRT-LLM (CUDA, compiler-heavy).
+
+### Features and ecosystem
+
+**Quantization support:** 1.5-bit to 8-bit integer quantization natively; 4-bit (Q4_K_M format) is the de facto consumer standard.
+
+**CPU-first inference** with optional GPU acceleration (Metal on Apple, cuBLAS on NVIDIA, ROCm on AMD, Vulkan on generic).
+
+**GGML tensor library** for efficient parsing, loading, and execution.
+
+**FlashAttention integration** (April 2024) reduces memory-bandwidth bottlenecks on CPU inference.
+
+**Multimodal support** (libmtmd revival, April 2025) enables vision-language tasks on CPU.
+
+**Broad ecosystem adoption:** Ollama, LM Studio, Jan.ai, and numerous other consumer tools standardize on GGUF, making llama.cpp the de facto reference implementation.
+
+**GitHub presence:** 109K+ stars, the most widely starred ML inference project by absolute count.
+
+### Performance benchmarks
+
+- **CPU inference (M1 Max, Llama 7B Q4):** 10–15 TPS (tokens per second) — not comparable to GPU throughput but fast enough for interactive use on consumer hardware.
+- **GPU acceleration available but rarely leveraged** in the consumer space, where latency (rather than throughput) is the primary metric.
+- **Memory efficiency:** 4-bit quantization reduces Llama 7B from ~14 GB (FP32) to ~3.5 GB, with 97.3% MMLU retention.
+- **TTFT on CPU:** 200–500 ms (due to sequential CPU execution), acceptable for batch inference but not interactive chat.
+
+### Deployment and limits
+
+**Strengths:** Ubiquitous in consumer applications (Ollama has 10M+ downloads). Format standardization means community-contributed quantized weights are easily shareable and immutable (GGUF is now the format of choice for publishing quantized models on Hugging Face). The simplicity of the codebase makes it a common educational tool for understanding inference fundamentals.
+
+**Weaknesses:** CPU inference is fundamentally 10–100× slower than GPU, so llama.cpp is not viable for interactive systems requiring sub-100ms TTFT. Quantization quality varies by implementation; some sub-4-bit quantizations show noticeable perplexity degradation (2–5% MMLU drop at 2-bit). GPU support is good but not optimized to the degree of vLLM or TRT-LLM, so enterprises typically prefer those engines for accelerated inference.
+
+Source: [llama.cpp GitHub](https://github.com/ggml-org/llama.cpp/), [GGUF Quantization Guide](https://kaitchup.substack.com/p/gguf-quantization-for-fast-and-memory)
+
+---
+
+## MLX {#mlx}
+
+### Innovation: Unified memory on Apple Silicon
+
+MLX (Apple, 2023–2026) is purpose-built for Apple Silicon (M1–M5, with dedicated Neural Accelerators on M5). The core innovation is **unified memory architecture** — on Apple Silicon, the CPU and GPU share physical memory, so tensors can move between devices without copying. This enables zero-copy operations that would require explicit transfers on traditional GPUs.
+
+For LLM inference, unified memory is a significant advantage during KV cache accumulation: as the cache grows, reads and writes naturally balance across the memory hierarchy without explicit DMA commands or PCIe transfers. Apple's promotion of MLX at WWDC 2025 and the March 2026 switch of Ollama's Apple backend from its own implementation to MLX signaled the framework's maturation.
+
+### Features and support
+
+**Apple Silicon optimization** (M1–M5, with M5 Neural Accelerators providing dedicated matrix-multiplication hardware).
+
+**Built-in quantization** (4-bit, 6-bit, 8-bit) with native format support.
+
+**Zero-copy unified-memory operations** eliminating data-movement overhead.
+
+**Python-first API**, similar in spirit to PyTorch but tailored to Apple's execution model.
+
+**Broader ecosystem adoption:** Ollama switched to MLX as the default on Apple (March 2026); Jan.ai and other consumer applications are integrating.
+
+### Performance benchmarks
+
+- **Memory efficiency:** 4-bit quantization achieves 97.3% MMLU with 3.8× memory reduction (Llama 7B: 14 GB FP32 → 3.5 GB Q4).
+- **Throughput (M1 Max, Llama 7B 4-bit):** 20–30 TPS (faster than CPU-only llama.cpp due to unified-memory advantage and GPU acceleration).
+- **M5 Neural Accelerators (2026):** Expected 1.5–2× speedup over M3/M4 on matrix operations, benefiting LLM throughput.
+- **TTFT:** 150–300 ms (better than CPU-only, worse than server-class GPUs, acceptable for on-device interactive use).
+
+### Deployment and outlook
+
+**Strengths:** Ideal for Apple ecosystem users (Mac, iPhone, iPad) wanting to run models locally with strong privacy guarantees. M5 with Neural Accelerators (shipping April 2026) positions MLX as a serious contender for on-device inference on high-end Apple hardware. The unified-memory advantage is genuinely unique and valuable.
+
+**Weaknesses:** Apple-only ecosystem limits adoption in data-center deployments. Performance is still 10–50× behind server GPUs, so MLX is not viable for high-throughput serving. Model coverage lags vLLM — newly released models take weeks or months to get MLX support through community contributions.
+
+Source: [Apple: Exploring LLMs with MLX and the Neural Accelerators in the M5 GPU](https://machinelearning.apple.com/research/exploring-llms-mlx-m5), [Ollama Switches to MLX on Apple Silicon](https://ollama.com/blog/mlx)
+
+---
+
+## LMDeploy {#lmdeploy}
+
+### Core innovations: TurboMind and quantization specialization
+
+LMDeploy (InternLM/CUHK, 2023–2026) pursues a different strategy: **maximize peak throughput with quantized models** through specialized kernels and persistent batching. The TurboMind engine within LMDeploy contains custom CUDA kernels for Llama, Qwen, DeepSeek, and other popular architectures, optimized for 4-bit quantization.
+
+The September 2025 release of **MXFP4 quantization** on NVIDIA H800 GPUs is a standout achievement: MXFP4 (mixed-exponent 4-bit floating point) achieves 1.5× higher throughput than vLLM on the same hardware, pushing Llama 70B to ~24K TPS. This is the highest-throughput point published for any open-source engine as of May 2026.
+
+### Key features
+
+**TurboMind engine** with custom CUDA kernels for popular architectures.
+
+**Persistent batching** enabling efficient continuous request streams.
+
+**Blocked KV cache** reducing fragmentation and improving memory utilization.
+
+**MXFP4 quantization** (September 2025) achieving 1.5× vLLM throughput on H800 (Llama 70B).
+
+**DeepSeek specialization (April 2025):**
+- FlashMLA (Multi-head Latent Attention) custom kernels
+- DeepGemm (specialized matrix multiplication)
+- DeepEP (Expert Parallelism for MoE)
+- MicroBatch (prefill batching within a decode step)
+
+**CUDA graph compilation** for PyTorchEngine (1.3× faster Llama 3 8B, reported September 2024).
+
+### Performance benchmarks
+
+- **Throughput (H100, Llama 70B):** 16K+ TPS, near-identical to SGLang on standard workloads.
+- **With MXFP4 (H800, Llama 70B):** 1.8× vLLM baseline throughput (~24K TPS vs. ~13K).
+- **TTFT:** Consistently lowest time-to-first-token across load patterns (Llama 3 8B benchmarks); 20–50 ms on single-request scenarios.
+- **Decoding speed:** Among the highest measured (tokens per second from first token onward).
+
+### Deployment perspective
+
+**Strengths:** Unmatched throughput on quantized 4-bit Llama models, the most common production configuration. Simplicity — `pip install lmdeploy` and inference is ready — appeals to practitioners prioritizing immediate deployment over architectural flexibility. DeepSeek specialization is a growing advantage as DeepSeek models see increased production use. Community documentation is clear and deployment guides are comprehensive.
+
+**Weaknesses:** NVIDIA-only support (H100, H800, A100 family). Custom kernel maintenance burden limits model coverage compared to vLLM; newly released model architectures (e.g., novel MoE variants) may see delayed support. Multi-LoRA support is less mature than vLLM or SGLang. The engine is less pluggable into larger serving systems (no Triton integration equivalent to TRT-LLM).
+
+Source: [LMDeploy Benchmarking Guide](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html), LMDeploy GitHub (https://github.com/InternLM/lmdeploy/)
+
+---
+
+## Feature matrix {#feature-matrix}
+
+The following table summarizes the key features across all eight engines:
+
+| Feature | vLLM | SGLang | TRT-LLM | TGI | DeepSpeed | llama.cpp | MLX | LMDeploy |
+|---------|------|--------|---------|-----|-----------|-----------|-----|----------|
+| **Paged Attention** | ✓ | ✓ | ✓ | ✓ | – | ✓ | – | ✓ |
+| **Continuous Batching** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Speculative Decoding** | ✓ (3.6×) | ✓ | ✓ (3.6×) | ✓ | ✓ (research) | – | – | – |
+| **Quantization (4–8b)** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ Native | ✓ Native | ✓ (MXFP4) |
+| **Structured Output** | ✓ (XGrammar) | ✓ (llguidance) | ✓ | ✓ (XGrammar) | – | – | – | – |
+| **Multi-LoRA** | ✓ (up to 50+) | ✓ Native (50+) | ✓ | – | – | – | – | – |
+| **RadixAttention (Cache Reuse)** | – | ✓ | – | – | – | – | – | – |
+| **Hardware Support** | Multi (NVIDIA, AMD, CPU) | Multi | NVIDIA-only | Multi | Multi | CPU/GPU | Apple Silicon | NVIDIA |
+| **Maturity (May 2026)** | Production | Production | Production | Maintenance | Research→Production | Consumer Standard | Growing | Production |
+| **API Style** | Custom Python | Custom DSL | Custom/Triton | OpenAI-compatible | Custom | C/Python | Python | Custom Python |
+
+**Key interpretations:**
+- **Speculative Decoding:** Baseline speedup with matching draft model; 3.6× achieved on H200 with optimal configuration.
+- **Quantization:** Native support means the engine has first-class quantization (llama.cpp, MLX); others support it but may require external compilation.
+- **Hardware Support:** vLLM and SGLang support NVIDIA/AMD/CPU via different backends; llama.cpp supports CPU/GPU via accelerated libraries; MLX is Apple-only by design; others are NVIDIA-focused.
+- **API Style:** OpenAI-compatible is a subset of the possible APIs; Custom Python/DSL reflects runtime-specific idioms.
+
+---
+
+## Benchmarks {#benchmarks}
+
+### Throughput (tokens per second)
+
+| Engine | Hardware | Model | Batch Setting | Throughput | Quantization | Source |
+|--------|----------|-------|------------------|------------|--------------|--------|
+| vLLM | H100 | Llama 70B | Dense batch | 10K–16K TPS | BF16 | [vLLM Blog](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html) |
+| vLLM + Speculative | H100 | Llama 70B | Dense batch | 36K–58K TPS | BF16 | [vLLM Speculative Docs](https://docs.vllm.ai/en/latest/features/speculative_decoding.html) |
+| SGLang | H100 | Llama 70B | Dense batch (no cache reuse) | 16K+ TPS | BF16 | [SGLang Paper (NeurIPS 2024)](https://arxiv.org/abs/2312.07104) |
+| SGLang + RadixAttention | H100 | Llama 70B | Prefix-overlap workload | 64K+ TPS | BF16 | [SGLang LMSYS Blog](https://www.lmsys.org/blog/2024-01-17-sglang/) |
+| TensorRT-LLM | H200 | Llama 3.3 70B | Dense batch | 15K TPS | BF16 | [NVIDIA TensorRT-LLM](https://developer.nvidia.com/blog/tensorrt-llm-speculative-decoding-boosts-inference-throughput-by-up-to-3-6x/) |
+| TensorRT-LLM + Speculative | H200 | Llama 3.3 70B | Dense batch | 45K TPS | BF16 | [NVIDIA TensorRT-LLM Blog](https://developer.nvidia.com/blog/tensorrt-llm-speculative-decoding-boosts-inference-throughput-by-up-to-3-6x/) |
+| TGI (vLLM backend) | H100 | Llama 8B | Dense batch | 13K–20K TPS | BF16 | [HuggingFace TGI v3.0](https://www.marktechpost.com/2024/12/10/hugging-face-releases-text-generation-inference-tgi-v3-0/) |
+| DeepSpeed-FastGen | H100 | Llama 70B | Heterogeneous load | 23K TPS (effective) | BF16 | [DeepSpeed-FastGen README](https://github.com/microsoft/DeepSpeed/blob/master/blogs/deepspeed-fastgen/README.md) |
+| llama.cpp | M1 Max (CPU) | Llama 7B | Single request | 10–15 TPS | Q4_K_M (4-bit) | [llama.cpp Benchmarks](https://github.com/ggml-org/llama.cpp/) |
+| MLX | M1 Max (GPU) | Llama 7B | Single request | 20–30 TPS | 4-bit | [Apple MLX Benchmarks](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) |
+| LMDeploy | H100 | Llama 70B | Dense batch | 16K+ TPS | BF16 | [LMDeploy Benchmark](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html) |
+| LMDeploy + MXFP4 | H800 | Llama 70B | Dense batch | 24K TPS | MXFP4 (4-bit) | [LMDeploy Benchmarks](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html) |
+
+### Latency (TTFT and token rate)
+
+| Engine | Hardware | Model | TTFT (ms) | Decoding Speed (TPS) | Source |
+|--------|----------|-------|-----------|---------------------|--------|
+| vLLM | H100 | Llama 70B | 50–150 | 5K–8K | [vLLM](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html) |
+| SGLang | H100 | Llama 70B | 40–120 | 6K–10K | [SGLang LMSYS](https://www.lmsys.org/blog/2024-01-17-sglang/) |
+| TensorRT-LLM | H200 | Llama 3.3 70B | 30–100 | 8K–12K | [NVIDIA TRT-LLM](https://developer.nvidia.com/blog/tensorrt-llm-speculative-decoding-boosts-inference-throughput-by-up-to-3-6x/) |
+| TGI | H100 | Llama 8B | 60–200 | 4K–6K | [HuggingFace TGI](https://www.marktechpost.com/2024/12/10/hugging-face-releases-text-generation-inference-tgi-v3-0/) |
+| DeepSpeed-FastGen | H100 | Llama 70B | 40–100 (avg: 2× lower) | 7K–11K | [DeepSpeed-FastGen](https://github.com/microsoft/DeepSpeed/blob/master/blogs/deepspeed-fastgen/README.md) |
+| LMDeploy | H100 | Llama 3 8B | 20–50 | 6K–9K (best-in-class) | [LMDeploy Benchmarks](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html) |
+| llama.cpp | M1 Max (CPU) | Llama 7B | 200–500 | 10–15 | [llama.cpp](https://github.com/ggml-org/llama.cpp/) |
+| MLX | M1 Max (GPU) | Llama 7B | 150–300 | 20–30 | [Apple MLX](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) |
+
+### Memory (Llama 70B, full precision and 4-bit quantization)
+
+| Engine | Hardware | BF16 | 4-bit | Source |
+|--------|----------|------|-------|--------|
+| vLLM + PagedAttention | H100 | 140 GB | 18 GB (97.3% MMLU) | [vLLM Docs](https://docs.vllm.ai/en/latest/design/paged_attention/) |
+| SGLang + RadixAttention | H100 | 140 GB | 18 GB (97.3% MMLU) | [SGLang Paper](https://arxiv.org/abs/2312.07104) |
+| TensorRT-LLM | H100 | 140 GB | 18 GB (97.3% MMLU) | [TRT-LLM Docs](https://nvidia.github.io/TensorRT-LLM/) |
+| TGI | H100 | 140 GB | 18 GB | [TGI v3.0](https://www.marktechpost.com/2024/12/10/hugging-face-releases-text-generation-inference-tgi-v3-0/) |
+| LMDeploy | H100 | 140 GB | 18 GB | [LMDeploy](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html) |
+| llama.cpp Q4 | M1 Max | – | 3.5–4.5 GB | [llama.cpp](https://github.com/ggml-org/llama.cpp/) |
+| MLX 4-bit | M1 Max | – | 3.8–4.2 GB (97.3% MMLU) | [Apple MLX](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) |
+
+---
+
+## When to use each engine {#when-to-use-each}
+
+### vLLM
+
+**Best for:** Research, multi-model serving, NVIDIA-heavy infrastructure without strict OpenAI API requirements, prototypes that will mature into production.
+
+**Avoid if:** Your workload is dominated by cache-reuse patterns (use SGLang), you need the lowest absolute latency on long prompts (use TGI or DeepSpeed-FastGen), or you require peak throughput on quantized Llama models (use LMDeploy).
+
+### SGLang
+
+**Best for:** Structured generation (JSON APIs, function calling), in-context learning with prompt reuse, multi-LoRA serving at scale (50+ adapters), research exploring prompt programming.
+
+**Avoid if:** You value simplicity over cache-reuse benefits, or your workload has no prefix overlap.
+
+### TensorRT-LLM
+
+**Best for:** Enterprise NVIDIA deployments, MoE models (Mixtral, DeepSeek MoE), integration with Triton serving stack, workloads where NVIDIA ecosystem integration (DGX, Dynamo) is a requirement.
+
+**Avoid if:** You lack NVIDIA expertise or if you need rapid deployment of new model architectures (TRT-LLM requires compiling per architecture).
+
+### TGI
+
+**Best for:** Hosting providers requiring OpenAI API compatibility, multi-backend flexibility without re-architecting, long-prompt scenarios (200K+ tokens).
+
+**Avoid if:** You need cutting-edge optimizations (TGI is in maintenance mode; underlying engines will be faster and more up-to-date).
+
+### DeepSpeed-FastGen
+
+**Best for:** Research on prefill-decode scheduling, heterogeneous workloads with variable prompt lengths, latency-sensitive applications where p99 matters more than p50.
+
+**Avoid if:** You need production-hardened deployment tooling (monitoring, logging, scaling orchestration are not yet mature).
+
+### llama.cpp
+
+**Best for:** Consumer/offline inference, edge deployment on commodity hardware, distributing quantized models (GGUF is the de facto standard), educational exploration of inference mechanics.
+
+**Avoid if:** You need interactive-level latency (TTFT &lt;100 ms) or throughput above a few tokens per second.
+
+### MLX
+
+**Best for:** Apple ecosystem (Mac, iPhone, iPad), privacy-first on-device inference, users valuing zero-copy unified-memory operations.
+
+**Avoid if:** You need server-grade throughput or multi-GPU distributed serving (not supported on Apple).
+
+### LMDeploy
+
+**Best for:** Peak throughput on quantized Llama models, DeepSeek inference (strongest specialization), teams valuing `pip install` simplicity and lowest TTFT, cost-optimized serving on H100/H800.
+
+**Avoid if:** You need multi-LoRA serving or rapid support for novel model architectures.
+
+---
+
+## Cross-cutting features and future directions {#summary}
+
+### Speculative decoding (2–3× speedup, universal as of May 2026)
+
+Speculative decoding is no longer experimental. Every major engine (vLLM, SGLang, TRT-LLM, TGI, DeepSpeed-FastGen) ships with built-in support. The typical speedup ranges from 2× to 3.6× depending on draft-model quality and hardware. A draft model with acceptance rate α ≥ 0.6 and speculation depth γ ≥ 5 is the baseline expectation. Production deployments are beginning to tune draft models per-workload (e.g., smaller or larger based on latency SLA vs. throughput goals), but the standard practice remains a single pre-trained smaller model (e.g., Sheared-LLaMA-1.3B for Llama 70B).
+
+Source: [Spec-Bench: A Comprehensive Benchmark for Speculative Decoding](https://github.com/hemingkx/Spec-Bench)
+
+### Structured output (universal, &lt;50 μs/token overhead)
+
+Every major engine and every commercial API (OpenAI, Anthropic, Claude) now guarantees valid JSON or schema compliance via constrained decoding. Two main approaches dominate:
+
+- **XGrammar** (vLLM, SGLang, TRT-LLM default): &lt;40 μs/token overhead, efficient schema caching.
+- **llguidance** (Microsoft Rust-based Earley parser): ~50 μs/token, foundational work credited by OpenAI.
+
+The overhead is negligible next to per-token inference latency (10–50 ms on server GPUs), so structured output is now a free feature in the engineering sense. Practical limitations remain: some frameworks (notably Outlines) struggle with extremely complex schemas (40-second to 10+ minute compilation times), so schema optimization is still a consideration for workloads with thousands of distinct schemas.
+
+Source: [Generating Structured Outputs from Language Models: Benchmark and Studies](https://arxiv.org/html/2501.10868v1)
+
+### Quantization maturity (4-bit standard, 2–3-bit research)
+
+All engines support 4–8 bit quantization natively as of 2026. The consumer and production standard is 4-bit (Q4_K_M in GGUF, or equivalent BF16/INT4 in other frameworks), achieving 97.3–99%+ MMLU retention on Llama family with 3.8× memory reduction. MXFP4 (LMDeploy, September 2025) pushes the envelope, achieving 1.5× baseline throughput on H800 while maintaining fidelity.
+
+Sub-4-bit quantization (2-bit, 3-bit) is active research; trade-off curves are well-established, and some models (e.g., Phi-3, a 3.8B parameter model) ship official 2-bit quantizations. Adoption remains niche due to engineering complexity and reduced margin over 4-bit.
+
+### Hardware diversity (2026 status)
+
+NVIDIA H100/H200 remain the target; AMD MI300X support is improving in vLLM and SGLang but lags behind in custom-kernel engines (TRT-LLM, LMDeploy). Intel Gaudi is supported in open-source frameworks but sees little adoption outside Intel labs. CPU inference (llama.cpp) is mature and useful for edge; GPU acceleration on consumer hardware (Metal, cuBLAS) works but is not tuned to production standards.
+
+The implicit expectation in the field is still NVIDIA-centric. New engines and optimizations are benchmarked first on H100/H200, and non-NVIDIA hardware support is bolted on second. Operators wanting multi-vendor deployments are advised to either stick with vLLM/SGLang (best multi-vendor support) or plan for separate inference stacks per vendor.
+
+---
+
+## Summary {#summary}
+
+Eight inference engines have crystallized as the production standard by May 2026. vLLM and SGLang dominate open-source research and production; TRT-LLM and TGI serve enterprise and hosting providers; DeepSpeed-FastGen innovates on latency-sensitive workloads; llama.cpp, MLX, and LMDeploy own the edge, Apple, and peak-throughput segments respectively. Speculative decoding (2–3× speedup) and structured output guarantees are now baseline; quantization is mature at 4-bit with 97.3% MMLU retention.
+
+Selecting an engine hinges on the deployment context:
+- **Research and multi-model serving:** vLLM (safest default).
+- **Structured generation and cache reuse:** SGLang.
+- **Enterprise NVIDIA with MoE:** TensorRT-LLM.
+- **OpenAI API compatibility:** TGI (maintenance mode; plan for underlying engines).
+- **Latency on variable-length prompts:** DeepSpeed-FastGen (research stage).
+- **Edge and consumer:** llama.cpp (CPU-first), MLX (Apple).
+- **Peak quantized throughput:** LMDeploy.
+
+The convergence toward paged attention, continuous batching, and speculative decoding has narrowed the performance gap between the best engines. Differentiation now comes through domain specialization (structured generation, cache reuse, long-prompt optimization) and ecosystem integration (hosting platforms, monitoring tools, model quantization standards) rather than raw throughput on identical hardware. The 2026 frontier expects inference engines to ship with speculative decoding, structured output, and multi-LoRA support as table stakes; cost, latency, and hardware compatibility drive the choice.
+
+---
+
+## References
+
+1. [Efficient Memory Management for Large Language Model Serving with PagedAttention — OSDI 2023](https://dl.acm.org/doi/10.1145/3600006.3613165) — vLLM foundational paper
+2. [vLLM Blog: Anatomy of vLLM](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html) — 2025 design overview
+3. [SGLang: Efficient Execution of Structured Language Model Programs — NeurIPS 2024](https://arxiv.org/abs/2312.07104)
+4. [Fast and Expressive LLM Inference with RadixAttention and SGLang](https://www.lmsys.org/blog/2024-01-17-sglang/) — LMSYS blog
+5. [NVIDIA TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/)
+6. [NVIDIA TensorRT-LLM Speculative Decoding: 3.6× Throughput](https://developer.nvidia.com/blog/tensorrt-llm-speculative-decoding-boosts-inference-throughput-by-up-to-3-6x/)
+7. [Hugging Face TGI v3.0: 13× Faster on Long Prompts](https://www.marktechpost.com/2024/12/10/hugging-face-releases-text-generation-inference-tgi-v3-0/)
+8. [Microsoft DeepSpeed-FastGen with Dynamic SplitFuse](https://github.com/microsoft/DeepSpeed/blob/master/blogs/deepspeed-fastgen/README.md)
+9. [POD-Attention: Unlocking Full Prefill-Decode Overlap — ASPLOS 2025](https://www.microsoft.com/en-us/research/wp-content/uploads/2025/03/POD-Attention-ASPLOS25.pdf)
+10. [llama.cpp GitHub Repository](https://github.com/ggml-org/llama.cpp/)
+11. [GGUF Quantization Guide](https://kaitchup.substack.com/p/gguf-quantization-for-fast-and-memory)
+12. [Apple: Exploring LLMs with MLX and the Neural Accelerators in the M5 GPU](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)
+13. [Ollama Switches to MLX on Apple Silicon (March 2026)](https://ollama.com/blog/mlx)
+14. [LMDeploy Benchmarking Guide](https://lmdeploy.readthedocs.io/en/latest/benchmark/benchmark.html)
+15. [Speculative Decoding: Achieving 2–3× LLM Inference Speedup](https://introl.com/blog/speculative-decoding-llm-inference-speedup-guide-2025)
+16. [Spec-Bench: A Comprehensive Benchmark for Speculative Decoding](https://github.com/hemingkx/Spec-Bench)
+17. [Generating Structured Outputs from Language Models: Benchmark and Studies](https://arxiv.org/html/2501.10868v1)
+18. [XGrammar: Structured Output in vLLM, SGLang, TensorRT-LLM](https://docs.vllm.ai/en/latest/features/structured_generation/)
+19. [Improving Multi-LoRA Serving Performance](https://arxiv.org/html/2505.03756v1)
+20. [Bench360: Benchmarking Local LLM Inference](https://arxiv.org/pdf/2511.16682)
+21. [Understanding Paged Attention and KV Cache](https://medium.com/my-musings-with-llms/understanding-kv-cache-and-paged-attention-in-llms-a-deep-dive-into-efficient-inference-62fa372432ce)
+22. [vLLM Documentation: Paged Attention Design](https://docs.vllm.ai/en/latest/design/paged_attention/)
+23. [FlexAttention: Flexible Attention with Paging](https://arxiv.org/html/2509.04377v1)
+24. [SwiftKV: Prefill-Optimized Inference (ACL EMNLP 2025)](https://aclanthology.org/2025.emnlp-main.1306.pdf)
+25. [Improving Large-Scale Serving with LMDeploy and DeepSeek](https://github.com/InternLM/lmdeploy/)

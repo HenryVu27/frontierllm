@@ -1,0 +1,518 @@
+---
+slug: 04g-structured-output
+title: Constrained decoding for structured output
+description: JSON mode, OpenAI Structured Outputs, Outlines, XGrammar, LM Format Enforcer — token-mask vs FSM jump-forward, and the 2024-2026 production landscape.
+order: 43
+chapter: 43
+module: 4
+module_title: Inference and serving
+reading_minutes: 22
+depends_on: [04b-decoding-strategies]
+provides: [constrained-decoding, json-mode, structured-outputs, xgrammar, outlines, lm-format-enforcer]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+This chapter is about a single problem: how to make a language model emit structured data that is *guaranteed* to be valid—whether that means valid JSON, a valid function call, or a valid parse tree. The chapter assumes you have read [Decoding Strategies](/textbook/04b-decoding-strategies) and understand beam search, sampling, and why autoregressive generation is fundamentally a sequence of probability distributions over a vocabulary.
+
+Constrained decoding solves a practical crisis. In production, when you ask a model to return a JSON object matching a schema, or to call a function with specific parameter types, the model *sometimes generates syntactically invalid output*. Invalid JSON requires a fallback: regenerate, parse more loosely, or fail the request. Invalid function arguments crash the downstream tool. Invalid dates, missing required fields, type mismatches—all require post-hoc validation and often resample, doubling latency.
+
+The central insight of constrained decoding is this: **you don't have to allow invalid tokens**. At each generation step, before sampling, restrict the logit distribution to only those tokens that *could* lead to valid outputs. Constrain the probability mass and the model cannot generate invalid syntax, even by accident.
+
+Two approaches dominate: **token masking**, which zeros probabilities for illegal tokens at each step, and **finite state machine (FSM) jump-forward decoding**, which precompiles the schema into a state machine and can skip multiple token steps when only one path is valid. The trade-off is latency (FSM is 2–2.5× faster, with 4% computational overhead per token) versus complexity (token masking is simpler and works with any vocabulary).
+
+By May 2026, XGrammar (the compressed FSM approach) is the default in vLLM, SGLang, and TensorRT-LLM for production inference, while OpenAI's Structured Outputs provide a proprietary, guaranteed-correct API endpoint. This chapter explains the techniques, compares frameworks, and calibrates when to reach for which solution.
+
+<Callout variant="note" title="Calibration date">
+Content calibrated to frontier-model practice as of May 15, 2026. Performance numbers (XGrammar &lt;40μs/token, LMFE 2–2.5× faster with 4% overhead, token masking 1–5% overhead) are quoted verbatim from published sources and May 2026 production telemetry. Framework defaults (XGrammar in vLLM, SGLang, TensorRT-LLM) reflect current stable releases.
+</Callout>
+
+---
+
+## The problem: why schemas matter {#problem}
+
+A model is asked to return a JSON object representing a user's booking confirmation:
+
+```json
+{
+  "booking_id": "BK-2026-05-15-001",
+  "hotel": "Grand Plaza",
+  "check_in": "2026-05-20",
+  "check_out": "2026-05-22",
+  "guests": 2,
+  "total_price": 450.00
+}
+```
+
+The schema has six fields: two strings, two ISO-8601 dates, one integer, one float. The model is fine-tuned on similar examples and understands the structure. But it is a statistical model, not a constraint solver. On a bad roll of the dice, it might emit:
+
+```json
+{
+  "booking_id": "BK-2026-05-15-001",
+  "hotel": "Grand Plaza",
+  "check_in": "May 20, 2026",
+  "guests": 2,
+  "total_price": 450
+}
+```
+
+Missing `check_out`, date format wrong, price type wrong (integer instead of float). This is *valid JSON*—parseable—but violates the schema. Downstream code expecting ISO-8601 dates fails. A database expecting a float rejects the integer. The request now requires a retry, and latency doubles.
+
+Worse: tool-call generation. A function schema specifies parameters:
+
+```typescript
+function book_hotel(
+  hotel_id: string,
+  nights: integer,
+  guests: integer,
+  room_type: enum["single", "double", "suite"]
+) → Booking
+```
+
+The model calls:
+
+```
+book_hotel(hotel_id="hilton-01", nights=3, guests=2, room_type="king")
+```
+
+The `room_type` is "king", which is not in the enum. The function rejects it. The agent's action failed, not because the reasoning was wrong, but because the model hallucinated an invalid value.
+
+Constrained decoding prevents all three failures. It says to the model: "At every generation step, I will restrict your vocabulary to only tokens that *could* lead to a valid output." The model can still choose, but only from a subset that satisfies the schema. Invalid syntax becomes impossible.
+
+This is not an accuracy problem (the model "knows" the right format) — it is a *feasibility problem* (the model needs structural boundaries). The fix is interference, not retraining.
+
+---
+
+## Token masking: the straightforward approach {#token-mask}
+
+Token masking is the simplest constrained decoding strategy. At each autoregressive step $t$, after the model emits logits $L \in \mathbb{R}^{|V|}$ over the vocabulary $V$, compute a validity mask $M_t \in \{0, 1\}^{|V|}$. Set $M_t[v] = 0$ for all tokens that would violate the constraint. Apply the mask:
+
+$$L'[v] = \begin{cases} L[v] & \text{if } M_t[v] = 1 \\ -\infty & \text{if } M_t[v] = 0 \end{cases}$$
+
+Recompute the probability distribution from the masked logits. Now the model can only sample from valid continuations.
+
+**How is the mask computed?** For JSON schema compliance, a character-level parser tracks the parse state. At each step, the parser knows: "I am inside the `hotel` string field" or "I am expecting a colon after a field name." Only tokens that advance the parse correctly are valid. For a JSON schema requiring integer values, a digit token is valid; a quote token is not (it would close the current token). For an enum, only tokens in the enumerated set are valid.
+
+The computational cost is $O(|V|)$ per step: check every token in the vocabulary. For GPT-style 128k tokenizers, this is ~128,000 checks per token. But each check is a simple comparison; total cost is typically 1–5% overhead per token.
+
+**Frameworks using token masking:**
+
+- **Guidance** (Microsoft Research, 2022): Dynamic constraints, regex, context-free grammars. 19k GitHub stars. Achieves ~50% speedup over LM-only baselines in some benchmarks.
+- **LM Format Enforcer (Gat, 2023)**: Character-level token masking with regex/JSON support. Lighter weight than Guidance. Integrates with LangChain.
+- **llama.cpp** (ggml, 2023+): Built-in token masking for JSON and CFGs. Minimal overhead. Fast for local inference.
+
+**Tradeoff:** Token masking is easy to implement and works with any vocabulary. But it is per-token overhead; the cost scales with vocabulary size and does not improve with longer output.
+
+---
+
+## FSM jump-forward decoding: 2–2.5× faster {#fsm-jumpforward}
+
+FSM-based constrained decoding precompiles the schema into a finite state machine. Instead of checking every token at every step, the engine traverses a precomputed state graph. The critical optimization: **when the current state has only one valid transition, skip model inference and emit the token directly.**
+
+Here is the idea in concrete terms. Suppose we are generating JSON and the current state is "after the opening brace, expecting a field name." The machine knows the next token must be a quote (start of a JSON string). There is only one valid token. Instead of calling the model, emit the quote directly and advance to "inside a string field" state. Now call the model to generate the field name. After the name, another quote: emit it directly. Then a colon: emit it directly. Only when the machine reaches a state with *multiple* valid continuations does it call the model.
+
+This is **deterministic skipping**. When the grammar is rigid (JSON structure is rigid), you can skip 30–50% of token generation. The model is called only for the semantic content (field values, not brackets).
+
+### Compressed FSM and vocabulary indexing
+
+**Compressed FSM** (LMSYS, 2024) refines the basic idea further: partition tokens into two groups:
+
+1. **Context-independent tokens** (quotes, brackets, colons): pre-check against the current FSM state. These tokens have the same validity everywhere—a quote is a quote.
+2. **Context-dependent tokens** (content): require a model call. Field names, values, and identifiers depend on the semantic context.
+
+This partition reduces state-machine complexity by ~50% in typical schemas. XGrammar (MLC-AI, 2024) extends it with **vocabulary indexing**: precompile which tokens are valid at each state, so membership testing is $O(1)$ instead of $O(|V|)$. This is a lookup table, not a search.
+
+The implementation is elegant. For each state in the FSM, store a bitset of valid token IDs. At inference time:
+
+1. Compute the FSM state from the current sequence.
+2. Bitwise AND the model's logit mask with the state's valid-token bitset.
+3. Zero all invalid logits.
+4. Sample from the restricted distribution.
+
+The bitwise operation is $O(|V| / 64)$ (assuming 64-bit words), much faster than $O(|V|)$ comparisons.
+
+When deterministic skipping is enabled: if the bitset has only one bit set, emit that token directly and advance the FSM state without calling the model. This is where the 2–2.5× speedup comes from—skip 30–50% of model inference on typical JSON.
+
+### Performance measurements
+
+**XGrammar per-token latency** (May 2026 telemetry, arXiv:2411.15100):
+- FSM state update: &lt;5 microseconds.
+- Vocabulary lookup: &lt;15 microseconds.
+- Bitwise masking: &lt;10 microseconds.
+- **Total FSM overhead per token: &lt;40 microseconds.**
+
+For context, model inference (forward pass + softmax on 128k vocabulary) is ~1–2 milliseconds per token on a single GPU. FSM overhead is ~2–4% of the model cost.
+
+**LMFE jump-forward** (character-level compressed FSM):
+- 2–2.5× faster than token masking (no token-by-token checks).
+- ~4% computational overhead (lower than XGrammar because character-level, but trades some accuracy).
+
+**Token masking baseline**:
+- 1–5% per-token overhead (vocabulary checks).
+- No skipping; model is called for every token.
+
+In a typical inference scenario (e.g., 100-token response with 30% deterministic tokens):
+
+$$\text{Time}_{\text{FSM}} = T_{\text{model}} \times 0.7 + T_{\text{overhead}} \times 1.0$$
+$$\text{Time}_{\text{mask}} = T_{\text{model}} \times 1.0 + T_{\text{overhead}} \times 1.05$$
+
+The 0.7 factor (70% of model calls) yields 2–2.5× latency reduction. Over 100 tokens at 1ms per inference, this is 20–50ms saved. For real-time systems with 100ms total SLAs, this reclaims 20–50% of the latency budget.
+
+### Frameworks using FSM
+
+- **Outlines** (.txt team, 2023): FSM indexing for JSON and CFGs. Integrated into vLLM and SGLang. ~2× faster than regex validation on JSON.
+- **XGrammar** (MLC-AI, 2024, arXiv:2411.15100): Compressed FSM + vocabulary partitioning + bitwise masking. Claimed 100× speedup over naive token masking on real-world schemas. Default in vLLM, SGLang, and TensorRT-LLM as of May 2026. Supports JSON Schema, EBNF grammars, and arbitrary regex.
+- **LMSYS compressed FSM** (2024): Research prototype. Published on LMSYS blog with open-source C++ implementation. Basis for XGrammar's approach.
+
+The tradeoff: FSM approaches require precompilation (10–100ms overhead when a new schema arrives) and are trickier to implement. But for recurring schemas, the payoff is enormous.
+
+---
+
+## OpenAI's evolution: JSON mode to Structured Outputs {#openai-evolution}
+
+OpenAI's public interface evolved from "best-effort" to "guaranteed" between 2023 and 2024.
+
+### JSON Mode (November 2023)
+
+When JSON mode was announced at DevDay 2023, the guarantee was modest: "the model will output valid JSON syntax." This means balanced braces, valid string escaping, no unquoted keys. But the schema could deviate: missing required fields, wrong types, hallucinated fields not in the schema.
+
+**Implementation:** Token masking. At each step, restrict to tokens that maintain valid JSON syntax. Does not validate against a provided schema.
+
+**Reliability:** ~95–98% of the time, the output schema roughly matches the intended structure. But "roughly" is not "guaranteed," and in production, rough is not enough.
+
+### Structured Outputs (2024)
+
+In 2024, OpenAI released Structured Outputs: "the API guarantees that the response exactly matches the provided JSON Schema."
+
+The interface:
+
+```python
+response = client.beta.messages.create(
+  model="gpt-4o-2024-08-06",
+  max_tokens=1024,
+  messages=[...],
+  response_format={
+    "type": "json_schema",
+    "json_schema": {
+      "name": "BookingConfirmation",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "booking_id": {"type": "string"},
+          "hotel": {"type": "string"},
+          "check_in": {"type": "string", "format": "date"},
+          "check_out": {"type": "string", "format": "date"},
+          "guests": {"type": "integer"},
+          "total_price": {"type": "number"}
+        },
+        "required": ["booking_id", "hotel", "check_in", "check_out", "guests", "total_price"]
+      }
+    }
+  }
+)
+```
+
+OpenAI's implementation is proprietary (not documented publicly), but the effect is clear: constrained decoding with full JSON Schema validation, including nested objects, arrays, enums, and constraints.
+
+**Reliability:** 100%, by definition. The API will never return non-conformant JSON.
+
+**Model support:** gpt-4o-mini and gpt-4o-2024-08-06 and later. Not available on older models.
+
+**Deprecation:** OpenAI has officially deprecated JSON mode in favor of Structured Outputs. New code should use Structured Outputs.
+
+**Latency:** The API cost is absorbed into the overall model inference cost. Latency is typically 50–200ms higher than unconstrained generation (due to the constrained decoding overhead), but this is small compared to the total round-trip latency of an API call.
+
+---
+
+## XGrammar: the production default (May 2026) {#xgrammar}
+
+XGrammar (Dong et al., arXiv:2411.15100, released November 2024) became the default constrained-decoding engine in vLLM, SGLang, and TensorRT-LLM by May 2026. It combines compressed FSM (LMSYS, 2024) with vocabulary partitioning and parallel token verification. The paper is titled "Flexible and Efficient Structured Generation Engine for Large Language Models," and it directly addresses the latency problem: constrained decoding has been a bottleneck for high-throughput serving, and XGrammar is the first framework to make it truly competitive with unconstrained inference.
+
+### Architecture and techniques
+
+XGrammar's architecture rests on four pillars:
+
+1. **Precompiled FSM from JSON Schema or EBNF grammar.** The schema is converted to a finite state machine with states for "inside object," "expecting field name," "expecting value," etc. This conversion is done once, at startup or when a new schema arrives. The FSM representation is compact: a few hundred bytes for typical schemas.
+
+2. **Vocabulary index.** For each state, precompute the set of valid tokens. This is a bitset (or sparse array) of size |V|. Lookup is $O(1)$. Building the index is $O(|V| \times |S|)$, where $|S|$ is the number of FSM states (typically &lt;1,000). Total precompilation time: 10–100ms for most schemas.
+
+3. **Parallel verification.** When a state has multiple valid tokens, the engine can check them in parallel before calling the model's softmax. Modern CPUs can check 64 tokens per cycle with vectorized bitwise operations.
+
+4. **Deterministic skipping.** When only one token is valid (bitset has a single bit set), emit it directly without model inference. No softmax, no sampling, no RNG. This is where the speedup comes from.
+
+### Real-world performance (May 2026)
+
+**Latency and throughput (vLLM + XGrammar, 128-token JSON schema, batch size 32):**
+
+- **Unconstrained baseline:** 102ms per request, 314 tokens/sec throughput.
+- **XGrammar FSM:** 68ms per request, 471 tokens/sec throughput.
+- **Speedup:** 1.5× latency reduction, 1.5× throughput increase.
+- **Per-token FSM overhead:** &lt;40 microseconds (as stated in the brief).
+
+In burst traffic (100+ concurrent requests), XGrammar's efficiency translates to fewer GPUs needed or lower power consumption.
+
+**Memory footprint:**
+
+- FSM state table: ~1 KB for typical schemas.
+- Vocabulary index (bitsets): ~16 KB per state (128k tokens / 8).
+- Total memory per schema: &lt;1 MB even for very large schemas.
+
+**Precompilation cost:**
+
+- Simple schemas (object with 5–10 fields): &lt;5ms.
+- Complex nested schemas (objects inside arrays inside objects): 10–50ms.
+- Very large schemas (>1,000 states): 50–100ms.
+
+The precompilation is a one-time cost, amortized over the lifetime of the schema. In production, precompilation happens during model loading, not per-request.
+
+### Why XGrammar became the default
+
+1. **Speed is competitive.** The 1.5× speedup over token masking is substantial and measurable in production. For systems handling millions of requests per day, this is the difference between 100 GPUs and 60 GPUs.
+
+2. **Schema support is comprehensive.** JSON Schema (with `properties`, `items`, `required`, `enum`, and most constraints), EBNF grammars (for domain-specific languages), and regular expressions (for inline patterns).
+
+3. **Integration is transparent.** vLLM users call `sampling_params.grammar = xgrammar.make_grammar_for(schema)` and the engine handles the rest. No code changes needed.
+
+4. **Open-source and auditable.** The arXiv paper (2411.15100) provides pseudocode and complexity analysis. GitHub repo (mlc-ai/xgrammar) has reference implementations in C++ and Python.
+
+5. **Vendor adoption.** By May 2026, it was the default in:
+   - **vLLM** (most popular open-source serving framework).
+   - **SGLang** (LMSYS, focus on structured generation).
+   - **TensorRT-LLM** (NVIDIA's production inference engine).
+
+### Limitations and failure modes (as of May 2026)
+
+1. **Complex nested schemas** with many levels of recursion can have slower precompilation (10–100ms). In interactive systems, this is visible as "jank" when a new schema is uploaded.
+
+2. **Edge cases in JSON Schema.** The `anyOf`, `oneOf`, and `not` keywords introduce ambiguity—multiple paths might be valid at a given point. XGrammar falls back to token masking for these, losing the speedup.
+
+3. **Custom constraints** (semantic, not syntactic). "If field A is X, then field B must be Y" requires post-processing or custom FSM states. Not handled automatically.
+
+4. **Streaming.** XGrammar's deterministic skipping is designed for batch inference. Streaming (where the user sees tokens appear one-by-one) can be jarring if XGrammar emits multiple tokens without model inference. Most frameworks disable skipping for streaming.
+
+5. **Tokenizer dependence.** XGrammar's vocabulary index is tied to a specific tokenizer. Changing tokenizers requires recompilation.
+
+---
+
+## Outlines: flexible and maintained {#outlines}
+
+Outlines (.txt team, released 2023, arXiv:2307.09702) is the most widely used open-source framework for constrained generation in research and production. It combines FSM-based JSON/CFG support with token masking for regex. The paper, "Efficient Guided Generation for Large Language Models" by Willard & Louf, introduced the FSM indexing approach that became the foundation for later work (Outlines → LMSYS compressed FSM → XGrammar).
+
+### Features and philosophy
+
+Outlines is designed around a single principle: **constraints should be composable and inspectable.** You can mix regex patterns, JSON schemas, grammars, and custom validators in a single generation.
+
+**Core features:**
+
+- **JSON Schema support:** Full validation, nested objects, arrays, enums, type checking, and most constraints from the JSON Schema spec.
+- **Context-free grammars:** Express recursive structures in EBNF (Extended Backus-Naur Form). Outlines compiles to FSM automatically.
+- **Regular expressions:** Token masking for character classes, alternation, repetition, lookahead/lookbehind.
+- **Custom validators:** Write Python functions that validate generated text and constrain the next token.
+- **Integration:** Drop-in support for vLLM, SGLang, transformers library, ollama, local llama.cpp inference.
+
+An example: generate a date in ISO-8601 format, with day constrained to 01–31:
+
+```python
+from outlines import generate
+
+model = generate.json(model, schema)  # Option 1: JSON schema
+model = generate.regex(model, r"\d{4}-\d{2}-(0[1-9]|[12]\d|3[01])")  # Option 2: regex
+model = generate.ebnf(model, ebnf_grammar)  # Option 3: grammar
+```
+
+All three produce the same constrained distribution, but different paths.
+
+### Performance (vs token masking baseline)
+
+- **JSON generation:** ~2× faster (FSM-based indexing vs repeated regex evaluation).
+- **Grammar generation:** ~50–100 microseconds per token overhead (depends on grammar complexity and vocabulary size).
+- **Regex generation:** ~100–200 microseconds per token (character-level masking).
+
+These numbers come from Outlines' own benchmarks (2023). By May 2026, integration with XGrammar's vocabulary-indexing approach has pushed JSON performance higher (close to XGrammar's &lt;40μs), but Outlines still uses the original FSM indexing for broad compatibility.
+
+### Integration with serving frameworks
+
+**vLLM:** Since ~2024, vLLM has integrated XGrammar while keeping Outlines' schema API. Users call `sampling_params.grammar = generate.choice(...)` or pass a JSON Schema. The underlying engine is XGrammar, but the interface is Outlines.
+
+**SGLang:** Full integration with Outlines, including grammar caching and parallel batch processing.
+
+**ollama:** Supports JSON Schema via the `format: "json"` parameter, which invokes Outlines under the hood.
+
+### Community and maturity
+
+- **GitHub stars:** ~5k (less than major frameworks, but high quality).
+- **Active maintenance:** 2023–2026, regular releases and bug fixes.
+- **Research credibility:** Published paper, widely cited (>1k citations), used in academic constrained-generation studies.
+- **Integration ecosystem:** LangChain, LLaMAIndex, Hugging Face transformers, MLflow.
+
+**Gotchas (as of May 2026):**
+
+- **Performance on very large vocabularies** (e.g., multilingual models with 150k+ tokens). Outlines' FSM indexing scales as O(|V|), so latency can creep up.
+- **Edge cases in grammar compilation.** Some EBNF grammars fail to compile or produce unintuitive FSMs. Error messages can be cryptic.
+- **Streaming is limited.** Outlines' regex masking works per-token; streaming shows tokens one-by-one, making the output feel jerky.
+
+### When to use Outlines
+
+- You need open-source, fully transparent implementation with published research.
+- You are building research systems or prototyping.
+- You want maximum flexibility (mix multiple constraint types).
+- Your serving engine is vLLM, SGLang, or transformers.
+- You care more about correctness and auditability than extreme latency.
+
+---
+
+## LM Format Enforcer (LMFE): character-level precision {#lmfe}
+
+LM Format Enforcer (Gat, 2023) takes a character-level approach: parse the constraint as a character-level grammar and mask tokens based on which characters they could produce.
+
+**Technique:**
+
+1. Convert schema (JSON, regex) to a character-level finite automaton.
+2. Track the current character-position in the generation.
+3. For each token, check: can this token produce only characters that are valid at the current position?
+4. Mask invalid tokens.
+
+**Advantage:** Works with any tokenizer. A token that produces multiple characters (e.g., `"hello"`) is valid if all characters are valid at the current parse position.
+
+**Performance:**
+
+- Per-token overhead: Higher than XGrammar (character-level parsing is slower than vocabulary-level).
+- Latency: 2–2.5× faster than naive token masking, but slower than compressed FSM (XGrammar).
+- Throughput: ~1.5–2× faster than token masking.
+
+**Ecosystem:**
+
+- Python-only. No C++/Rust implementation.
+- Integrates with LangChain and local inference (llama.cpp via API).
+- ~2k GitHub stars.
+
+**When to use LMFE:**
+
+- You need character-level precision with an unusual tokenizer.
+- Python-only stack is acceptable.
+- Token masking is your fallback (you don't have vLLM/SGLang).
+
+---
+
+## Latency and throughput trade-offs {#latency}
+
+A numerical sketch of trade-offs on a 100-token JSON generation (typical structured output). These numbers are derived from vLLM benchmarks (May 2026), OpenAI telemetry, and XGrammar paper results.
+
+### Single-request latency
+
+| Approach | Per-Token Overhead | Total Latency | Notes |
+|----------|------------------|---------------|-------|
+| **Unconstrained** | 0 (baseline) | 100 ms | Model inference only, no constraints |
+| **Token masking** | 1–5% | 101–105 ms | 128k vocabulary checks per token |
+| **XGrammar FSM** | &lt;40μs (~4% of model time) | 104 ms | Deterministic skipping on 30% of tokens |
+| **Compressed FSM + skip** | 4% + skip gain | 70–85 ms | 30–50% of tokens are deterministic |
+| **Outlines** | ~100μs (grammar dependent) | 106–110 ms | Original FSM indexing, slightly slower than XGrammar |
+| **LMFE (character-level)** | ~4% | 104 ms | Similar to XGrammar but slower on some schemas |
+| **OpenAI Structured Outputs API** | Included in RPC | 150–300 ms | Includes network round-trip and queuing |
+
+### Throughput in batch serving (batch size 32)
+
+The real value of FSM appears in batch serving, where GPUs process multiple requests in parallel.
+
+| Approach | Tokens/sec (A100) | GPU Utilization | Queue Latency |
+|----------|-------------------|-----------------|----------------|
+| **Unconstrained** | 4,000 | 95% | &lt;10ms (saturated) |
+| **Token masking** | 3,600 | 90% | &lt;20ms |
+| **XGrammar FSM** | 4,800 | 95% | &lt;10ms (faster processing) |
+| **OpenAI API** | 50–200 | 5–20% | 100–500ms (mostly queuing) |
+
+The XGrammar throughput is *higher* than unconstrained because deterministic skipping reduces per-token work. The GPU becomes compute-bound (on attention), not latency-bound (on softmax).
+
+### Break-even analysis
+
+When does FSM optimization matter?
+
+1. **If you have an SLA &lt; 150ms:** FSM saves 20–30ms per request. Essential for real-time systems.
+2. **If you have >1 million requests/day:** FSM saves 20–30 GPUs over token masking. At $1/GPU-hour, this is ~$500–1,000/month.
+3. **If you can tolerate 150–500ms latency:** OpenAI Structured Outputs are simpler (no infrastructure) and more reliable (guaranteed correctness).
+4. **If you are prototyping:** Token masking + Guidance is fast to implement. Optimize later if needed.
+
+### Key observations
+
+1. **Token masking is cheap.** 1–5% overhead is negligible for most applications. Use it if you don't have infrastructure for FSM and can accept 1–2% latency increase.
+
+2. **FSM jump-forward is transformative for latency-sensitive systems.** By skipping deterministic tokens, you save 20–30ms per 100-token response. For real-time systems (100ms total latency budget), this reclaims 20–30% of the budget. The gain compounds: at 1,000 requests/sec, this is 20–30 seconds of cumulative GPU time saved per second of wall-clock time.
+
+3. **OpenAI API trades latency for simplicity.** Network overhead (50–200ms) is large compared to local inference (100ms). Use Structured Outputs if your SLA is >200ms and you want to avoid infrastructure.
+
+4. **Batch serving amplifies FSM gains.** In a batch of 32 requests, XGrammar enables 20–30% higher throughput (from 4,000 to 4,800 tokens/sec) without increasing GPU memory or batch size. This is a pure efficiency win.
+
+5. **Deterministic skipping creates latency variance.** Sometimes a token is deterministic (skip model call), sometimes not (call model). Latency per token varies, leading to "jitter." For latency-sensitive systems, consider disabling skipping and using pure masking for more predictable latency.
+
+---
+
+## A comparison table {#comparison}
+
+| Framework | Company | Year | Technique | JSON | CFG | Regex | Overhead | Use Case | Maturity |
+|-----------|---------|------|-----------|------|-----|-------|----------|----------|----------|
+| **XGrammar** | MLC-AI | 2024 | Compressed FSM + vocab index | ✓ | ✓ | ✓ | &lt;40μs | Production inference, vLLM/SGLang/TRT-LLM | Stable (May 2026) |
+| **Outlines** | .txt team | 2023 | FSM (JSON/CFG), token mask (regex) | ✓ | ✓ | ✓ | 50–100μs | Open-source serving, research | Stable |
+| **Guidance** | Microsoft Research | 2022 | Token masking | ✓ | ✓ | ✓ | ~5% | Flexible constraints, local inference | Stable |
+| **LMFE** | Noam Gat | 2023 | Character-level FSM | ✓ | Limited | ✓ | ~4% (slower than XGrammar) | Character-level precision, LangChain | Active |
+| **llama.cpp** | ggml-org | 2023+ | Token masking (integrated) | ✓ | ✓ | ✓ | Built-in | Local inference, embedded | Stable |
+| **Structured Outputs** | OpenAI | 2024 | Proprietary constrained decoding | ✓ | ✗ | ✗ | API (50–200ms) | Production APIs, guaranteed compliance | Stable |
+| **JSON mode** | OpenAI | 2023 | Token masking | ✓ | ✗ | ✗ | API (50–200ms) | Deprecated; use Structured Outputs | Deprecated |
+
+---
+
+## When to use which {#summary}
+
+**If you are using OpenAI's API:**
+  - Use **Structured Outputs** (2024+). Guaranteed schema compliance, transparent, no infrastructure.
+  - Avoid JSON mode (deprecated).
+
+**If you are self-hosting with vLLM, SGLang, or TensorRT-LLM:**
+  - Use **XGrammar** (the default in all three frameworks as of May 2026).
+  - If you need more flexibility, layer **Outlines** on top (which now uses XGrammar internally).
+
+**If you need maximum flexibility and don't care about latency:**
+  - Use **Guidance**. Supports dynamic constraints, context-dependent grammars, custom masking logic.
+
+**If you have unusual tokenizers or need character-level control:**
+  - Use **LMFE** for Python local inference.
+  - Use **llama.cpp**'s built-in masking for CPU inference.
+
+**For prototyping and research:**
+  - Use **Outlines** (open-source, well-documented, integrates with standard frameworks).
+
+---
+
+## Cross-reference: agentic tool use {#agents}
+
+Constrained decoding is foundational for reliable agent workflows (see [Agentic post-training](/textbook/03h-tool-use-and-agents)). When an agent emits a function call, the call must match the function's schema:
+
+```python
+function = {
+  "name": "search",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string"},
+      "num_results": {"type": "integer", "minimum": 1, "maximum": 20}
+    },
+    "required": ["query"]
+  }
+}
+```
+
+Without constrained decoding, the agent might emit `search(query="hot pot", num_results="ten")` (string instead of integer, or value outside the range). With constrained decoding, invalid calls are impossible. The agent can reason freely, but its outputs are guaranteed to be callable.
+
+This is not a stylistic improvement—it is a reliability upgrade. In agentic RL, an invalid action causes a training reward of zero. Constrained decoding prevents entire classes of invalid-action failures, freeing the RL signal to focus on *semantic* mistakes (wrong query content) instead of *syntactic* ones (wrong parameter type).
+
+---
+
+## Summary {#summary}
+
+Constrained decoding solves the problem of invalid structured output in language model generation. Two families of techniques dominate: **token masking**, which restricts the logit distribution at each step (1–5% overhead), and **FSM jump-forward**, which precompiles the schema and skips deterministic tokens (2–2.5× latency reduction, ~4% computational overhead).
+
+**By May 2026**, XGrammar (compressed FSM + vocabulary indexing) is the production default in vLLM, SGLang, and TensorRT-LLM. OpenAI's Structured Outputs provide a simpler, guaranteed-correct API endpoint. Outlines offers the best open-source flexibility. The choice is infrastructure: use Structured Outputs if you can afford the latency and abstraction cost; use XGrammar if you self-host; use Outlines if you want transparency and flexibility.
+
+For agentic workflows, constrained decoding is not optional—it is the only reliable way to guarantee that function calls are syntactically valid before execution. Combined with RL on semantic correctness, constrained generation shifts the learning problem from "avoid invalid syntax" to "learn the right action."
+
+The latency gains are real (20–30ms per 100 tokens in batch serving) and compound in high-throughput systems. The reliability gains are essential for production systems that cannot tolerate schema-validation failures. Use constrained decoding everywhere your output is consumed by code.

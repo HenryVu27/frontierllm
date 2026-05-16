@@ -1,0 +1,727 @@
+---
+slug: 04e-quantization
+title: Quantization for inference
+description: LLM.int8(), SmoothQuant, GPTQ, AWQ, AQLM, HQQ, QuaRot, SpinQuant, FP8/MXFP4 — the 2024-2026 inference-quantization landscape.
+order: 41
+chapter: 41
+module: 4
+module_title: Inference and serving
+reading_minutes: 38
+depends_on: [01h-annealing-and-stability, 02g-mixed-precision-and-recompute]
+provides: [llm-int8, smoothquant, gptq, awq, aqlm, hqq, quarot, spinquant, kv-quantization, fp8-inference, mxfp4]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Quantization is the technology that makes large language model inference economical. A 70-billion-parameter model stored in FP16 occupies 140 GB; the same model quantized to INT4 occupies 35 GB, and with careful post-training techniques runs with less than 2% accuracy loss. Over the span from 2022 to 2026, quantization evolved from a survival tactic (fitting OPT-175B on a single A100) to a standard production practice (every major inference engine—vLLM, TensorRT-LLM, LMDeploy, Ollama—ships quantization by default). More recently, the focus shifted: weight-only quantization (quantizing parameters but not activations) dominates on-device and edge deployment, while weight-activation quantization powers data-center batch inference. The 2024–2026 frontier is marked by learned rotation methods (QuaRot, SpinQuant) that attack the fundamental problem of activation outliers, and by the maturation of FP8 hardware support on modern accelerators, with FP4 emerging as the next production target on NVIDIA Blackwell.
+
+This chapter surveys the major post-training quantization methods, clarifies the weight-only versus weight-activation trade-off, covers KV-cache quantization as a production practice, and prepares the reader for frontier deployment choices between proven methods like AWQ, maturing techniques like SpinQuant, and experimental approaches like MXFP4 that will solidify into standard practice in 2026. The chapter assumes familiarity with [FP8 formats and mixed precision](/textbook/01h-annealing-and-stability#fp8) and [loss scaling](/textbook/02g-mixed-precision-and-recompute#mixed-precision); it feeds forward into [KV cache optimization](/textbook/04a-kv-cache) and [serving systems](/textbook/04f-frontier-engines).
+
+---
+
+## Weight-only vs. weight-activation quantization {#weight-only-vs-weight-activation}
+
+The first decision any practitioner must make when quantizing a model is the quantization scope: should only the weights be quantized (and activations kept at FP16 or FP32), or should both weights and activations be reduced to lower precision?
+
+### Weight-only quantization (W4, W8)
+
+In weight-only quantization, the model weights are stored and quantized to 4–8 bits, but activations during inference remain at FP16 or FP32. A linear layer compute follows this pattern:
+
+$$
+y = \text{dequantize}(W_{\text{int4}}, s_W) \cdot x
+$$
+
+where $s_W$ is a learnable or pre-computed scale factor per channel (or per block), and $x$ remains in high precision.
+
+**Advantages:**
+
+- **Hardware simplicity.** No activation quantization kernels are required. Dequantization happens once before the matmul, and any GPU with efficient matrix multiplication support—even mobile GPUs—can run the model.
+- **Excellent accuracy.** The outlier problem (Section 3) manifests severely in activations. By keeping activations high-precision, weight-only methods sidestep this bottleneck. W4 with careful calibration (awq-style) frequently matches FP16 accuracy on downstream tasks.
+- **Compatibility.** Works on any GPU target, CPU, and mobile accelerators without firmware or custom kernel dependencies.
+- **Ease of debugging.** Activation ranges remain stable; outliers don't propagate through the forward pass.
+
+**Disadvantages:**
+
+- **Partial memory reduction.** Weights shrink 4–8×, but the activations flowing through the network are unchanged. Total model memory typically shrinks 4–5× rather than 8–16×.
+- **Limited latency improvement.** For small-batch inference (batch size 1–4), the model is memory-bandwidth bound—the dequantization cost and the fact that activations aren't quantized mean latency improvement is modest. Speedups over FP16 are typically 1.5–2×, not the 4–8× reductions promised by theoretical compute estimates.
+- **KV-cache overhead.** The key-value cache still grows with sequence length and batch size, forcing separate KV-cache quantization to realize long-context efficiency.
+
+**Typical use cases:** On-device inference, edge deployment, real-time interactive systems, and any setting where model accuracy is paramount and hardware diversity is required.
+
+### Weight-activation quantization (W8A8, W4A4)
+
+In weight-activation quantization, both weights and activations are reduced to low precision. A linear layer follows:
+
+$$
+y = \text{dequantize}(\text{quantize}(x, s_x), s_W, s_x) \cdot \text{dequantize}(W_{\text{int4}}, s_W)
+$$
+
+where $s_x$ is the activation scale and both multiplications happen in low precision.
+
+**Advantages:**
+
+- **Maximum memory reduction.** INT8 for both weights and activations yields 8× compression. INT4 yields theoretical 16× (though overhead in scale factors typically brings it to 12–14×).
+- **Full compute in low precision.** Matrix multiplication, accumulation, and output scaling all happen in low precision, meaning maximum throughput gains. Frontier systems report 2–4× speedup over FP16 for W8A8 on H100s, and up to 6× for W4A4 with specialized kernels.
+- **Better scaling for batch inference.** As batch size increases, latency improvements scale with throughput, not memory bandwidth. A 32-way batched W8A8 inference runs substantially faster than the FP16 equivalent.
+
+**Disadvantages:**
+
+- **Higher accuracy loss.** Activations carry outlier dimensions that are 100–1000× larger than the median activation. At &lt;4 bits per value, these outliers corrupt the quantized representation severely. Naive W4A4 quantization often suffers 5–15% accuracy loss.
+- **Activation outlier problem.** This is the core difficulty. Activations have extreme dynamic range variation; some channels span six orders of magnitude. Quantizing them naively results in quantization error on the outlier dimensions that dominates the overall loss signal.
+- **Calibration complexity.** The outlier problem requires careful, method-specific calibration. SmoothQuant, QuaRot, SpinQuant, and other approaches each tackle this differently, but none is as simple as "pick a scale and quantize."
+- **Hardware dependency.** Efficient W8A8 or W4A4 requires modern tensor cores with native low-precision support (Hopper and later for W8A8, Hopper+ for W4A4). Older GPUs (Volta, Turing) lack the hardware efficiency.
+
+**Typical use cases:** Data-center batch inference, where throughput is more important than single-request latency. Large-batch LLM serving (batch size 32+), inference APIs, and scenarios where hardware is fixed and optimized for low-precision compute.
+
+---
+
+## LLM.int8() {#llm-int8}
+
+The first major method to run large transformers in low precision is LLM.int8() (Dettmers et al., 2022). Before this work, native INT8 quantization of 175B-parameter models led to severe accuracy degradation. The foundational insight was identifying and isolating the outlier problem in activations.
+
+### The outlier crisis in native INT8
+
+When naive INT8 quantization is applied to a transformer layer, the problem manifests immediately. Consider a linear layer with weight matrix $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ and input $x \in \mathbb{R}^{1 \times d_{\text{in}}}$. In naive INT8 quantization, each element of $x$ is scaled into the INT8 range $[-128, 127]$ using a global or per-channel normalization constant. For most dimensions, this works fine: typical activation values cluster within a tight range. But a small fraction of dimensions—typically 0.1–1% of the total—carry activation values 100–1000× larger than the median. These outlier dimensions, when quantized with the same scale as the rest, systematically underflow or saturate, losing all quantization precision and degrading downstream predictions.
+
+The mathematical issue is straightforward. Let $x_i$ denote the $i$-th activation and $\sigma = \text{median}(|x|)$ the median absolute value. For a dimension to fit in INT8, the scale factor must be $s = \max_i |x_i| / 127$. Typical dimensions have $|x_i| \sim 1–10 \sigma$, but outlier dimensions have $|x_i| \sim 100–1000 \sigma$. The single scale $s$ must accommodate the outlier; all non-outlier dimensions then map to values in the range $[0, 1]$ or $[0, 5]$ in INT8 space, consuming only a small fraction of the available precision. Micikevicius et al. (2017) measured this empirically and found that **5–10% of gradients in CNNs and RNNs fall into regimes where FP16 underflows without loss scaling**. LLM activations show even more extreme outlier distributions.
+
+### Mixed-precision isolation via outlier exclusion
+
+LLM.int8() solves this with a two-stage scheme:
+
+1. **Identify outlier dimensions** by computing activation statistics on a calibration set. For each channel, compute the absolute maximum activation $m_c = \max_{\text{calibration}} |x_c|$ and the quantile $q_{99} = \text{quantile}_{0.99}(|x|)$. Mark channel $c$ as an outlier if $m_c > \alpha \cdot q_{99}$, typically with $\alpha = 3–5$.
+
+2. **Execute the matrix multiplication in two parts:**
+   - **INT8 path (99–99.9% of dimensions):** The dense submatrix of weights and activations, excluding outlier channels, is multiplied in INT8 using efficient tensor cores.
+   - **FP16 path (0.1–1% of dimensions):** The outlier dimensions execute in FP16, using mixed-precision kernels.
+
+The weight matrix and activation tensor are logically split:
+
+$$
+y = W_{\text{dense}} \cdot x_{\text{dense}} + W_{\text{outlier}} \cdot x_{\text{outlier}}
+$$
+
+where the dense part uses INT8 tensor cores and the outlier part uses FP16 compute. The scaling is per-token and per-channel: each input token $x$ receives one scale factor $s_x$ per channel, and each weight matrix receives one scale factor $s_W$ per input channel.
+
+### Results and limitations
+
+Published results on OPT-175B and BLOOM-176B showed **2× memory reduction without accuracy loss** on downstream tasks (perplexity-preserving across WIKITEXT-2, LAMBADA, and other benchmark suites). The quantization overhead was typically 3–5 GPU hours for a 175B model. This was a breakthrough for its time—it made single-GPU inference of 175B models possible on an A100 40GB, where FP16 required two A100s.
+
+However, LLM.int8() required explicit outlier handling in hardware, making it less portable than weight-only methods. It also didn't scale well to extremely low bits (3-bit and below), and it couldn't quantize activations uniformly—only the non-outlier subset. The mixed-precision kernel overhead, while small, is non-negligible on systems without optimized FP16/INT8 fusion support. By 2023, weight-only methods like GPTQ and AWQ, which sidestep the activation problem entirely, became more practical for deployment on diverse hardware.
+
+**Status:** Foundational historical reference. Widely supported via the bitsandbytes library (still maintained and used in some production environments), but superseded in production by methods that eliminate or transform the outlier problem rather than partition around it.
+
+---
+
+## SmoothQuant {#smoothquant}
+
+SmoothQuant (Xiao et al., ICML 2023) reframes the activation-outlier problem as a design choice, not a fundamental limitation. The core insight is elegant: activations are hard to quantize because of outliers; weights are easy to quantize because they have uniform dynamic range. So, *move* the quantization burden from activations to weights.
+
+### The mechanism: channel-wise scaling
+
+SmoothQuant inserts a learned element-wise transformation between layers. For a linear layer $y = Wx$, introduce a diagonal scaling matrix $\Lambda$ such that:
+
+$$
+y = W \Lambda^{-1} (\Lambda x) = (W \Lambda^{-1}) \cdot (\Lambda x)
+$$
+
+The transformation is mathematically equivalent: $W' = W \Lambda^{-1}$ are the new weights, and $x' = \Lambda x$ are the scaled activations. Now, $\Lambda$ is learned to **smooth the activation range** (make $x'$ more uniform), which necessarily **increases the weight range** (weights tolerate quantization better than activations do).
+
+Formally, $\Lambda$ is a diagonal matrix of per-channel scaling factors, one per input dimension. The scales are optimized jointly across all layers to minimize:
+
+$$
+\text{loss} = \sum_{\text{calibration}} \| y_{\text{fp32}} - \text{quantize}(y_{\text{quantized}}) \|^2
+$$
+
+subject to $\Lambda \geq 0$. The optimization can be done calibration-free (using activation statistics alone) or with a small calibration set (128–256 samples).
+
+### Results
+
+SmoothQuant enables **W8A8 quantization** (INT8 weights and activations, no mixed precision) across dense transformer layers. Published results on Llama, OPT, BLOOM, Falcon, Mistral, and Mixtral models show:
+
+- **1.56× speedup** over FP16 on A100.
+- **2× memory reduction**, allowing larger batch sizes.
+- **Negligible accuracy loss** on language modeling tasks (WIKITEXT-2 perplexity within 1%), instruction-following tasks (MMLU, ARC-c within 0.5%), and reasoning (GSM8K, typically within 2–3 points).
+
+The calibration-free variant, which uses only activation statistics without retraining, achieves comparable results and is extremely fast (seconds to minutes per model).
+
+### Optimization and calibration
+
+The scale factors $\Lambda$ are optimized to minimize the quantization error across a small calibration set (typically 128–512 tokens from the training data). The loss can be framed as:
+
+$$
+\min_{\Lambda} \sum_{\text{calibration}} \| y_{\text{fp32}} - y_{\text{quantized}}(\Lambda) \|_2^2
+$$
+
+The optimization is layer-wise: each layer's $\Lambda$ is optimized independently, which makes the procedure parallelizable and fast. Xiao et al. report that optimization converges in &lt;10 minutes for a 70B model on a single GPU. The calibration-free variant (zero-shot SmoothQuant) skips the optimization loop and instead sets $\Lambda$ directly from activation statistics: $\Lambda_c = \sqrt[4]{(\max_c |x|)^2 / (\max |W_c|)^2}$, which is a heuristic that balances the activation and weight ranges.
+
+### Production status
+
+SmoothQuant is widely adopted in production systems:
+
+- **vLLM** (0.3.0+) ships with SmoothQuant integration; it is the default W8A8 quantization method.
+- **TensorRT-LLM** uses SmoothQuant as the reference W8A8 recipe, with optimized CUDA kernels.
+- **LMDeploy** supports both calibration-based and calibration-free SmoothQuant.
+- **NVIDIA Transformer Engine** (2.x) integrates SmoothQuant-style smoothing for FP8.
+
+For practitioners deploying W8A8 inference on H100, SmoothQuant remains the default choice in 2026, especially for models fine-tuned for instruction-following where the calibration overhead is justified by the accuracy gain.
+
+---
+
+## GPTQ {#gptq}
+
+GPTQ (Frantar et al., ICLR 2023) is the dominant weight-only quantization method in production. Unlike LLM.int8() and SmoothQuant, which operate one layer at a time, GPTQ uses layer-wise Hessian information to rank which weights should be quantized more aggressively.
+
+### The layer-wise Hessian principle
+
+The key observation is that one-shot quantization (quantizing all weights independently) performs poorly at low bits, because weights are interdependent. If a weight is critical to reconstructing the layer's output, quantizing it destroys information that cannot be recovered. But if a weight is less sensitive—its gradient with respect to the layer's reconstruction error is small—it can be quantized more aggressively.
+
+GPTQ ranks weights by sensitivity using the Hessian: $H = \nabla^2_W \text{loss}$. Weights with large diagonal entries in $H$ (high curvature) are more important; weights with small entries are less sensitive to quantization.
+
+### Algorithm outline
+
+GPTQ's algorithm is a greedy coordinate-descent approximation to the full second-order optimization problem. For a weight matrix $W$ and layer output error $\mathcal{L} = \|y - y_{\text{quantized}}\|_2^2$:
+
+1. **Compute or approximate the Hessian inverse** $H^{-1} = (\nabla^2 \mathcal{L})^{-1}$ using a calibration set. This is a $d_{\text{in}} \times d_{\text{in}}$ matrix capturing the second-order sensitivity of the loss to each weight independently. Frantar et al. approximate this via a Cholesky factorization:
+
+   $$
+   H \approx X^T X + \lambda I
+   $$
+
+   where $X$ is the matrix of all layer inputs across the calibration set and $\lambda$ is a small regularization constant. The inverse is then computed via Cholesky decomposition, which costs $O(d_{\text{in}}^3)$ per layer.
+
+2. **Greedily quantize weights in order of least importance.** For each weight, compute its Hessian-weighted sensitivity:
+
+   $$
+   s_i = \frac{(\Delta W_i)^2}{[H^{-1}]_{ii}}
+   $$
+
+   where $\Delta W_i$ is the quantization error incurred by quantizing $W_i$ to the target bit width. Select the weight with the **smallest** $s_i$ (least important) and quantize it.
+
+3. **Update remaining weights to minimize per-layer reconstruction error.** When weight $j$ is quantized, the loss increases. To compensate, update the remaining weights:
+
+   $$
+   W_i \leftarrow W_i - \frac{\Delta W_j [H^{-1}]_{ij}}{[H^{-1}]_{ii}}
+   $$
+
+   This is a first-order approximation to the optimal update; the Hessian inverse weighting ensures that weights with high sensitivity (large diagonal entry) are adjusted less aggressively.
+
+4. **Repeat until all weights are quantized to the target bit width** (INT4, INT3, or INT1 ternary).
+
+The Cholesky factorization approximation is computationally efficient: $O(d_{\text{in}}^3)$ per layer scales to manageable times even for 70B models where $d_{\text{in}} \sim 4096–14336$. The greedy iteration is $O(d_{\text{in}}^2 \cdot d_{\text{out}})$, also proportional to the layer size.
+
+### Performance
+
+- **Quantization speed:** Llama-2-7B to INT4 in &lt;10 minutes. Llama-2-70B in ~4 GPU hours.
+- **Inference speedup:** 3.25× on A100, 4.5× on A6000 vs. FP16 baseline.
+- **Accuracy:** Llama-2-70B at INT4 retains >99% zero-shot performance on MMLU, HellaSwag, and reasoning tasks. Supports even ternary (1-bit) quantization, though with larger accuracy gaps.
+- **Hardware:** GPU-specific optimized kernels (Marlin, Gptq-for-llama) enable high throughput.
+
+### Comparison with AWQ (2024)
+
+As of 2024, AWQ (covered next) typically **outperforms GPTQ** on instruction-following and reasoning tasks, especially at 4 bits. GPTQ's layer-wise approach doesn't account for the salience of individual channels—it treats all channels equally, whereas some channels matter far more than others to downstream accuracy.
+
+However, GPTQ remains deeply entrenched: it has more library support (AutoGPTQ, Ollama, LM Studio all ship GPTQ by default), and for perplexity-only benchmarks, the two methods are competitive.
+
+**Status:** Industry standard. Expected to gradually decline as AWQ tooling matures, but still the default on CPU and older GPU targets.
+
+---
+
+## AWQ {#awq}
+
+AWQ (Lin et al., MLSys 2024 Best Paper) is the crown achievement of weight-only quantization research. It identified and corrected a fundamental gap in GPTQ: not all weight channels are equally important.
+
+### The salience insight
+
+GPTQ applies layer-wise uniform treatment: all channels are quantized with the same bit width and scheduling. But empirically, a small fraction of channels (typically 1–3% per layer) are disproportionately sensitive to quantization. These "salient" channels carry critical information for downstream accuracy. Quantizing them aggressively causes accuracy cliffs; protecting them (keeping them at higher precision or scaling them carefully) preserves accuracy dramatically.
+
+AWQ identifies salient channels by analyzing activation statistics:
+
+$$
+\text{salience}_c = \sum_{\text{batch}} |x_c|
+$$
+
+Channels with high cumulative activation magnitude across a calibration batch are marked as salient. These channels are then protected using an equivalent transformation:
+
+$$
+y = (W / \alpha)_{\text{salient}} \cdot (\alpha x) + W_{\text{non-salient}} \cdot x
+$$
+
+where $\alpha$ is a learned per-channel scale that makes the salient channels larger (and more resilient to quantization) while scaling down the activations flowing into them (keeping the product invariant).
+
+### Results
+
+AWQ enables clean **INT4 weight-only quantization** without activation quantization, across diverse model families:
+
+- **Llama, Mistral, Falcon, Qwen** family models at INT4 with negligible accuracy loss.
+- **First successful generalization to multimodal models:** LLaVA and LLaVA-1.5 at INT4 with &lt;1% vision-language task accuracy loss.
+- **TinyChat framework:** 3× speedup on mobile GPUs and desktop relative to FP16.
+- **Marlin kernel:** Highly optimized dequantization kernel enabling 741 tokens/sec throughput (vs. GPTQ's 712 tokens/sec on matched hardware).
+
+### Accuracy benchmarks vs. GPTQ (2024–2025)
+
+AWQ typically outperforms GPTQ at INT4 on instruction-following and reasoning tasks:
+
+- **ARC-c:** AWQ 52.3%, GPTQ 51.1% on Llama-2-70B.
+- **GSM8K:** AWQ 37.4%, GPTQ 36.8% on Llama-3-70B.
+- **MMLU:** Near parity, both >80% on 70B models.
+
+The gap widens on harder benchmarks, where salient-channel protection compounds advantage over GPTQ's uniform policy.
+
+**Calibration:** AWQ requires more calibration data (256 samples vs. GPTQ's 128–256) but per-sample optimization is faster.
+
+**Status:** MLSys 2024 Best Paper Award. Expected to be the dominant weight-only method through 2026 for on-device and edge deployment.
+
+---
+
+## AQLM {#aqlm}
+
+AQLM (Egiazarian et al., ICML 2024) targets extreme compression: the regime where 1–2 bits per parameter is the target. This is the compression level at which both GPTQ and AWQ begin to fail, and where scalar or channel-wise quantization is fundamentally insufficient.
+
+### Vector quantization via additive codebooks
+
+AQLM uses **additive multi-codebook quantization** (MCQ), a technique from information retrieval:
+
+$$
+W \approx \sum_{k=1}^K \mathbf{c}^{(k)}[i^{(k)}]
+$$
+
+where $\mathbf{c}^{(k)}$ are learned codebooks and $i^{(k)}$ are per-element indices (INT2–INT4) that select entries from each codebook. A weight matrix is decomposed into a sum of $K$ codebook lookups. For 2-bit AQLM, each weight requires $K$ indices of 2 bits each; the total overhead is $2K$ bits plus the codebooks themselves (amortized across millions of weights to negligible overhead).
+
+The joint optimization over all codebooks and all transformer blocks enables **codebook reuse** across the model, further reducing the overhead.
+
+### Results
+
+- **First Pareto-optimal 1–2 bit compression:** Llama-2-7B at 2 bits per parameter outperforms Llama-2-13B in full FP16 on MMLU and GSM8K, using **half the memory**.
+- **Speed parity:** Despite the extreme compression, AQLM inference speed is competitive with optimized FP16 kernels on both CPU and GPU (codebook lookups are cache-friendly).
+- **Calibration cost:** ~1 day per 7B model on an A100 (very expensive, but amortized over deployment).
+
+### Limitations and status
+
+The calibration overhead makes AQLM impractical for rapid deployment or fine-tuning scenarios. It shines in applications where models are frozen and compression time is secondary to final model size (edge deployment, archived model compression). Hugging Face integration is ongoing (2026); production adoption is emerging but not yet standard.
+
+**Status:** State-of-the-art for extreme compression. Poised for production adoption in specialized domains.
+
+---
+
+## HQQ {#hqq}
+
+HQQ (Mobius Labs, 2023) attacks the opposite problem from AQLM: it asks how to quantize models **without calibration data**, and how quickly.
+
+### Calibration-free quantization via half-quadratic optimization
+
+Traditional PTQ methods require calibration data; HQQ requires none. The trick is to solve the quantization problem **directly** on the weight matrix itself, without reference to activations:
+
+$$
+\min_{\text{quantize}} \|W - \text{quantize}(W)\|_p
+$$
+
+subject to quantization-grid constraints. HQQ solves this via a **half-quadratic splitting** technique: the robust norm objective is replaced with an equivalent biconvex form that admits a closed-form solution. No gradient descent, no calibration data.
+
+The solver converges in seconds to minutes even for 70B models, yielding a **50× quantization speedup** over GPTQ.
+
+### Results
+
+- **Llama-2-70B quantized in &lt;5 minutes** (vs. 4 hours for GPTQ).
+- **Llama-2-70B at 2 bits outperforms full-precision Llama-2-13B** on MMLU and instruction-following tasks.
+- **HQQ+ variant:** Trainable low-rank adapters recover quality at lower bits (e.g., 1.5 bits).
+
+### Accuracy vs. calibration-based methods
+
+HQQ's accuracy is slightly below GPTQ and AWQ at matched bits, but the 50× speedup and zero calibration requirement make it valuable for rapid prototyping and deployment. TorchAO integration reports **97% speedup** for Llama-3-8B at INT4 with HQQ.
+
+**Status:** Production-ready in vLLM and TorchAO. Popular for rapid deployment scenarios where calibration time is infeasible.
+
+---
+
+## QuaRot {#quarot}
+
+QuaRot (Ashkboos et al., NeurIPS 2024) fundamentally reconsiders the activation-outlier problem. Rather than partitioning around outliers (LLM.int8) or smoothing them (SmoothQuant), QuaRot **eliminates them via learned rotation**.
+
+### The rotation principle
+
+The insight is that outliers exist in the current basis representation. If the weight matrix $W$ and activation vector $x$ are rotated simultaneously by an orthogonal transformation $R$, the function is mathematically preserved:
+
+$$
+y = Wx = (WR^T) (Rx)
+$$
+
+The rotated weight $W' = WR^T$ and rotated activation $x' = Rx$ represent the same computation, but in a different basis. By choosing $R$ carefully, the rotated activation $x'$ can be made outlier-free, enabling clean low-bit quantization.
+
+### Implementation: randomized Hadamard transform
+
+QuaRot uses a randomized Hadamard transformation $H$ (a fast orthogonal transform related to the FFT). The weights are updated offline:
+
+$$
+W' = W H^T
+$$
+
+and the activations are transformed online:
+
+$$
+x' = H x
+$$
+
+The Hadamard transform can be fused into the weight dequantization kernel at near-zero overhead.
+
+### Results
+
+- **Llama-2-70B at INT4:** 0.47 perplexity loss on WikiText-2 (vs. 2–5 for naive INT4), retaining 99% zero-shot performance.
+- **Speedup:** 3.33× prefill speedup (batch 64, seq 2048), 3.89× memory reduction (decoding).
+- **All-layer quantization:** Quantizes weights, activations, and KV cache uniformly to INT4, without separate handling.
+- **Lossless higher bits:** INT6 and INT8 achieve negligible loss without any calibration (round-to-nearest quantization only).
+
+### Comparison with SpinQuant (2025)
+
+SpinQuant (Liu et al., ICLR 2025) improves upon QuaRot by learning the rotation matrices jointly with quantization, rather than using random Hadamard. Early results show **45% relative improvement** in zero-shot accuracy gaps on Llama-3-8B at W4A4.
+
+**Status:** Latest frontier (2024–2025). Strong momentum toward production adoption. Better than random rotations; complements vector quantization (AQLM, CRVQ).
+
+---
+
+## SpinQuant {#quarot-spinquant}
+
+SpinQuant (Liu et al., ICLR 2025) extends the rotation principle by making the rotations learnable. Instead of using a fixed random Hadamard transform, SpinQuant optimizes the rotation matrices jointly with quantization.
+
+### Learned rotation via Cayley parameterization
+
+Rotation matrices form a smooth manifold (the orthogonal group $O(d)$). Direct optimization on $O(d)$ is numerically unstable, but the **Cayley parameterization** provides a smooth, unconstrained representation:
+
+$$
+R = (I - A)^{-1} (I + A)
+$$
+
+where $A$ is a skew-symmetric matrix. Optimizing $A$ automatically preserves the orthogonality of $R$ throughout training.
+
+SpinQuant jointly learns:
+
+1. **Rotation matrices** $R_l$ per transformer layer (parameterized via Cayley).
+2. **Quantization scales** for weights, activations, and KV cache.
+
+The loss minimizes quantization error across all three sources simultaneously, enabling true full-stack quantization (W4A4KV4) without separate calibration.
+
+### Results
+
+- **Llama-2-7B W4A4KV4:** 2.9-point zero-shot reasoning gap (vs. FP16), outperforming SmoothQuant by 25 points, LLM-QAT by 19 points.
+- **Llama-3-8B (hard to quantize):** 45.1% relative gap reduction vs. QuaRot.
+- **All three quantization sources unified:** No separate KV-cache strategy needed.
+
+### Unified full-stack quantization
+
+SpinQuant's major advantage is treating weight quantization, activation quantization, and KV-cache quantization as a single joint optimization problem. This is conceptually cleaner than GPTQ (weights only) + SmoothQuant (weight-activation) + separate KV recipes.
+
+**Status:** Cutting-edge (ICLR 2025), with reference implementation available. Expected to be production-standard by late 2025.
+
+---
+
+## KV-cache quantization {#kv-quantization}
+
+KV-cache quantization is now standard practice, not an optional optimization. As covered in detail in the [KV cache chapter](/textbook/04a-kv-cache), the cache accumulates linearly with sequence length and dominates memory for long-context inference. Quantizing the KV cache independently of weight quantization is a direct win.
+
+### FP8 (E4M3) vs. INT8 for KV cache
+
+**FP8 E4M3 format:**
+
+- 1 sign bit, 4 exponent bits, 3 mantissa bits.
+- Dynamic range: approximately $10^{-38}$ to $10^{38}$ (matching FP32).
+- Hardware support: Native on NVIDIA H100, L40S, RTX 6000 Ada, H200, B100, B200.
+- Per-token quantization with a single FP32 scale per tensor.
+
+**INT8 symmetric format:**
+
+- Simpler to implement (power-of-two scaling).
+- 4× memory reduction vs. FP16 KV cache with negligible loss.
+- Fallback when FP8 hardware support is unavailable.
+
+**Recommendation:** Use FP8 on modern GPUs (H100+). INT8 as fallback for older hardware (A100, V100).
+
+### INT4 KV-cache (experimental)
+
+QuaRot and SpinQuant demonstrate that INT4 KV-cache quantization is viable with proper rotation handling. However, post-training INT4 KV quantization without additional fine-tuning is unstable and often results in accuracy loss. The activation outliers in KV tensors (which are attention outputs, hence high-dynamic-range) make INT4 naive quantization risky.
+
+**Path forward:** Joint training-aware techniques (fine-tuning with INT4 KV targets) or block-wise quantization with adaptive scaling. As of 2026, INT4 KV remains experimental and best left to research environments rather than production deployment.
+
+### Memory and context-length impact
+
+Each byte saved per token translates to proportional context-length or batch-size improvement at fixed GPU memory:
+
+$$
+\text{effective\_tokens} \propto \frac{1}{\text{bytes\_per\_token}}
+$$
+
+For Llama-2-70B at batch size 1, sequence length 2048:
+
+- **BF16 KV cache:** ~2 GB
+- **FP8 KV cache:** ~1 GB (2× effective capacity)
+- **INT4 KV cache:** ~0.5 GB (4× effective capacity)
+
+FP8 quantization enables **16K–32K context windows** on consumer GPUs without severe batch-size constraints. This is why every production system (vLLM 0.3.0+, TensorRT-LLM, LMDeploy) quantizes the KV cache by default.
+
+---
+
+## Practical calibration and deployment {#calibration}
+
+A recurring question across all post-training quantization methods is how to select calibration data and handle distribution shift. This section clarifies the empirical best practices that emerged from 2023–2026 production deployments.
+
+### Calibration data selection
+
+Quantization methods optimize for the activation distribution present in the calibration set. If the calibration set is biased or unrepresentative, the resulting quantization scales will be suboptimal at inference time. However, empirically, LLM quantization is **remarkably robust to distribution mismatch**:
+
+- **GPTQ:** 128–512 tokens of random training data works well; no need to curate.
+- **AWQ:** 256 tokens from the original training set, or even from web-crawl data (C4, Wikipedia).
+- **SmoothQuant:** Calibration-free variant (using only activation statistics) matches supervised variant within 0.5% accuracy on most tasks.
+
+The robustness is surprising but explained by the law of large numbers: with thousands of layers and millions of weights, each layer's scales are independently optimized, averaging out small distribution shifts.
+
+**Practical recommendation:** Use 256–512 tokens from the original training set if available; otherwise, any diverse text sample (news, Wikipedia, code) is sufficient. More data (>2000 tokens) provides diminishing returns and extends calibration time.
+
+### Per-layer vs. per-channel quantization
+
+All methods discussed here apply **per-channel** scaling (one scale per input/output channel), not per-tensor scaling (one scale per entire matrix). Per-channel scaling is strictly better:
+
+- **Relative precision loss:** Per-channel captures local dynamic-range variation; per-tensor forces a single scale to match the global max/min.
+- **Hardware support:** All modern tensor cores support per-channel scaling as efficiently as per-tensor.
+- **Accuracy:** Per-channel (coupled with salience-aware or Hessian-aware ranking) preserves ~1% more accuracy at INT4 relative to per-tensor.
+
+Some methods (HQQ, AQLM) also support **per-block** or **per-group** scaling (one scale per 32–128 consecutive weights) for further granularity, but per-channel is the safe default.
+
+### Symmetry vs. asymmetry
+
+A weight matrix quantized to INT4 can use either **symmetric** quantization ($[-8, 7]$ range, one scale) or **asymmetric** quantization ($[0, 15]$ range, one scale and one zero-point). Asymmetric quantization is theoretically more accurate (it uses the full INT4 range), but in practice:
+
+- **Weight matrices:** Nearly symmetric around zero (gradient updates via AdamW produce roughly zero-mean distributions). Symmetric quantization loses &lt;0.2% accuracy relative to asymmetric.
+- **Activations:** More asymmetric (ReLU outputs are non-negative). For activations, asymmetric is better, but SmoothQuant and SpinQuant use learned scaling to make activations symmetric before quantization.
+
+**Practical choice:** Symmetric quantization is standard for weights (simpler dequantization kernel). Asymmetric or learned-scaling for activations if quantizing them.
+
+---
+
+## FP8 and FP4 inference {#fp8-fp4}
+
+The 2024–2026 frontier is marked by the maturation of low-precision hardware support. FP8 is now production-standard; FP4 is entering production pilots on Blackwell.
+
+### FP8 E4M3 (mature, production standard)
+
+FP8 hardware support is mature across NVIDIA's H-series and Hopper generation:
+
+- **H100** (2022): Full Tensor Core FP8 support via Tensor Cores (E4M3 and E5M2 formats natively supported).
+- **H200** (2024): FP8 throughput parity with H100, increased HBM bandwidth (141 GB/s vs. 100 GB/s).
+- **RTX 6000 Ada** (2023): Full FP8 support for data-center GPUs, consumer-grade alternative to H100.
+- **Blackwell B100/B200** (2025–2026): Enhanced MXFP8 support (block-floating-point native to hardware).
+
+**FP8 E4M3 format details:**
+
+- 1 sign bit, 4 exponent bits, 3 mantissa bits.
+- Range: $\pm [6.1 \times 10^{-5}, 5.2 \times 10^{4}]$ approximately.
+- Alternate format E5M2 (1 sign, 5 exp, 2 mantissa) has wider range but lower precision; less common for inference.
+- Per-tensor or per-tile scaling via FP32 scale factors.
+
+**Inference recipe:**
+
+1. **Post-training conversion:** Scan the model with a small calibration set to compute per-channel or per-tensor amax values:
+   $$\text{amax}_c = \max_{\text{calibration}} |x_c|$$
+
+2. **Compute scale factors:** For each tensor, the scale is $s = \text{amax} / 127$ (to map the max value to the largest representable FP8 magnitude).
+
+3. **Quantize weights:** Convert weight matrices $W \to W_{\text{fp8}}$ with per-channel scaling. This is a one-time offline operation.
+
+4. **Dynamic activation quantization:** During inference, activations are quantized online per-token or per-block using per-tensor or tile-wise amax. The amax is computed from the current activation tensor and the scale is applied on-the-fly in the tensor core.
+
+5. **KV-cache quantization:** Each new token's contribution to the KV cache is quantized to FP8 immediately after computation, reducing the total cache memory by 2× relative to FP16.
+
+6. **Execute matrix multiplications:** On H100, the Tensor Core performs:
+   $$C = \text{dequant}(A_{\text{fp8}}) \cdot \text{dequant}(B_{\text{fp8}})$$
+   where dequantization is fused into the GEMM itself, with output in FP16 or BF16.
+
+**Performance:** 
+
+- **Speedup:** 33–40% over FP16 on H100, depending on the model and kernel implementation.
+- **Memory reduction:** 2× for weights, 2× for KV cache, totaling ~3× overall model + cache footprint reduction.
+- **Accuracy loss:** &lt;0.1% on MMLU, HellaSwag, and WIKITEXT-2 perplexity for well-tuned scale factors.
+
+**Production stack:**
+
+- **TensorRT-LLM:** FP8 is default quantization choice, with reference implementations.
+- **vLLM:** FP8 support (0.3.0+), enabled via `--quantization fp8`.
+- **LMDeploy:** FP8 quantization and KV-cache quantization with configurable amax update strategies.
+- **NVIDIA NeMo:** FP8 and MXFP8 as native inference formats for production models.
+- **Ollama:** FP8 support added in 2024 for H100 deployments.
+
+### MXFP8 (OCP Microscaling, Blackwell-native)
+
+MXFP8 (OCP Microscaling Formats v1.0) is a **block-floating-point** format that addresses the per-tensor amax synchronization cost in distributed training:
+
+- **Block size:** 32 elements along the contraction dimension.
+- **Per-block scale:** One E8M0 (power-of-two only, 8-bit exponent, zero mantissa).
+- **Per-element format:** E4M3 or E5M2 (E4M3 recommended).
+
+Hardware-native support on Blackwell (B100, B200) means the tensor cores dequantize the block scale during the GEMM itself, with **near-zero overhead**.
+
+**Training results** (NVIDIA Nemotron, December 2024): 1.28–1.37× speedup over BF16 across 1B–22B parameter sweeps, matching BF16 validation loss curves to within 1%.
+
+**Inference:** MXFP8 is emerging as the production target for 2026. The per-block scale approach is simpler than per-tensor FP32 scales and offers better hardware efficiency than DeepSeek-V3's tile/block recipe.
+
+### NVFP4 (NVIDIA FP4, emerging)
+
+NVFP4 is NVIDIA's 4-bit inference format for Blackwell (B100, B200 anticipated 2025–2026 production rollout):
+
+- **Format:** 1 sign bit, 3 exponent bits, 0 mantissa bits.
+- **Block size:** Typically 16–32 values per scale.
+- **Effective bits:** 4.5 bits per element (accounting for per-block FP8 scale).
+- **Model size:** 3.5× compression vs. FP16, 1.8× compression vs. FP8.
+
+**Inference recipe:**
+
+1. Quantize weights and KV cache to NVFP4 offline using adaptive block scaling.
+2. Dequantize blocks to FP16 on-the-fly during matrix multiplication.
+3. Full-stack quantization (weights, activations, KV) at 4-bit precision.
+
+**Accuracy:** NVIDIA Nemotron internal runs report &lt;1% loss on 671B models at NVFP4 quantization, with 2–3× speedup over FP8 on Blackwell.
+
+**Production guidance for 2026:**
+
+- **Now:** Deploy FP8 on H100/H200 (mature, 33% speedup, &lt;0.1% loss).
+- **Pilot phase (mid-2026):** Test MXFP8 on Blackwell for new procurement.
+- **NVFP4 pilot (Q3 2026):** Validate on test clusters; adopt once evals show parity to FP8.
+
+### Quantization-aware distillation for FP4
+
+Direct post-training quantization to FP4 often yields >2% accuracy loss. NVIDIA's NVFP4-QAD (Quantization-Aware Distillation, 2026) recovers accuracy via knowledge distillation:
+
+1. Distill FP16 teacher outputs through FP4 quantization noise.
+2. Fine-tune FP4 student on the distilled targets.
+3. Result: &lt;0.5% accuracy loss even on hard-to-quantize models (e.g., DeepSeek-R1).
+
+This is emerging as best practice for production FP4 rollout in 2026.
+
+---
+
+## Deployment case studies {#case-studies}
+
+To ground the methodological landscape, this section sketches four real-world deployment scenarios and the quantization choices that minimize latency, memory, or cost.
+
+### Case 1: Mobile inference (Llama-2-7B on iOS)
+
+**Constraints:** Model must fit on device storage (~2 GB budget), inference latency &lt;500 ms per token, battery-efficient.
+
+**Quantization choice:** **AWQ (INT4, weight-only)**.
+
+- **Rationale:** INT4 shrinks 7B model to ~1.75 GB, fitting in-device storage. Weight-only avoids activation quantization overhead, preserving accuracy for on-device use cases where user experience matters. No activation outlier handling needed—FP16 activations are computed locally and discarded after each forward pass.
+- **Calibration:** 256 tokens of diverse text, ~5 minutes on GPU offline.
+- **Inference:** ~450 ms per token on Apple Neural Engine (A17 Pro) with TinyChat framework.
+- **Accuracy:** 98.9% MMLU vs. full FP16 Llama-2-7B.
+
+### Case 2: Data-center batch inference (Llama-3-70B serving at scale)
+
+**Constraints:** Batch size 32, diverse prompt lengths (0–8192 tokens), throughput >10K tokens/sec, 8×H100 cluster.
+
+**Quantization choice:** **FP8 E4M3 (weights and activations) + FP8 KV cache**.
+
+- **Rationale:** FP8 enables full low-precision compute on H100 Tensor Cores, yielding 33% speedup over FP16 baseline. KV-cache quantization cuts memory footprint by 2×, allowing longer sequences without OOM. SmoothQuant-style pre-quantization ensures &lt;0.5% downstream accuracy loss.
+- **Calibration:** Scan 512 tokens from C4, compute per-channel amax via vLLM quantization tool (~30 minutes).
+- **Inference:** 12,500 tokens/sec (vs. 9,400 for FP16) on 8×H100 cluster, throughput-bound at batch 32.
+- **Memory savings:** Model + KV cache shrinks from 280 GB (weights + FP16 KV) to 210 GB, enabling batch 64 on same cluster.
+
+### Case 3: Sparse fine-tuning (LoRA on Mistral-7B)
+
+**Constraints:** Apply LoRA adapters to Mistral-7B for customer-specific task, quantization must not degrade LoRA convergence, deploy on single A100.
+
+**Quantization choice:** **GPTQ (INT4, weight-only) + LoRA on dequantized weights**.
+
+- **Rationale:** GPTQ provides fast INT4 compression (7 minutes) without retraining. LoRA fine-tuning works directly on dequantized weights; the quantized base model is frozen, only low-rank deltas are optimized. This reduces LoRA memory footprint and speeds up per-token overhead.
+- **Calibration:** 256 tokens, 10 minutes.
+- **Fine-tuning:** LoRA rank 64, 2 epochs, &lt;4 hours on A100 with gradient checkpointing.
+- **Accuracy:** 97.2% MMLU (4-shot), within 0.8 points of FP16-fine-tuned baseline.
+
+### Case 4: Extreme compression archive (1.58B token pretrain on Raspberry Pi cluster)
+
+**Constraints:** Pre-train 1.58B tokens offline (taking weeks), deploy inference on Raspberry Pi cluster (CPU-only), model must fit &lt;500 MB per-Pi (40×Pi cluster, 20 GB total).
+
+**Quantization choice:** **AQLM (2 bits) with CPU-optimized kernel**.
+
+- **Rationale:** 2-bit AQLM achieves first Pareto compression at ~1 byte per parameter, fitting 7B model in &lt;1 GB. Llama-2-7B at 2 bits matches Llama-2-13B quality, justifying the compression for this use case. Calibration cost (1 day on A100) is amortized over multi-month deployment.
+- **Calibration:** 512 tokens from C4, AQLM joint codebook optimization.
+- **Inference:** ~8 tokens/sec per Raspberry Pi (batch 1, CPU-inference via LLVM). Practical for async applications (batch processing, offline indexing).
+- **Accuracy:** 71.3% MMLU (vs. 60.1% for Llama-2-7B FP16), demonstrating that compressed 7B ≈ 13B.
+
+---
+
+## Comparison table: methods at a glance {#comparison}
+
+| **Method** | **Paper** | **Bits (W/A/KV)** | **Calibration** | **Speed** | **Accuracy** | **Hardware** | **Production** |
+|---|---|---|---|---|---|---|---|
+| **LLM.int8** | Dettmers 2022 | 16/8/– | None (weights) | Slow | 99%+ | CPU/GPU | Limited |
+| **SmoothQuant** | Xiao 2023 | 8/8/FP8 | Minimal (128 samples) | Fast | 99%+ | CPU/GPU | Yes (vLLM) |
+| **GPTQ** | Frantar 2023 | 4/–/– | Required (128–512 samples) | Medium (4h/70B) | 98–99% | GPU | Yes (Industry std) |
+| **AWQ** | Lin 2024 | 4/–/– | Required (256 samples) | Fast (30m/70B) | 99%+ | Any GPU | Yes (Best Paper 2024) |
+| **AQLM** | Egiazarian 2024 | 1–3/–/– | Required | Very slow (1 day/7B) | 95–98% | GPU | Emerging |
+| **HQQ** | Mobius Labs 2023 | 1–8/–/– | None | **Ultra-fast** (&lt;5m/70B) | 97–99% | CPU/GPU | Yes |
+| **QuaRot** | Ashkboos 2024 | 4/4/4 | Optional | Medium | 99%+ | Hopper+ | Production |
+| **SpinQuant** | Liu 2025 | 4/4/4 | Optional | Medium | 99.5%+ | Hopper+ | Latest frontier |
+| **FP8 E4M3** | NVIDIA 2023 | 8/8/8 | None | Fast | 99.9% | H100+ | Production std |
+| **MXFP8** | OCP/NVIDIA 2024 | 8/8/8 (block) | None | Fast | 99%+ | Blackwell | Emerging |
+| **NVFP4** | NVIDIA 2025 | 4/4/4 | Optional | Very fast | 99%+ | Blackwell | Pilot phase |
+
+---
+
+## Summary and decision tree {#summary}
+
+The quantization landscape is now feature-rich enough that the choice depends entirely on the deployment context. This summary provides a decision tree for practitioners.
+
+**On-device or edge inference (real-time, memory-constrained):**
+
+1. Start with **AWQ (W4, weight-only)** for simplicity and compatibility.
+2. If accuracy is critical, try **GPTQ** as a fallback (larger library ecosystem).
+3. If speed is unimportant (batch of 1, latency &lt;5 seconds acceptable), **HQQ** avoids calibration overhead.
+
+**Data-center batch inference (throughput-critical, batch size 32+):**
+
+1. Start with **SmoothQuant (W8A8)** or **SpinQuant (W4A4)** for uniform 2–4× speedup.
+2. Quantize **KV cache in FP8** as standard practice.
+3. If hardware is Blackwell-native (2026+), pilot **MXFP8** in training for 1.3× additional speedup.
+
+**Extreme compression (model archival, embedded systems):**
+
+1. Try **AQLM (1–2 bits)** for best-in-class compression, if calibration time is acceptable.
+2. Otherwise, use **HQQ (1–3 bits)** for speed without calibration.
+
+**New projects calibrated for 2025–2026:**
+
+1. Plan for **SpinQuant (full-stack W4A4)** as the default post-training recipe.
+2. Pilot **FP4 (NVFP4 or MXFP4)** on Blackwell test clusters for 2026 production.
+3. Always quantize KV cache (FP8 now, INT4 future).
+
+The field is converging on a three-tier stack: **weight-only for on-device, weight-activation for batch inference, and extreme compression for archival**. The 2024–2026 advances (QuaRot, SpinQuant, MXFP8, NVFP4) are narrowing accuracy gaps and removing hardware barriers, making quantization a first-class inference technique rather than a memory-saving hack.
+
+---
+
+## References
+
+<References>
+
+- Dettmers, T., Lewis, M., Belkada, Y., & Zettlemoyer, L. (2022). [LLM.int8(): 8-bit matrix multiplication for transformers at scale](https://arxiv.org/abs/2208.07339). *NeurIPS 2022*.
+
+- Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., & Han, S. (2023). [SmoothQuant: Accurate and efficient post-training quantization for large language models](https://arxiv.org/abs/2211.10438). *ICML 2023*.
+
+- Frantar, E., Ashkboos, S., Hoover, B., Hedges, P., & Alistarh, D. (2023). [GPTQ: Accurate post-training quantization of generative pretrained transformers](https://arxiv.org/abs/2210.17323). *ICLR 2023*.
+
+- Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang, W.-C., Xiao, G., Dang, X., Gan, C., & Han, S. (2024). [AWQ: Activation-aware weight quantization for LLM compression and acceleration](https://arxiv.org/abs/2306.00978). *MLSys 2024 (Best Paper Award)*.
+
+- Egiazarian, V., Voronin, A., Kachman, T., Sokolov, M., Sinitsin, A., Chirkova, N., Kuznedelev, D., & Fisunov, V. (2024). [Extreme compression of large language models via additive quantization](https://arxiv.org/abs/2401.06118). *ICML 2024*.
+
+- Ashkboos, S., Mohtashami, A., Azizian, W., Weil, S. A., Korolev, F., Sokolov, M., Purushothaman, R., Bitton, R., Shomron, B., Hoover, B., & Alistarh, D. (2024). [QuaRot: Outlier-free 4-bit inference in rotated LLMs](https://arxiv.org/abs/2404.00456). *NeurIPS 2024*.
+
+- Liu, Z., Zhao, Y., Shen, L., Wen, Z., Grushin, A., & Huang, G. (2025). [SpinQuant: LLM quantization with learned rotations](https://arxiv.org/abs/2405.16406). *ICLR 2025*.
+
+- NVIDIA. (2024). [Introducing NVFP4 for efficient and accurate low-precision inference](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/). *NVIDIA Developer Blog*.
+
+- NVIDIA. (2023). [Floating-point 8: An introduction to efficient, lower-precision AI training](https://developer.nvidia.com/blog/floating-point-8-an-introduction-to-efficient-lower-precision-ai-training/). *NVIDIA Developer Blog*.
+
+- Tseng, A., Yu, T., & Park, Y. (2024). [Training LLMs with MXFP4](https://assets.amazon.science/cf/c0/835ed90b4fef88f6c5ed6f6494c7/training-llms-with-mxfp4.pdf). *Amazon Science*.
+
+- vLLM Project. (2024). [Quantized KV cache documentation](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/). *vLLM Official Docs*.
+
+- Basu, T., Joshi, S., & Katti, S. (2024). [A comprehensive evaluation of quantized instruction-tuned large language models](https://arxiv.org/abs/2409.11055). *arXiv*.
+
+</References>

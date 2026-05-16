@@ -1,0 +1,103 @@
+---
+slug: 04-inference
+title: Inference and serving — orientation
+description: How to read this module, the dependency chain across chapters, the notation conventions, and what a frontier 2026 inference stack looks like.
+order: 36
+chapter: 36
+module: 4
+module_title: Inference and serving
+reading_minutes: 18
+depends_on: [03-post-training]
+provides: []
+last_reviewed: 2026-05-15
+---
+
+## About this module {#about}
+
+This module is a self-contained textbook on the engineering of frontier-LLM inference. It covers the eight clusters of decisions a serving team faces between the moment a model finishes post-training and the moment a request returns from production: how to lay out and shrink the KV cache, which decoding-time sampler to use, whether to add speculative decoding, how to schedule concurrent requests, which quantization recipe to apply, which engine to deploy on, how to constrain output to a schema, and how to architect the end-to-end deployment (prefill/decode disaggregation, KV offload, multi-LoRA, wide expert parallelism).
+
+After the eight chapters, a reader should be able to read any 2024–2026 serving disclosure — vLLM and SGLang release notes, TensorRT-LLM technical blogs, DeepSeek-V3's wide-EP inference architecture, Mooncake's KVCache-centric design — and reconstruct each engineering decision.
+
+This module does **not** teach pretraining ([Module 1](/textbook/01-pretraining)), distributed training ([Module 2](/textbook/02-distributed)), or post-training ([Module 3](/textbook/03-post-training)). It also does not cover evaluation methodology (future Module 5) or frontier-lab architecture decisions (future Module 6).
+
+<Callout variant="note" title="Calibration date">
+Content is calibrated to frontier serving practice as of May 15, 2026. The KV memory math, paged-attention algorithm, acceptance-rate equation for speculative decoding, and quantization theory are durable. The frontier-engine feature matrix, the FP8/MXFP4 production timeline, and the prefill-decode disaggregation recipes age fastest. Inference benchmarks shift with every NCCL release.
+</Callout>
+
+---
+
+## What this module covers {#chapter-list}
+
+**[Chapter 37 — KV cache and paged attention](/textbook/04a-kv-cache)**
+KV-cache memory math (~84 GB for Llama-3-70B at 128k / batch 32). The fragmentation problem and vLLM's paged-attention solution (16-token blocks, near-zero waste). KV compression: H2O (5× reduction, 29× speedup), StreamingLLM (4M+ tokens, 22.2×), SnapKV (8.2× memory), KIVI (2-bit, 8×).
+
+**[Chapter 38 — Sampling and decoding strategies](/textbook/04b-decoding-strategies)**
+From greedy and beam search through temperature, top-k, top-p / nucleus (Holtzman 2019) to the 2024–2026 frontier: min-p (Nguyen ICLR 2025 oral), DRY (Oct 2024), XTC, and entropy-based variants (Mirostat, EDT). Frontier-engine defaults and task-specific recommendations.
+
+**[Chapter 39 — Speculative decoding](/textbook/04c-speculative-decoding)**
+The draft-target framework with acceptance-rate equation $\alpha = \mathbb{E}[\min(p/q, 1)]$ and speedup $\approx 1 + k\alpha$. Speculative Sampling (2–2.5×), Medusa, EAGLE (2.7–3.5×), EAGLE-2 (3–5×), EAGLE-3 (4.1–6.5×), and Lookahead decoding. The SpecBench / SPEED-Bench evaluation framework.
+
+**[Chapter 40 — Continuous batching](/textbook/04d-continuous-batching)**
+Orca's iteration-level scheduling (36.9× throughput). vLLM's continuous batching with PagedAttention (2–23× gain). Ragged batching to eliminate the 60–80% padding waste. Preemption (swap vs recompute), throughput–latency tradeoffs, chunked prefill, and Sarathi-Serve's 2.6–5.6× capacity improvement.
+
+**[Chapter 41 — Quantization for inference](/textbook/04e-quantization)**
+The weight-only vs weight-activation axis. LLM.int8(), SmoothQuant, GPTQ (ICLR 2023), AWQ (MLSys 2024 Best Paper), AQLM (extreme 1–2 bit), HQQ (calibration-free), QuaRot (NeurIPS 2024), SpinQuant (ICLR 2025). KV-cache quantization (FP8 / INT8 / INT4). The 2026 FP8-on-H100, MXFP8 and NVFP4-on-Blackwell production landscape.
+
+**[Chapter 42 — Inference engines](/textbook/04f-frontier-engines)**
+Feature matrix across vLLM (10–16K TPS), SGLang (RadixAttention, 5–6.4× cache speedup), TensorRT-LLM, Text Generation Inference, DeepSpeed-FastGen, llama.cpp (Llama-70B 140 GB → 18 GB at 4-bit with 97.3% MMLU retention), MLX, and LMDeploy (MXFP4, 1.5× vLLM). Context-driven engine selection.
+
+**[Chapter 43 — Constrained decoding for structured output](/textbook/04g-structured-output)**
+Token-mask vs FSM-jumpforward strategies. JSON mode → OpenAI Structured Outputs (guaranteed schema compliance). Outlines, XGrammar (< 40 μs/token, default in vLLM / SGLang / TRT-LLM as of May 2026), LM Format Enforcer. JSONSchemaBench evaluation.
+
+**[Chapter 44 — Deployment architectures](/textbook/04h-deployment-architecture)**
+Prefill/decode disaggregation: Splitwise (2.35× cost-optimised throughput), DistServe (7.4× request throughput), Mooncake (75% more requests on real traces), DeepSeek-V3 wide-EP (4 nodes prefill + 320-GPU decode, 52.3k input / 22.3k output tok/s per node). Four-tier KV-offload hierarchy: HBM 6 TB/s → pinned DRAM 100 GB/s → host DRAM 80 GB/s → NVMe 7 GB/s. Multi-LoRA serving (Punica SGMV 12×, S-LoRA 10k+ adapters).
+
+---
+
+## Notation conventions {#notation}
+
+- $L$ — layer count; $H$ — attention heads; $H_{kv}$ — KV-heads under GQA.
+- $d_h$ — head dimension.
+- $T$ — sequence length (context).
+- $B$ — batch size (sequences).
+- $|KV|$ — KV cache size in bytes.
+- $\alpha$ — speculative-decoding acceptance rate; $k$ — speculation horizon.
+- $W_q$ — quantization bit-width for weights; $A_q$ — for activations; $KV_q$ — for KV cache.
+- Module-wide notation inherited from Modules 0–3: $N$ (parameters), $D$ (tokens), $C$ (FLOPs).
+
+---
+
+## Reading order recommendations {#reading-order}
+
+### First time through
+Chapters 37–44 in order. KV cache → decoding → speculative → batching are the throughput stack; quantization, engines, structured output, deployment architecture are the next layer.
+
+### For a serving engineer at a small lab
+Chapters 37, 40, 41, 42. KV math → continuous batching → quantization choices → engine selection.
+
+### For a researcher studying inference efficiency
+Chapters 39, 37, 44. Speculative decoding, KV compression, and disaggregation are where most 2024–2026 research happens.
+
+### For a deployment architect
+Chapters 44, 42, 41. Architecture first, then engines, then quantization.
+
+---
+
+## What success looks like {#success-criteria}
+
+After completing the module a reader should be able to:
+
+1. Compute KV cache memory for an arbitrary model and request shape.
+2. Predict the throughput–latency tradeoff curve under continuous batching for a given workload.
+3. Estimate speculative-decoding speedup given a draft-target pair's acceptance rate.
+4. Choose a quantization recipe given accuracy, throughput, and hardware constraints.
+5. Select an inference engine given workload characteristics.
+6. Design a prefill-decode disaggregated deployment with realistic KV-offload tiers.
+
+<Sources items={[
+  { authors: "Module 1 — Pretraining at scale", year: 2026, title: "Frontier-LLM textbook, Module 1", url: "/textbook/01-pretraining" },
+  { authors: "Module 2 — Distributed training", year: 2026, title: "Frontier-LLM textbook, Module 2", url: "/textbook/02-distributed" },
+  { authors: "Module 3 — Post-training and reasoning", year: 2026, title: "Frontier-LLM textbook, Module 3", url: "/textbook/03-post-training" },
+  { authors: "Kwon, W. et al.", year: 2023, title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM)", venue: "arXiv:2309.06180", url: "https://arxiv.org/abs/2309.06180", note: "The keystone reference for the module — paged attention, continuous batching, and the vLLM engine all stem from here." },
+  { authors: "DeepSeek-AI", year: 2024, title: "DeepSeek-V3 Technical Report", venue: "arXiv:2412.19437", url: "https://arxiv.org/abs/2412.19437", note: "Anchor for wide-EP serving and prefill-decode disaggregation." },
+]} />

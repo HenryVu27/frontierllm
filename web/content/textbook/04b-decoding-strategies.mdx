@@ -1,0 +1,569 @@
+---
+slug: 04b-decoding-strategies
+title: Sampling and decoding strategies
+description: Greedy, top-k, top-p, temperature, min-p, DRY, XTC, Mirostat, and the 2024-2026 production-default combinations.
+order: 38
+chapter: 38
+module: 4
+module_title: Inference and serving
+reading_minutes: 32
+depends_on: [00g-tokenization-and-objectives]
+provides: [greedy, top-k, top-p, min-p, temperature, dry-sampler, xtc, mirostat, sampling-defaults]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Decoding is the algorithmic interface between a language model's learned probability distribution and discrete token sequences presented to users. At each position $t$, the model outputs a probability distribution $p(\cdot \mid x_{<t})$ over vocabulary $V$. The decoding strategy is the rule for converting that distribution into a single token $x_t \in V$.
+
+The field has undergone a profound shift between 2019 and 2026, driven by empirical discovery and frontier-practice adoption:
+
+- **2019–2021:** Nucleus sampling (top-p) and temperature emerged as the standard, displacing greedy and beam search.
+- **2022–2023:** Entropy-based methods (typical sampling, EDT) and adaptive schemes (Mirostat) began addressing quality-diversity tradeoffs theoretically.
+- **2024–2026:** Min-p sampling (Nguyen et al., ICLR 2025, oral presentation) and ensemble penalties (DRY, XTC) now form the de-facto best practice in open-source inference engines (vLLM, SGLang, llama.cpp).
+
+This chapter traces the foundational methods (greedy, beam search, temperature), the truncation approaches that adapted to model confidence (top-k, top-p, min-p), repetition-control penalties (DRY, XTC), and the adaptive frontiers (Mirostat, entropy-aligned decoding). The capstone is the production-default configurations as deployed across engines in 2026, calibrated for different task types.
+
+**Key insight:** The best modern configurations are not single methods but combinations: (min-p 0.05–0.1) &lt; + (temperature 0.7–1.0) for general text; (min-p + DRY) for avoiding repetition; (min-p + XTC) for creative writing. Reasoning models lock decoding by design; do not override.
+
+---
+
+## Greedy and Beam Decoding {#greedy-beam}
+
+### Greedy decoding
+
+**Definition:** At each position, select the token with highest probability: $x_t = \arg\max_v p(v \mid x_{<t})$.
+
+**Characteristics:**
+- Deterministic; minimal latency.
+- Produces bland, generic text despite high model probability (Holtzman et al., 2019).
+- Optimal only for tasks where the model's best guess is trustworthy (constrained output, structured prediction).
+
+**The bland-text problem:** Large-scale language models trained on internet-scale diverse data have well-calibrated probability distributions where many continuations are plausible. Deterministically picking the maximum ignores this uncertainty and produces repetitive, clichéd text. For open-ended generation, the token with highest probability is often the most generic continuation — a neutral pronoun, a filler adjective, or a predictable next word. Diversity emerges from sampling the tail of the distribution.
+
+**Modern role:** Rarely used for open-ended generation. Retained in constrained decoding (guided generation, structured outputs, code synthesis with format constraints).
+
+---
+
+### Beam search
+
+**Definition:** Maintain $k$ partial sequences ordered by cumulative log-probability. At each step, expand each beam and prune to the top $k$ by cumulative score.
+
+**Historical context:** Dominant in statistical machine translation (2000s–2010s) and early neural sequence-to-sequence models (2014–2019). The standard baseline for encoder-decoder architectures like transformer-based machine translation.
+
+**Why it lost for LLMs:**
+
+1. **Speed penalty:** Beam search with $k \geq 4$ runs 1.13–1.41× slower than greedy; slowdown increases with generation length.
+2. **Quality paradox:** Beam search can miss globally higher-probability sequences if an earlier branch takes a lower-probability token followed by a flatter distribution. The greedy path may find a higher-total-probability continuation (Freitag & Al-Onaizan, 2017).
+3. **Repetition and low diversity:** Beams tend to select similar tokens at each position, producing repetitive outputs that read worse than greedy + temperature.
+4. **Probability miscalibration:** LLM probability estimates are not well-calibrated for ranking beams; high-probability beams do not guarantee better reads.
+
+**Current status:** Deprecated for open-ended generation. Retained only in structured decoding contexts (constrained beam search for parsing, grammar-guided generation).
+
+---
+
+## Temperature {#temperature}
+
+**Definition:** Scale logits by $1/T$ before softmax. As $T \to 0$, the distribution approaches argmax; as $T \to \infty$, it approaches uniform.
+
+**Mathematical form:**
+$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
+
+where $z_i$ is the logit (pre-softmax score) for token $i$.
+
+**Intuition:** Low temperature ($T &lt; 1$) concentrates probability mass on the highest logits, generating conservative, deterministic text. Medium temperature ($T \approx 0.7$–$0.9$) balances quality and diversity, the default for most commercial APIs. High temperature ($T > 1$) flattens the distribution, increasing randomness; OpenAI caps temperature at 2.0 to avoid incoherence.
+
+**Strengths:**
+- Simplest global control knob; affects all tokens equally in a principled way.
+- Interpretable: directly modulates perceived confidence.
+
+**Limitations:**
+- Naive tool: temperature alone does not address the long-tail problem. Increasing $T$ flattens both signal (good continuations) and noise (nonsense tokens) equally.
+- **Temperature coupling:** When combined with truncation methods (top-p, top-k), changing $T$ inadvertently changes which tokens survive truncation, conflating randomness with diversity.
+- Unstable at high $T$: Very flat distributions are brittle to small logit changes; tiny perturbations in a 20-way near-tie can flip which token wins the sample.
+
+**Common defaults:**
+- $T = 1.0$: OpenAI GPT-4 API baseline.
+- $T = 0.7$: OpenAI GPT-3.5 API, general-purpose default.
+- $T = 0$: Reasoning models, code generation where determinism is prized.
+
+---
+
+## Top-K Sampling {#top-k}
+
+**Definition:** Keep only the $k$ tokens with highest probability; renormalise and sample.
+
+**Motivation:** The true next-token distribution is sparse in most cases. The long tail of low-probability tokens contributes mostly noise; filtering it removes spurious alternatives.
+
+**Characteristics:**
+- Fixed $k$ per step; does not adapt to model confidence.
+- Typical defaults: $k = 50$ for balanced tasks; $k = 100$–$200$ for diverse, open-ended generation.
+- Fast implementation; simple integration.
+
+**Static truncation flaw:** When the model is confident ($p_1 = 0.8$, $p_2 = 0.05$), top-$k=50$ still includes 49 near-zero tokens, adding noise. When uncertain ($p_1 = p_2 = \cdots = p_{50} = 0.02$), the nucleus is already exhausted and top-$k$ is not reducing noise, merely truncating arbitrarily.
+
+**Modern status:** Largely superseded by top-p and min-p. Retained in legacy systems and as a building block for hybrid schemes (e.g., top-k applied after other samplers).
+
+---
+
+## Top-P (Nucleus Sampling) {#top-p}
+
+**Definition:** Include tokens in decreasing probability order until the cumulative probability exceeds $p$; renormalise and sample.
+
+**Key innovation:** Adapts truncation dynamically to model confidence. When the model is confident, the nucleus is small; when uncertain, the nucleus is larger.
+
+**Algorithm:**
+1. Sort tokens by $p(x_t)$ in descending order.
+2. Accumulate probabilities in order until cumulative sum exceeds $p$.
+3. Zero out all probabilities outside this nucleus.
+4. Renormalise and sample.
+
+**Mathematical form:**
+$$\text{nucleus} = \{v \in V : \sum_{u \in V, p(u) \geq p(v)} p(u) \leq p\}$$
+
+**Interpretation:** The nucleus is the minimal set of tokens accounting for approximately $p$ fraction of the probability mass (e.g., 95% for $p=0.95$). This discards the unreliable tail of low-probability tokens while preserving diversity when the model is uncertain.
+
+**Empirical findings (Holtzman et al., 2019):**
+
+Nucleus sampling produces more coherent, diverse text than top-$k$. Combined with temperature scaling, it achieves state-of-the-art quality-diversity tradeoff. The original paper states: "Nucleus sampling better demonstrates the quality of human text, yielding enhanced diversity without sacrificing fluency and coherence."
+
+**Common defaults:**
+- $p = 0.90$–$0.95$: General-purpose text generation.
+- $p = 0.95$–$0.99$: Conservative generation, knowledge-intensive tasks.
+- $p = 0.85$–$0.90$: Creative writing, storytelling.
+
+**Discovered limitations (2022–2024):**
+
+1. **Flat-distribution flaw:** At high temperature or for inherently uncertain models, top-p includes too many tokens. In a flat region where $p_1 = p_2 = \cdots = p_k \approx 1/k$, top-p includes all $k$ tokens even though no single token is particularly confident. Min-p and entropy-based methods (see below) address this.
+
+2. **Temperature coupling:** Changing $T$ changes which tokens survive truncation, not merely their relative probability. The cumulative probability threshold is independent of temperature, but which tokens reach that threshold shifts with $T$-induced logit rescaling.
+
+**Adoption:** Industry standard through 2024; still the default on commercial APIs (OpenAI, Anthropic, Google). Increasingly replaced by min-p in open-source inference (vLLM 0.5+, SGLang, llama.cpp).
+
+**Reference:** Holtzman et al. (2019), "The Curious Case of Neural Text Degeneration," *ICLR 2020*, arXiv:1904.09751.
+
+---
+
+## Min-P Sampling {#min-p}
+
+**Definition:** Scale the truncation threshold to the top token's probability. Include tokens with $p(x_t) \geq m \times \max_v p(v \mid x_{<t})$, where $m \in [0, 1]$ is the min-p parameter.
+
+**Algorithm:**
+```
+max_prob = max(p)
+min_threshold = m * max_prob
+keep tokens where p(x_t) >= min_threshold
+renormalise and sample
+```
+
+**Key innovations:**
+
+1. **Confidence-aware truncation:** When the model is confident ($\max p = 0.8$), only tokens with $p \geq 0.05 \times 0.8 = 0.04$ survive (for $m=0.05$). When uncertain ($\max p = 0.1$), the threshold drops to $0.05 \times 0.1 = 0.005$, allowing more diversity proportionally.
+
+2. **Temperature-invariant nucleus size:** Changing temperature does not alter the truncation ratio. Temperature rescales all logits equally, so the ratio between max probability and threshold scales proportionally, keeping the nucleus size approximately constant. This decouples randomness (temperature) from diversity (min-p).
+
+3. **Practical parameter range:** $m = 0.05$–$0.10$ yields best results across benchmarks. $m = 0.01$ approximates greedy; $m = 1.0$ approaches uniform sampling.
+
+**Empirical results (ICLR 2025 oral, Nguyen et al.):**
+
+Evaluated on GPQA (difficult QA), GSM8K (math reasoning), and AlpacaEval (creative writing) across model families (Mistral 7B–123B, Llama 3 1B–70B):
+
+- **Quality:** Min-p outperforms top-p, top-k, and greedy across all benchmarks.
+- **Temperature handling:** Particularly effective at $T > 1.0$, where top-p begins to fail (the nucleus becomes too large).
+- **Human preference:** Clear preference for min-p in both text quality and creativity metrics.
+
+**Recommended configurations:**
+- $m = 0.05$ for creative writing (maximum diversity).
+- $m = 0.10$ for general-purpose text (balanced default).
+- $m = 0.15$ for factual, analytical tasks (conservative).
+
+**Adoption:** Implemented in Hugging Face Transformers (2024+), vLLM (0.5+, 2025), SGLang (2025), llama.cpp. Now the default sampler in open-source inference by 2026.
+
+**Critical context:** Recent critique (arXiv 2506.13681, "Turning Down the Heat: A Critical Analysis of Min-p Sampling") questions reproducibility of some claims. However, consensus among practitioners is that min-p substantially outperforms top-p in empirical deployments.
+
+**Reference:** Nguyen et al. (2024), "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs," *ICLR 2025* (Oral, paper &lt;31888), arXiv:2407.01082.
+
+---
+
+## DRY Sampling {#dry}
+
+**Definition:** Detect n-gram repetition and penalise tokens that would extend the input into previously seen n-grams. Penalty scales exponentially with repetition count.
+
+**Algorithm:**
+```
+For token x_t:
+  if (x_{t-n+1}...x_t) appears in input as prefix:
+    z_{x_t} ← z_{x_t} - base^(times_seen) * length_bonus
+```
+
+where `base` (default &lt; 1.75) is the exponential scaling factor and `length_bonus` adjusts penalty by n-gram length.
+
+**Characteristics:**
+- **Context-aware:** Penalises literal verbatim repetition, not legitimate reuse (pronouns, common words in different contexts).
+- **Exponential scaling:** Frequent offenders (3+ times) are suppressed hard; occasional repeats (first occurrence) have mild or zero penalty.
+- **Configurable:** `dry_base` (typical 1.75–2.0) and `dry_allowed_length` (typical 4–16 tokens, the minimum n-gram length to penalise).
+
+**Empirical findings:**
+
+Prevents looping and verbose repetition without degrading language structure. Far superior to simple frequency penalties, which suppress pronouns and necessary reuse. In practice, DRY eliminates the "stuck loop" failure mode where models repeat the same phrase 5+ times in sequence.
+
+**Adoption:** Implemented in oobabooga/textgen (Oct 2024), llama.cpp, SGLang. Now standard in open-source deployments for long-context generation.
+
+**Typical usage:** Combined with min-p and temperature for general-purpose text. Often paired with `--sampling-seq m d t` (min-p, then DRY, then temperature sample) in llama.cpp.
+
+**Reference:** DRY Sampler PR, oobabooga/textgen#5677 (Oct 2024); LLM Sampling Parameters Guide (2025).
+
+---
+
+## XTC Sampler {#xtc}
+
+**Definition:** With probability $p_{\text{xtc}}$, remove the top tokens (those with $p > \text{threshold}_{\text{xtc}}$) and sample from the remainder; otherwise, sample normally.
+
+**Algorithm:**
+```
+if random() < p_xtc:
+  remove tokens where p(x_t) >= threshold_xtc
+  sample from remainder
+else:
+  sample from full distribution
+```
+
+**Purpose:** Break writing clichés and force exploration of less obvious continuations. When applied probabilistically, it avoids harsh surprises while allowing the model to occasionally deviate from the obvious choice.
+
+**Parameters:**
+- `xtc_probability` (default 0.5): Frequency of applying exclusion; 0.5 means "apply to every other token on average."
+- `xtc_threshold` (default 0.15): Which tokens to exclude (top tokens above this probability).
+
+**Recommended combination:** Min-p &lt; + XTC with defaults: `--sampling-seq mx --min-p 0.02 --xtc-probability 0.5`.
+
+**Empirical status:** Emerging best practice for creative writing. Not yet well-studied in peer-reviewed literature, but widely used in open-source and community models (2024–2026) with strong anecdotal results.
+
+---
+
+## Mirostat {#mirostat}
+
+**Definition:** Adaptive top-$k$ decoding that maintains a target perplexity by dynamically adjusting $k$ based on recent token surprisal (information content).
+
+**Algorithm:**
+```
+1. Set target perplexity τ (e.g., 5.0–10.0).
+2. At each step, compute the surprisal of the sampled token: s = -log(p).
+3. If recent-average surprisal > log(τ), reduce k (generate more conservatively).
+4. If recent-average surprisal < log(τ), increase k (allow more diversity).
+```
+
+**Key insight:** Perplexity is a principled information-theoretic quality metric. By controlling perplexity directly, Mirostat sidesteps heuristic choices like top-$p$ or temperature.
+
+**Characteristics:**
+- Theoretically principled; grounded in information theory.
+- Parameter: target perplexity $\tau$ (default 5.0–10.0 for fluent text).
+- More stable than fixed temperature at balancing quality and diversity.
+
+**Limitations:**
+- Computational overhead: requires tracking and adjusting $k$ at each step.
+- Requires tuning $\tau$ (less intuitive than temperature).
+- Adoption slower than min-p; simpler methods (min-p) perform comparably with less tuning.
+
+**Current status:** Active research frontier 2023–2026. Interest from llama.cpp and vLLM (feature requests), but not yet default. May see revival as entropy-aligned decoding matures.
+
+**Reference:** Gao et al. (2020), "Mirostat: A Neural Text Decoding Algorithm that Directly Controls Perplexity," arXiv:2007.14966.
+
+---
+
+## Entropy-Aligned and Frontier Methods {#comparison}
+
+### Typical Sampling
+
+Select tokens with information content (surprisal, $-\log p$) close to the expected information content of the distribution. Intuition: natural language text has entropy close to the true entropy of the underlying distribution; sampling "typical" tokens matches this natural information content.
+
+**Characteristics:**
+- Competitive with top-p and top-k on story generation and summarization.
+- Consistently reduces repetitions.
+- Requires computing entropy, slightly higher computational cost than truncation methods.
+
+**Status:** Theoretical interest; not widely deployed. Subsumed by min-p and entropy-aligned methods in practice.
+
+---
+
+### Entropy-Based Dynamic Temperature (EDT)
+
+Dynamically adjust temperature at each step based on the entropy of the current probability distribution:
+
+$$T_t = T_{\text{base}} \times \frac{H_t}{H_{\text{target}}}$$
+
+where $H_t = -\sum p_i \log p_i$ is the distribution entropy.
+
+**Rationale:** High-entropy steps (uncertain model) warrant higher temperature; low-entropy steps (confident model) use lower temperature to avoid noise.
+
+**Status:** Academic interest; not widely adopted. Subsumed by min-p &lt; + DRY in practice (min-p is simpler, min-p + DRY handles repetition directly).
+
+---
+
+### Entropy-Aligned Decoding (Epic, 2026)
+
+Explicitly regulate the entropy of the sampling distribution at each step to match a target entropy profile. Different parts of the task have different uncertainty; aligning entropy to task-dependent targets improves coherence.
+
+**Approaches:**
+- **REAL Sampling:** Predict step-wise likelihood of hallucination; lower $p$-threshold adaptively.
+- **Epic:** Align sampling distribution entropy to aleatoric (data) uncertainty, capturing irreducible uncertainty of plausible continuations.
+- **RAG variants:** Ensemble low-entropy distributions from retrieved documents; contrast with high-entropy internal knowledge.
+
+**Status:** Frontier 2024–2026; active research. Not yet in mainstream inference engines. Expected to see adoption 2026–2027 for reasoning and retrieval-augmented generation.
+
+---
+
+## Production Defaults and Best Practices {#defaults}
+
+### Open-Source Inference Engines (2026)
+
+**vLLM (NVIDIA, October 2025)**
+
+Default sampler: Min-P.
+
+```
+--sampling-method min-p --min-p 0.05 --temperature 0.7
+```
+
+For repetition control, add DRY:
+```
+--repetition-penalty 1.1  (legacy)
+or sampler chain with DRY if supported
+```
+
+For creative tasks:
+```
+--min-p 0.02 --temperature 1.0 --xtc-probability 0.5
+```
+
+---
+
+**SGLang (LMSYS, 2025)**
+
+Default: Min-P (high performance priority).
+
+Advanced sampler chains supported:
+```
+samplers=['min_p', 'dry']
+min_p=0.05, dry_base=1.75
+```
+
+Speculative decoding compatible; does not affect sampler choice.
+
+---
+
+**llama.cpp (ggml, ongoing)**
+
+Default: Top-P (backward compatibility); min-p available via flag.
+
+Modern recommended configuration:
+```
+llama-cli -m model.gguf \
+  --sampling-seq m t d \
+  --min-p 0.05 \
+  --temperature 0.7 \
+  --dry-base 1.75 --dry-allowed-length 4
+```
+
+Flags: `--repeat-penalty`, `--dry-penalty` available.
+
+---
+
+**Hugging Face Transformers**
+
+Default: Top-P (backward compatibility).
+
+Min-P now available:
+```python
+outputs = model.generate(
+  input_ids,
+  max_new_tokens=...,
+  temperature=0.7,
+  top_p=0.95,  # for legacy
+  # or: min_p=0.05
+)
+```
+
+Penalty: `repetition_penalty=1.1` or `apply_sampler='min_p'`.
+
+---
+
+### Task-Specific Configurations (2026)
+
+#### General-Purpose Text Generation
+```
+temperature: 0.7–0.8
+min-p: 0.05–0.10
+repetition_penalty: 1.0 (none) or DRY
+top_p: 0.95 (legacy APIs) or min-p: 0.05 (OSS)
+```
+
+Rationale: Min-p is now the gold standard. Temperature 0.7–0.8 balances quality and diversity. No aggressive penalties needed.
+
+---
+
+#### Creative Writing and Storytelling
+```
+temperature: 1.0–1.2
+min-p: 0.02
+xtc_probability: 0.5 (if available)
+dry_base: 1.75
+```
+
+Rationale: Higher temperature + low min-p + XTC breaks clichés. DRY prevents repetition loops without suppressing legitimate reuse.
+
+---
+
+#### Factual Q&A and Knowledge Retrieval
+```
+temperature: 0.3–0.5
+min-p: 0.10–0.15
+repetition_penalty: 1.0
+```
+
+Rationale: Lower temperature reduces hallucination risk. Higher min-p threshold prunes low-confidence tokens. No special repetition control needed.
+
+---
+
+#### Code Generation
+```
+temperature: 0.0 (deterministic, often best) or 0.1–0.3
+min-p: 0.05–0.10
+top_p: 0.95
+```
+
+Rationale: Low or zero temperature for consistent, predictable code. Some models benefit from $T = 0.1$ for minor variation without sacrificing correctness.
+
+---
+
+#### Reasoning and Math (GSM8K, MATH)
+```
+temperature: 0.0 or 1.0 (model-specific)
+min-p: 0.05 (for ensemble sampling)
+Reasoning models: Locked by design (e.g., OpenAI o1, Anthropic Claude Sonnet reasoning mode)
+```
+
+Rationale: Reasoning models are trained with specific decoding; do not override. For base models, $T = 0$ is often best; emerging evidence for $T = 1.0$ + test-time scaling (sample multiple paths, select by majority or confidence).
+
+---
+
+#### Long-Context Generation (&lt; 4k tokens)
+```
+temperature: 0.7–0.8
+min-p: 0.05
+mirostat (or entropy-aligned): optional
+DRY: strongly recommended
+```
+
+Rationale: Long generation amplifies repetition risk. DRY is essential for preventing loops over 10k+ tokens. Entropy-aligned methods (Mirostat, Epic) emerging as frontier for maintaining coherence.
+
+---
+
+### Commercial API Defaults (2026)
+
+| **Provider** | **Default T** | **Supports** | **Best for** |
+|---|---|---|---|
+| OpenAI (GPT-4 Turbo, 4o) | 1.0 | Temp, Top-P | T=0.7, top_p=0.9 (general); T=0 (reasoning/code) |
+| Anthropic (Claude Sonnet 3.5) | 1.0 | Temp, Top-P, Top-K | T=1.0, top_p=0.95 (default); T=0.5 (factual) |
+| Google (Gemini 2.0) | 1.0 | Temp, Top-P, Top-K | T=0.9, top_p=0.95 |
+| Anthropic (Claude reasoning mode) | Locked | — | Do not override |
+
+**Note:** Commercial APIs do not yet expose min-p, DRY, or entropy-aligned methods. Top-P remains the best truncation option for legacy APIs.
+
+---
+
+## Comparison and Selection {#comparison}
+
+| **Method** | **Type** | **Adaptive** | **Quality** | **Diversity** | **Adoption (2026)** | **Best For** |
+|---|---|---|---|---|---|---|
+| Greedy | Deterministic | — | Low (generic) | None | Legacy | Constrained output, structured decoding |
+| Beam Search | Deterministic | — | Low (repetitive) | Low | Deprecated | Seq2seq (legacy) |
+| Temperature | Stochastic | No | Medium | Medium | Moderate | Simple baseline |
+| Top-K | Truncation | No | Medium | Medium | Low | Legacy baseline |
+| Top-P (nucleus) | Truncation | Dynamic | High | High | High | Commercial APIs (still default) |
+| Min-P | Truncation | Dynamic | **Highest** | **Highest** | **Dominant (OSS)** | General purpose (2024–2026 frontier) |
+| Top-A | Truncation | Dynamic | Medium-high | Medium-high | Very low | Niche |
+| + Repetition penalty | Modifier | — | Medium | Medium | Very low | Verbose output (replaced by DRY) |
+| + DRY | Modifier | Dynamic | High | High | **High (OSS)** | Avoid repetition, prevent loops |
+| + XTC | Modifier | Stochastic | High | **Very high** | Medium | Creative writing |
+| Typical | Entropy-based | Dynamic | High | High | Very low | Theoretical interest |
+| EDT | Adaptive | Dynamic | High | High | Very low | Research |
+| Mirostat | Adaptive | Dynamic | **Highest** (principled) | High | Very low | Research frontier |
+| REAL / Epic | Entropy-aligned | Dynamic | Highest (task-specific) | Medium-high | Emerging | Reasoning, RAG |
+
+---
+
+## Summary {#summary}
+
+Decoding is the bridge between learned probability distributions and user-facing text. The field has matured dramatically:
+
+**Deprecated:** Greedy and beam search are suboptimal for open-ended generation except in constrained settings.
+
+**Standard baseline:** Top-p (nucleus) sampling remains the academic reference and commercial API default, but is now understood to have fundamental limitations (flat-distribution flaw, temperature coupling).
+
+**Frontier (2024–2026):** Min-p sampling (Nguyen et al., ICLR 2025, oral) is the open-source standard: simpler, more adaptive, empirically superior. Adoption in vLLM, SGLang, and Hugging Face Transformers validates the shift.
+
+**Composite best practices:** Repetition control (DRY) and diversity boosting (XTC) are no longer traded off separately; they are integrated into production configurations.
+
+**Research frontier:** Entropy-based and adaptive methods (Mirostat, EDT, Epic) are the cutting edge. Likely to see increased adoption 2025–2027 for reasoning, long-context, and RAG applications.
+
+**Reasoning models:** An exception by design. Reasoning models (OpenAI o1, Anthropic Claude Sonnet reasoning) lock decoding deliberately to enforce search or chain-of-thought behaviour. Do not override.
+
+**Production reality:** The best 2026 configuration is (min-p 0.05) + (temperature 0.7) + (DRY 1.75) for general text; adjust min-p downward for creativity, upward for factuality. Commercial APIs remain at top-p for backward compatibility; open-source is the frontier.
+
+---
+
+## Cross-References
+
+- **Chapter 00g (Tokenization):** How vocabulary size and tokenizer choice interact with decoding (long tokens vs. short tokens).
+- **Chapter 03 (Post-Training):** Instruction tuning and decoding: model behaviour under different sampling regimes.
+- **Chapter 05 (Scaling Laws):** Does model scale affect optimal decoding parameters? (Emerging evidence: yes, larger models may prefer min-p over top-p.)
+- **Chapter 06 (Inference Optimization):** Latency and throughput tradeoffs of sampler choices; speculative decoding independence from sampler type.
+
+---
+
+## Further Reading and Citations
+
+1. Holtzman, A., Buys, J., Du, L., Forbes, M., & Choi, Y. (2019). "The Curious Case of Neural Text Degeneration." *ICLR 2020*, arXiv:1904.09751. Foundational; introduces nucleus sampling; identifies bland-text problem.
+
+2. Nguyen, M. N., Thawani, A., Dhuliawala, S., Turian, J., & Raffel, C. (2024). "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs." *ICLR 2025 (Oral)*, arXiv:2407.01082. Frontier; strong empirical results; now standard in OSS engines.
+
+3. Gao, X., Wu, Y., Zhang, S., Li, Y., Deng, N., Lerman, K., Spokoyny, A., Xiong, C., & Zhang, Y. (2020). "Mirostat: A Neural Text Decoding Algorithm that Directly Controls Perplexity." arXiv:2007.14966. Principled; adaptive decoding via perplexity control; lower adoption than min-p.
+
+4. Freitag, M., & Al-Onaizan, Y. (2017). "Beam Search Gone Wrong: Why Beam Search Sometimes Fails in Decoding." *EMNLP 2017*. Explains why beam search can miss globally optimal sequences.
+
+5. "A Thorough Examination of Decoding Methods in the Era of LLMs." (2024). arXiv:2402.06925. Comprehensive review of greedy, beam, and sampling methods.
+
+6. DRY Sampler PR. oobabooga/textgen#5677 (Oct 2024). Implementation and discussion of Don't Repeat Yourself penalty.
+
+7. LLM Sampling Parameters Guide. smcleod.net (Apr 2025). Practical parameter recommendations; DRY, XTC, min-p combinations.
+
+8. "EDT: Improving Large Language Models' Generation by Entropy-based Dynamic Temperature Sampling." (2024). arXiv:2403.14541. Dynamically adjust temperature via distribution entropy.
+
+9. "REAL Sampling: Boosting Factuality and Diversity of Open-ended Generation by Extrapolating the Entropy of an Infinitely Large LM." (2024). arXiv:2406.07735. Predict hallucination risk; adaptive p-threshold.
+
+10. "Entropy-Aligned Decoding of LMs for Better Writing and Reasoning." (2026). arXiv:2601.01714. Epic sampler; align entropy to task-dependent targets.
+
+11. "Turning Down the Heat: A Critical Analysis of Min-p Sampling in Language Models." (2025). arXiv:2506.13681. Critical analysis of min-p claims; ongoing debate on reproducibility.
+
+12. vLLM Documentation. vllm.readthedocs.io. Min-p, top-p, temperature parameters; sampler configuration.
+
+13. SGLang Documentation. docs.sglang.ai. Sampler chains, speculative decoding, decoding parameters.
+
+14. llama.cpp README. github.com/ggml-org/llama.cpp. Sampling parameters, DRY, repetition penalties.
+
+15. Hugging Face Transformers — Text Generation. huggingface.co/docs/transformers. Top-p, top-k, temperature, min-p in practice.
+
+---
+
+**Notation and Definitions**
+
+- $p(x_t \mid x_{<t})$: Probability distribution over vocabulary at step $t$, conditioned on preceding tokens.
+- $z_t$: Logits (pre-softmax scores); proportional to log-odds.
+- $T$: Temperature scaling parameter; applied as $z_t \to z_t / T$ before softmax.
+- $p$ (top-p): Cumulative probability cutoff; include tokens until cumulative probability exceeds $p$.
+- $m$ (min-p): Relative threshold; include tokens with $p(x_t) \geq m \times \max(p)$.
+- **Nucleus:** The set of tokens included after truncation.
+- $H$: Entropy of a distribution; $H = -\sum p_i \log p_i$ (in nats).
+- **Surprisal:** Information content of a token; $s = -\log p$.
+- **Perplexity:** Geometric mean of per-token surprisal; $\text{PPL} = \exp(-\sum \log p_i / N)$.
+- **Sampler chain:** Sequential application of samplers (e.g., min-p → DRY → sample).

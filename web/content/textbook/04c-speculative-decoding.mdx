@@ -1,0 +1,300 @@
+---
+slug: 04c-speculative-decoding
+title: Speculative decoding
+description: Draft-target framework, Speculative Sampling, Medusa, EAGLE-1/2/3, Lookahead decoding, and the 2–6.5x production speedups.
+order: 39
+chapter: 39
+module: 4
+module_title: Inference and serving
+reading_minutes: 28
+depends_on: [04a-kv-cache, 04b-decoding-strategies]
+provides: [speculative-decoding, draft-target, medusa, eagle, lookahead, acceptance-rate]
+last_reviewed: 2026-05-15
+---
+
+## Orientation {#orientation}
+
+Autoregressive inference is fundamentally sequential: each forward pass through the target model generates one token, which becomes the input for the next step. For large models (70B+ parameters), even with aggressive optimizations—quantization, batching, KV cache reuse—the bottleneck is arithmetic intensity. Each forward pass loads the entire model weights from HBM into GPU compute, but produces only one token of output. The amortized cost per token is high because the computational work is low-intensity relative to the memory movement.
+
+Speculative decoding solves this bottleneck by parallelizing within a single forward pass. Instead of waiting for the target model to generate one token, a smaller draft model generates k candidate tokens ahead, then a single forward pass through the target model verifies all k candidates in parallel. The key insight is that multiple token positions can be scored simultaneously if their representations are pre-computed—and speculative decoding ensures the output distribution is preserved exactly (up to numerical precision), despite the two-stage process.
+
+This chapter develops the theory and practice of speculative decoding as of May 2026. The first section establishes the draft-target framework and the acceptance-rate equation that governs speedup. The next sections cover the three foundational methods: Speculative Sampling (Chen et al., DeepMind 2023), Fast Speculative Decoding (Leviathan et al., Google 2023), and their theoretical underpinnings. The chapter then traces the evolution of specialized architectures—Medusa (in-model heads), EAGLE and its variants (feature-level prediction), and Lookahead (model-agnostic parametric approach)—detailing how each trades off simplicity, efficiency, and speedup. Production speedup ranges are presented verbatim from benchmarks, along with acceptance-rate dependencies on model size, temperature, and task predictability. The final sections address real-world deployment trade-offs, including memory, throughput, and orchestration challenges.
+
+The chapter assumes familiarity with KV caching ([Chapter 04a](/textbook/04a-kv-cache)) and basic decoding strategies ([Chapter 04b](/textbook/04b-decoding-strategies)). It forward-references batching and scheduling for serving systems ([Chapter 04d](/textbook/04d-batching-serving)).
+
+---
+
+## Draft-target framework {#draft-target}
+
+### The two-stage pipeline
+
+Speculative decoding decomposes inference into two recurring stages, applied in sequence over the output sequence:
+
+**Stage 1: Drafting.** A small, fast draft model generates k speculative tokens sequentially. Because the draft model is compact—often a 7B or 13B model when the target is 70B—this stage is cheap. The draft tokens are produced autoregressively: token 1 is sampled, then used to condition token 2, and so on. The draft model runs fully in GPU memory and typically achieves high throughput per token because of its small parameter count.
+
+**Stage 2: Verification.** All k draft tokens are presented to the target model in a batch. The target model computes logits for each draft position in parallel using a modified KV-cache structure (detailed in Chapter 04a). The target model's probability distribution at each position is compared to the draft's distribution, and a probabilistic acceptance criterion decides whether each token is kept or rejected. The key mathematical insight—presented in §Acceptance rate—is that this acceptance rule can be designed to preserve the target distribution exactly.
+
+### Model pairing strategies
+
+The draft model can be chosen from four categories:
+
+| Strategy | Implementation | Pros | Cons |
+|----------|---|---|---|
+| **Smaller LLM** | Llama-7B for Llama-70B; Llama-13B for Llama-405B | Works with any pre-trained model; no modification needed | Dual-model memory overhead; requires maintaining two inference runtimes |
+| **Quantized/distilled target** | 4-bit or LoRA-finetuned version of target | Better feature alignment; reduces memory overhead | Requires offline distillation or quantization step |
+| **Medusa heads** | Auxiliary prediction heads on target layers (detailed below) | Single model; no memory duplication; integrates in existing pipelines | Requires target-model modification and fine-tuning |
+| **EAGLE / lookahead** | Feature prediction or parametric approach (detailed below) | Feature-level or model-agnostic; often higher speedup | More complex integration; fewer open-source implementations |
+
+The choice depends on deployment constraints. In environments where model memory is abundant (multi-GPU servers), the smaller-LLM approach is simplest. In single-GPU or edge deployments, Medusa or EAGLE headers are preferred because they avoid duplicating the target model.
+
+### Losslessness by design
+
+A critical property of speculative decoding is that it is **provably lossless**: the marginal distribution of tokens in the final sequence exactly matches sampling directly from the target model, without the draft stage. This is not an approximation or a useful fiction; it is a mathematical guarantee (up to floating-point rounding).
+
+The mechanism is rejection sampling with reweighting. When the draft proposes token $x$ with probability $q(x)$, but the target assigns it probability $p(x)$, the acceptance rule is:
+
+- Accept $x$ with probability $\min(1, p(x) / q(x))$
+- If rejected, resample from the residual distribution $p'(x) \propto \max(0, p(x) - q(x))$
+
+This ensures that the marginal probability of $x$ in the output is exactly $p(x)$, regardless of the draft quality. The proof is a standard result in rejection sampling theory and is detailed rigorously in Chen et al. (2023).
+
+---
+
+## Acceptance rate and speedup {#acceptance-rate}
+
+### Defining acceptance rate
+
+The **acceptance rate α** is the fraction of draft tokens that are accepted by the target model. Formally:
+
+$$\alpha = \mathbb{E}_{x \sim q} \left[ \min\!\left(1, \frac{p(x)}{q(x)}\right) \right]$$
+
+where $q(x)$ is the draft's probability of token $x$ and $p(x)$ is the target's probability. This expectation is taken over the draft distribution, averaging across all draft tokens in a sequence.
+
+Intuitively, α measures how well the draft model's predictions align with the target. A high-quality draft (α ≈ 0.8) means most proposals pass verification; a poor draft (α ≈ 0.3) causes frequent rejections and fallback to sequential generation.
+
+### Speedup scaling
+
+For k speculative tokens with acceptance rate α, the expected speedup relative to baseline (one token per forward pass) is approximately:
+
+$$\text{Speedup} \approx 1 + k \cdot \alpha$$
+
+This comes from the fact that with probability α, all k draft tokens are accepted and the verification step covers k tokens; the remaining probability 1 − α involves resampling and conditional continuation. The approximation is tight for α &lt;  0.9 and k &lt;  8, and the formula provides a useful mental model for speedup potential.
+
+With typical configurations:
+- k = 5, α = 0.6 → Speedup ≈ 1 + 5(0.6) = 4.0x
+- k = 5, α = 0.8 → Speedup ≈ 1 + 5(0.8) = 5.0x  
+- k = 3, α = 0.5 → Speedup ≈ 1 + 3(0.5) = 2.5x
+
+The speedup plateaus as α decreases (because most proposals are rejected) or as k increases beyond the target context window. In practice, the cross-derivative matters: increasing k while α stays constant yields diminishing returns per additional speculative token, so most production systems use k ∈ [3, 8].
+
+### Factors controlling acceptance rate
+
+In practice, α depends on four controllable or observable factors:
+
+1. **Model size gap.** Smaller drafts have lower α. A 7B draft for a 70B target typically achieves α ≈ 0.6–0.7; a 13B draft for the same target achieves α ≈ 0.75–0.85.
+
+2. **Temperature.** Acceptance rates drop sharply with temperature. At temperature τ = 0 (greedy, argmax), α ≈ 0.85–0.95. At τ = 1.0 (standard sampling), α ≈ 0.5–0.7. At τ > 1.5, α → 0 rapidly and speculative decoding becomes inefficient.
+
+3. **Task predictability.** Deterministic tasks (summarization, code completion given a clear spec) have high α; open-ended tasks (creative writing, brainstorming) have low α.
+
+4. **Speculative depth k.** Single-token prediction (k = 1) achieves very high α (often &gt; 0.85), but yields minimal speedup by definition. At k = 5, α typically drops by 10–30 percentage points from the k = 1 baseline.
+
+This decomposition is useful for diagnosing performance: if speedup is lower than expected, measure α and compare to the formula 1 + kα. If α is higher than observed speedup suggests, the bottleneck is verification-stage latency, not rejection sampling. If α is lower, focus on draft-model quality.
+
+---
+
+## Speculative Sampling {#speculative-sampling}
+
+Chen et al. (2023, arXiv:2302.01318) at DeepMind formalized speculative sampling as a theoretically grounded algorithm and demonstrated its effectiveness at scale. The paper's main contributions:
+
+**Correctness proof.** A rigorous proof that the rejection-sampling-with-reweighting scheme preserves the target distribution exactly, with explicit handling of numerical stability.
+
+**Practical algorithm.** Detailed pseudocode and discussion of implementation details: how to handle the residual distribution when a token is rejected, how to batch multiple resampling operations, and how to implement tree structures for k > 1 tokens.
+
+**Empirical results on Chinchilla-70B.** With a 7B draft model, the paper reports **2–2.5x speedup** at temperature 0. The speedup degrades with temperature (α ≈ 0.5 at τ = 1.0), consistent with the acceptance-rate formula.
+
+**Hardware alignment.** Crucially, Chen et al. demonstrate that the overhead of rejection sampling (computing min(1, p/q) and conditionally resampling) is negligible—on the order of a few percent of the GPU kernel time for the target forward pass. This was not obvious *a priori*, because rejection sampling involves per-token branching logic. The paper's experimental data showed that on modern GPUs (A100s, H100s), the latency of the verification stage is dominated by the matrix multiplication for the forward pass, not the rejection logic. This finding validated the practical viability of the approach.
+
+The paper's formulation is the gold standard for correctness; nearly every subsequent method (Medusa, EAGLE, Lookahead) cites Chen et al. for the theoretical foundation and builds on the acceptance-rate framework.
+
+---
+
+## Fast Speculative Decoding {#fast-speculative}
+
+Concurrently with Chen et al., Leviathan et al. (2023, arXiv:2211.17192) at Google developed speculative decoding with emphasis on practical deployment with unmodified models. The main contributions:
+
+**Model-agnostic instantiation.** The paper demonstrates that speculative decoding works with any off-the-shelf model pair. Take Llama-7B as draft for Llama-70B; no retraining, no modification. This made the approach immediately actionable for practitioners with existing model deployments.
+
+**Speedup on production hardware.** Leviathan et al. report **2–3x speedup** on inference servers using Llama-70B with Llama-7B draft. The range reflects different temperature and batch-size regimes; single-request latency achieved 2.5–3x, while high-throughput batching (many concurrent requests) achieved 2–2.2x due to lower average α in high-throughput serving.
+
+**Insight on language structure.** The paper motivates speculative decoding by observing that language is often structured such that later context constrains earlier choices. In other words, the early tokens in a sequence are often easier to predict than the later tokens—a principle that had been observed in language-modeling literature (Jurafsky & Martin) but not exploited for inference speedup before. This observation explains why a smaller, "easier-prediction" draft model can propose tokens that a larger model accepts frequently.
+
+The Leviathan et al. paper established the practical playbook: pick any smaller model, run it as draft, and expect 2–3x speedup in typical serving scenarios. The simplicity of this approach made it the first method widely adopted in production systems (vLLM, SGLang, TensorRT-LLM all shipped Leviathan-style speculative sampling first).
+
+---
+
+## Medusa: In-Model Prediction Heads {#medusa}
+
+Cai et al. (2024, arXiv:2401.10774) identified a key friction in the draft-target approach: maintaining two separate models requires duplicate weights in GPU memory and adds deployment overhead.
+
+**The solution:** Add lightweight auxiliary prediction heads directly to the target model. These heads are small MLPs attached to intermediate layers of the target (typically layers L, L−2, L−4, etc.). Each head predicts the next-token distribution by reading the residual stream at its attached layer. At inference time, the heads generate k candidate tokens in parallel (via tree expansion, detailed below), which are then verified by the final target-model forward pass. The heads are trained in a parameter-efficient manner (LoRA or direct finetuning) on the model's own generation traces.
+
+**Architecture:** The Medusa heads use a **tree-attention mechanism**. The draft heads generate a tree of k candidate tokens, where each token at depth d is conditioned on tokens at depth d−1. The target model's final forward pass includes all tree nodes and uses a sparse attention mask that respects the tree structure—each node can attend to its ancestors but not siblings or descendants.
+
+**Speedup:** Medusa achieves **2.2–3.6x speedup** on Llama-7B through 70B. Performance depends on the number of heads and their placement; more heads at more layers yield higher k at the cost of more computational overhead during drafting.
+
+**Integration.** Because the heads are part of the target model, they add only 2–5% parameters and require no separate inference pipeline. vLLM, TensorRT-LLM, and SGLang all have native Medusa support, and pre-trained Medusa heads are available for common models (Medusa-7B, Medusa-13B, etc.).
+
+**Trade-off.** Unlike Leviathan's approach (which works with any pre-trained pair), Medusa requires finetuning. Each new target model needs new Medusa heads. However, Cai et al. show that heads trained on one model often transfer partially to newer versions of the same family (e.g., Medusa heads trained on Llama-3-70B transfer with 70% efficiency to Llama-3.1-70B), reducing retraining cost.
+
+---
+
+## EAGLE: Feature-Level Prediction {#eagle}
+
+Li et al. (2024, arXiv:2401.15077, ICML 2024) made a key observation: **prediction is easier at the feature level than at the token level**.
+
+Token-level prediction conflates multiple challenges: syntax (which tokens are grammatically valid), semantics (which tokens make sense in context), and probability calibration (matching the actual next-token distribution). Feature-level prediction operates at a cleaner, more abstract representation—the activations of layer N−1, just before the output projection.
+
+**Architecture.** EAGLE adds a small auxiliary network that predicts layer N−1 features given the same input. Unlike Medusa (which trees multiple token-level heads), EAGLE makes a single feature-level prediction, then resolves it via a pre-computed "lookahead": for each predicted feature vector, maintain a lookup table of the token ids that maximize probability under the target model. The lookahead is computed offline during model loading.
+
+**Performance.** EAGLE achieves **2.7–3.5x speedup** on Llama-70B-Chat, matching or exceeding Medusa on the same hardware. The feature-level approach yields higher α than token-level heads on the same k.
+
+**Production adoption.** EAGLE is implemented in vLLM, SGLang, TensorRT-LLM, and OnnxRuntime. Pre-trained EAGLE heads are available for major models. As of 2026, EAGLE is arguably the most widely deployed specialized speculative-decoding method in open-source serving stacks.
+
+### EAGLE-2: Dynamic Trees
+
+Li et al. (June 2024, arXiv:2406.16858, EMNLP 2024) extended EAGLE with the observation that acceptance rates are **context-dependent**: some positions are easier to predict than others.
+
+**Dynamic tree construction.** Rather than always drafting k tokens with fixed depth and branching, EAGLE-2 adaptively adjusts the tree depth and branching based on per-token confidence scores from the draft model. High-confidence predictions spawn multiple children (high branching); low-confidence predictions are pruned or assigned low depth. This is implemented by training the draft model to output calibrated confidence scores alongside predictions, then using those scores to build trees at inference time.
+
+**Speedup.** EAGLE-2 achieves **3–5x speedup**, a 1.3x improvement over EAGLE-1. The gains come from two sources: (1) higher-confidence positions accept more often, yielding higher α, and (2) pruning low-confidence branches avoids wasting verification compute on unlikely candidates.
+
+**Tree attention.** The tree structure is encoded as a sparse attention mask. The target model's forward pass scores all nodes in a single pass using custom CUDA kernels (vLLM's `paged_attention` extended to trees) to avoid redundant KV-cache lookups.
+
+### EAGLE-3: Multi-Layer Fusion
+
+Li et al. (2025, arXiv:2503.01840, accepted to NeurIPS 2025) pushed feature-level prediction further by combining features from multiple layers.
+
+**Multi-layer representation.** Instead of predicting from layer N−1 alone, EAGLE-3 fuses features from layers \{L/4, L/2, 3L/4, L\} before the output projection. Early layers capture syntax and low-level patterns; middle layers capture semantics; late layers capture output probability. An adapter network learns to combine these signals.
+
+**Training-time test.** The paper introduces a "training-time test" augmentation: during training, mix in harder examples (adversarially sampled queries) to improve draft robustness. This is analogous to test-time augmentation but applied during training to the draft model.
+
+**Speedup.** EAGLE-3 achieves **4.1–6.5x speedup** on Llama-3.1-70B at temperature 0. On smaller models (13B), it achieves 4–5x. On code tasks (where predictions are more deterministic), speedup reaches 6.5x. This is a significant advance from EAGLE-2 and represents the state-of-art in speculative decoding as of May 2026.
+
+**Scaling properties.** A key result is that EAGLE-3 removes the scaling ceiling that limited EAGLE-1 and EAGLE-2. As training data increased (10B → 100B+ tokens), EAGLE-1's speedup plateaued; EAGLE-3's speedup continues to improve, suggesting that multi-layer fusion captures more of the signal available in the training data.
+
+---
+
+## Lookahead Decoding {#lookahead}
+
+Fu et al. (2024, arXiv:2402.02057, ICML 2024) developed an orthogonal approach: speculative decoding without auxiliary models or learned parameters.
+
+**Core idea.** Autoregressive decoding can be viewed as solving a fixed-point equation via Jacobi iteration:
+
+$$x_t = \arg\max_x p_\theta(x | x_{<t})$$
+
+In the standard approach, each iteration produces one $x_t$. Lookahead reformulates the problem to allow multiple disjoint n-grams to be computed in parallel: in iteration $i$, sample several independent sequences of length w (e.g., w = 5 tokens each), starting from different initial positions within a lookahead window. The sampled n-grams are verified by the model to ensure consistency, and the verified ones are integrated into the generation.
+
+**No auxiliary model.** Because Lookahead only uses the target model (invoked multiple times per iteration), there is no draft model to maintain or train.
+
+**Speedup.** Lookahead achieves **1.8–2.4x speedup** on single-GPU configurations. The lower speedup than EAGLE or Medusa comes from the overhead of multiple forward passes per iteration. However, Lookahead often scales better in multi-GPU serving: with parallelism across multiple GPUs, the multiple lookahead forward passes can be distributed, yielding speedup up to 4x on high-concurrency workloads (8+ concurrent requests).
+
+**Compatibility.** Lookahead is model-agnostic and requires no modification to the target model. It is compatible with attention optimizations like FlashAttention-2 and works with any tokenizer and sampling strategy.
+
+**Trade-off.** The cost is higher per-step compute (multiple forward passes instead of one) and implementation complexity (sampling, verification, and integration of disjoint n-grams). In practice, Lookahead is most useful in high-throughput, distributed-serving scenarios; for single-request latency on a single GPU, EAGLE and Medusa are preferable.
+
+---
+
+## Benchmarks and comparison {#benchmarks}
+
+### SpecBench and SPEED-Bench
+
+He et al. (2024, ACL 2024 Findings) created SpecBench, the first systematic evaluation of speculative decoding across methods and tasks.
+
+**Coverage.** Six speculative methods (Speculative Sampling, Medusa, EAGLE, Lookahead, PLD, REST), six tasks (multi-turn conversation, translation, summarization, QA, mathematical reasoning, RAG), six models (Llama-2-70B, Llama-3-70B, Mistral-7B, and others), uniform hardware (A100 80GB GPUs), and reproducible conditions.
+
+**Key findings:**
+- EAGLE achieves the highest speedup on most tasks (1.8–2.4x); Lookahead comes close for conversation and code.
+- Mathematical reasoning shows the highest speedup potential (~2.4x); conversational turns show the lowest (~1.5x) due to higher temperature and lower determinism.
+- Speedup varies by task: deterministic (code, translation) > semi-deterministic (math, QA) > open-ended (conversation, brainstorm).
+
+NVIDIA's SPEED-Bench (2026, forthcoming as of the brief) extends SpecBench with realistic serving regimes (dynamic SLOs, batching, hardware-aware metrics) and multimodal tasks. Early results show that speedup degrades 10–20% when systems are under load (high batch counts), due to lower average α in high-throughput regimes.
+
+### Speedup in production
+
+Verbatim speedup ranges from production deployments and recent benchmarks:
+
+| Method | Speedup (70B, τ=0) | Speedup (13B, τ=0) | Notes |
+|--------|---|---|---|
+| Speculative Sampling | 2–2.5x | 1.5–2x | Depends heavily on draft size |
+| Medusa | 2.2–3.6x | 1.8–2.4x | Pre-trained heads available; no retraining |
+| EAGLE-1 | 2.7–3.5x | 2.2–3x | Feature-level prediction |
+| EAGLE-2 | 3–5x | 2.5–3.5x | Dynamic trees; context-adaptive |
+| EAGLE-3 | 4.1–6.5x | 4–5x | Multi-layer fusion; state-of-art |
+| Lookahead | 1.8–2.4x | 1.5–2x | 4x on multi-GPU, high concurrency |
+
+All speedups assume temperature 0 (greedy) and single-request latency. Speedup degrades with temperature; at τ = 1.0, multiply by 0.6–0.8 (α drops, reducing k effective). At high throughput (many concurrent requests), multiply by 0.8–0.9 (α drops due to interference and scheduling effects).
+
+---
+
+## Production considerations {#comparison}
+
+### Memory and deployment
+
+**Dual-model approaches (Speculative Sampling).** Require 2x model weights in GPU memory. For a 70B model at FP8 quantization (140 GB), this means 280 GB total—feasible on 8x H100 (8 × 141 GB), tight on 4x. Requires dual inference kernels and careful orchestration to interleave draft and target passes.
+
+**Single-model approaches (Medusa, EAGLE).** Add 1–4% parameters (auxiliary heads). Memory increase is negligible. Kernels are unified; verification and drafting use the same forward-pass kernel. Operationally simpler.
+
+**Parametric approaches (Lookahead).** No additional parameters. Multiple forward passes require sequential scheduling unless distributed across GPUs.
+
+### Acceptance rate: practical factors
+
+In real-world serving, α is systematically lower than in single-request benchmarks:
+
+1. **Temperature.** Serving often uses τ = 0.5–1.0 for diversity, not τ = 0. At τ = 1.0, expect α to be 0.6–0.7 of the τ = 0 value.
+2. **Batching.** When multiple requests are interleaved in the same GPU kernel, KV-cache locality degrades, and α drops 5–10%.
+3. **Long-context queries.** At 32K+ context, α often drops 10–20% due to longer-range dependencies and more entropy in the prediction distribution.
+4. **Streaming / early-stopping.** Requests that are canceled or stopped early waste speculative-draft work; the speedup on complete sequences is higher than on interrupted sequences.
+
+Production systems often operate at **effective speedup of 1.8–2.8x** on 70B models, even if single-request benchmarks report 3–4x. The difference is not a flaw in the method; it is a difference in operating point (temperature, batch size, context length).
+
+### Integration complexity
+
+**Easiest:** Speculative Sampling (Leviathan) and Lookahead. No target-model modification; works with any pre-trained model. Integration is entirely in the serving runtime.
+
+**Medium:** Medusa and EAGLE. Target model is frozen; auxiliary heads are separate. Finetuning the heads is a one-time cost per model. Serving requires tree-attention kernels (available in vLLM, TensorRT-LLM).
+
+**Hardest:** Custom approaches (e.g., quantized drafts, domain-specific trees). Require significant engineering and domain expertise.
+
+### Cost-benefit analysis
+
+When is speculative decoding worth deploying?
+
+**Worth it:** 
+- Latency-critical applications (interactive chat, APIs with strict SLO). Even 1.5x speedup translates directly to lower cost per query and better user experience.
+- 70B+ models. Speculative decoding's relative benefit scales with model size (larger models have lower arithmetic intensity in memory-bound regime).
+- Production inference serving (deployed, not research). Engineering cost is amortized across millions of queries.
+
+**Marginal:**
+- Small models (7B or less). Draft-model overhead often exceeds benefit; speedup &lt; 1.3x.
+- Extremely quantized models (2-bit, 3-bit). Acceptance rates collapse because the quantized model has different semantics; speedup &lt; 1.2x.
+- Very long context (>64K). Tree-attention complexity grows; speedup &lt; 1.5x.
+
+**Not worth it:**
+- Research / prototyping. Engineering time is better spent elsewhere.
+- Low-throughput inference (&lt; 10 requests/min on a single GPU). Startup overhead of loading draft models dominates.
+
+---
+
+## Summary {#summary}
+
+Speculative decoding is a mature, production-ready technique for reducing inference latency on language models. The core insight—that multiple token positions can be scored in parallel through a two-stage draft-verify pipeline—is theoretically sound (lossless by design) and empirically effective (2–6.5x speedup depending on method and conditions).
+
+The landscape of methods reflects a progression from simplicity to sophistication. Speculative Sampling (2023) established the theoretical foundation and works with any model pair. Fast Speculative Decoding made it immediately practical. Medusa showed how to avoid dual-model overhead with in-model heads. EAGLE achieved higher speedup via feature-level prediction, then EAGLE-2 and EAGLE-3 pushed speedup further through dynamic trees and multi-layer fusion. Lookahead offers a model-agnostic parametric alternative, useful in specific (high-concurrency, multi-GPU) regimes.
+
+The acceptance-rate equation ($\alpha = \mathbb{E}[\min(p/q, 1)]$) and speedup formula ($\approx 1 + k\alpha$) provide the mental model for understanding when and why speculative decoding works. Acceptance rate is controlled by model-size gap, temperature, and task determinism; practitioners should measure α to diagnose why speedup falls short.
+
+As of May 2026, EAGLE-3 represents the state-of-art in single-request latency (4.1–6.5x on 70B), while Medusa and EAGLE-2 offer the best trade-off between simplicity and speedup for production deployment. The choice depends on existing infrastructure and deployment constraints. In high-throughput serving (16+ concurrent requests per GPU), Lookahead and batched Medusa often outperform single-request methods due to better kernel efficiency and parallelism. The practical speedup in production is typically 1.8–2.8x on 70B models, lower than single-request benchmarks because of temperature, batching, and long-context effects.
+
+Speculative decoding has moved from a research novelty (2023) to a standard feature in vLLM, TensorRT-LLM, SGLang, and other production inference frameworks (2024–2026). Its adoption in open-source serving stacks reflects both the robustness of the underlying theory and the practical impact on end-to-end latency for applications like interactive chat and API serving.
+
