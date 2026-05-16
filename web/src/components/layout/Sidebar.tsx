@@ -287,6 +287,7 @@ export function Sidebar() {
               to="/textbook"
               label="All Chapters"
               collapsed={collapsed}
+              end={true}
             />
 
             {chapters.map((chapter) => (
@@ -313,6 +314,7 @@ export function Sidebar() {
               to="/notes"
               label="All Notes"
               collapsed={collapsed}
+              end={true}
             />
 
             {/* 7 topic entries */}
@@ -351,6 +353,7 @@ export function Sidebar() {
               to="/projects"
               label="All Projects"
               collapsed={collapsed}
+              end={true}
             />
 
             {projects.map((project) => (
@@ -376,16 +379,19 @@ export function Sidebar() {
               to="/reading"
               label="All Items"
               collapsed={collapsed}
+              end={true}
             />
             <NavItem
               to="/reading?status=unread"
               label="Unread"
               collapsed={collapsed}
+              end={true}
             />
             <NavItem
               to="/reading?status=read"
               label="Read"
               collapsed={collapsed}
+              end={true}
             />
           </NavGroup>
         </div>
